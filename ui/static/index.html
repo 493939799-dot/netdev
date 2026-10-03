@@ -355,14 +355,16 @@ button .bi, .mono .bi{pointer-events:none}
       那一颗（7px 圆 + 6px 柔光）。语义也跟设备行的点对齐：
       **不活动 = 主题主色实心点；活动 = 变绿 + 呼吸**，忙闲由 aiBusy() 切 .busy。
       （沿革：实心方块「■」→ 3×3 方点阵 → 3×3 圆点阵 → 现在这一颗点。）
-   ② **去掉外面的方框**，且与文本框上下居中。两条各自的理由：
+   ② **去掉外面的方框**，且与文本框上下居中。
       · 去框：按钮本体仍在，只是不可见 —— 26px 的点击热区**必须保留**，
         7px 的点当点击目标太小了（可用性 > 视觉）。所以是"透明"而不是"删掉按钮"。
-        顺带治好一个 2px 错位：文本框 = 24px 内容 + 2×1px 边框 = 26px，
-        按钮 = 26px + 2×1px 边框 = 28px，容器又是 align-items:flex-end
-        ⇒ 按钮顶边比文本框高 2px。去框后两者都是 26px。
-      · 居中：容器 .ai-in 是 align-items:flex-end（文本框长高时按钮贴底）。
-        这里单独 align-self:center —— 文本框最多长到 180px，点始终垂直居中。 */
+      · 居中：容器 .ai-in 是 align-items:flex-end，而文本框比按钮高
+        （占位文字自动折成 2 行 ⇒ 41px，按钮恒 26px，两者**底边**对齐）
+        ⇒ 按钮中心比文本框中心低 **7.5px**（浏览器实测）。加 align-self:center 后 Δ=0；
+        文本框最高可长到 180px，点始终垂直居中。
+      ⚠ 别把错位归到"边框"上：全局是 box-sizing:border-box，去不去边框
+        按钮**都是 26px**（实测）。错位纯粹是 flex 对齐方式的问题 ——
+        这条一开始我按 content-box 推断成"2px"，是错的，实测纠正。 */
 .ai-in button.icon-btn{width:26px;padding:0;display:flex;align-items:center;justify-content:center;
   flex:0 0 auto;align-self:center;border:0;background:transparent;color:var(--g)}
 /* 悬停**不给方框**（那正是用户要去掉的东西），只让点自己"醒一下"：柔光放大。
