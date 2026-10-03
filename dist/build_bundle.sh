@@ -122,7 +122,9 @@ chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/tools-menu.command"
 ok "安装器就绪（菜单取自 bin/设备工具台.command，仓库里只有这一份）"
 
 printf "${B}▶ 5/6 打包${X}\n"
-NAME="${TS}_netdev设备工具台_macOS_${ARCH}_安装包"    # 本机存档文件名（带日期）
+# 文件名可用 NETDEV_BUNDLE_NAME 覆盖（CI 的 release.yml 用它打出 GitHub 固定名附件，
+# 让 README 的 releases/latest/download/<固定名> 链接永远命中）；默认按本机存档规范带日期。
+NAME="${NETDEV_BUNDLE_NAME:-${TS}_netdev设备工具台_macOS_${ARCH}_安装包}"
 # ★ tar 内顶层目录名 = GitHub 附件名，固定不变（2026-10-04 开箱即用验证发现：
 #   README 让用户 `cd netdev-macos-arm64-installer`，而 tar 顶层目录是带日期的
 #   中文名，每次发版都变 —— 用户照着 README 敲 cd 必失败。目录名固定后，

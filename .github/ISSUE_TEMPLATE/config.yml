@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先看 README「起不来怎么办」
+    url: https://github.com/493939799-dot/netdev#网页服务起不来怎么办
+    about: 大部分启动/安装问题在这一节就有答案，先对照自查一遍更快。

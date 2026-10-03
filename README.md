@@ -216,10 +216,19 @@ uv pip install --target dist/deps --python 3.12 -r requirements.txt
 
 ### 方式二：开发者就地运行
 
+> **前置**：需要 **Python 3.10+** 和 [uv](https://docs.astral.sh/uv/)。
+> macOS 自带的 `python3`（Xcode CLT，3.9）装不动 `requirements.txt` 里锁定版本的
+> 依赖（实测 `cffi==2.1.1` 直接报"无匹配版本"）。装 uv 一条命令（它会自动带上
+> 合适的 Python，无需 homebrew）：
+>
+> ```bash
+> curl -LsSf https://astral.sh/uv/install.sh | sh
+> ```
+
 ```bash
 cd /path/to/netops
 
-# 建 venv 并装依赖（可用 uv，也可用 requirements.txt）
+# 建 venv 并装依赖（uv 会自动下载 Python 3.13，不需要你预装）
 uv venv --python 3.13 .venv
 uv pip install -r requirements.txt
 

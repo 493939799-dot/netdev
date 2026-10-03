@@ -1,0 +1,42 @@
+name: 设备接入问题
+description: 串口/SSH/Telnet 连不上某台设备、或连上后命令不对
+labels: ["device"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        接入问题请写清**设备与接入方式**。如果不确定，先在网页界面里点一次
+        接入，把终端里显示的报错原文贴上来。
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: 接入通道
+      options:
+        - 串口 Console（USB 转串口线）
+        - SSH
+        - Telnet
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: 设备厂商与型号
+      placeholder: "例如：华为 AR 路由器 / H3C 交换机 S5130 / 思科 2911"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: 报错或异常表现
+      description: 终端原文；**贴之前删掉密码、真实 IP、USB 序列号**
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "./netdev doctor 输出（可选，但很帮助定位）"
+      render: shell

@@ -32,6 +32,16 @@ jobs:
       # 的原生库要做代码签名校验，实测要 30 秒以上（本机不到 1.2 秒）。
       NETDEV_UI_START_TIMEOUT: "180"
       NETDEV_TEST_WAIT: "90"
+      # ★ 产物文件名固定 + 输出到仓库内目录（2026-10-04 修）：
+      #   ① build_bundle.sh 默认把产物写到 ~/Desktop/workbuddy（维护者本机约定），
+      #      CI 的校验步骤却在仓库根 `ls ./*.tar.gz` 找 —— v1.0.2 / v1.0.3 两次
+      #      tag 的 Release workflow 全因这个失败（产物明明打出来了，找错地方）。
+      #   ② 附件名必须固定（不带日期），README 的 releases/latest/download/
+      #      netdev-macos-arm64-installer.tar.gz 链接才能命中。
+      NETDEV_BUNDLE_NAME: netdev-macos-arm64-installer
+      # 绝对路径：build_bundle.sh 打 tar 时会 cd 进暂存目录再引用 $OUT，
+      # 相对路径在那里会指错位置
+      BUNDLE_DIR: ${{ github.workspace }}/bundle-out
 
     steps:
       - uses: actions/checkout@v4
@@ -57,13 +67,13 @@ jobs:
           uv pip list --format=freeze > dist/deps/_licenses/requirements.lock.txt 2>/dev/null || true
 
       - name: 打包（含独立 Python，完全离线）
-        run: bash dist/build_bundle.sh --with-python
+        run: bash dist/build_bundle.sh --with-python --out "$BUNDLE_DIR"
 
       - name: 校验产物结构
         run: |
           set -uo pipefail
           fail=0
-          TARBALL="$(ls ./*.tar.gz | head -1)"
+          TARBALL="$(ls "$BUNDLE_DIR"/*.tar.gz | head -1)"
           echo "产物：$TARBALL"
           echo "── 必含 ──"
           for must in "install.sh" "uninstall.sh" "config-template/devices.toml.example" \
@@ -85,8 +95,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ./*.tar.gz
-            ./*.sha256
+            ${{ env.BUNDLE_DIR }}/*.tar.gz
+            ${{ env.BUNDLE_DIR }}/*.sha256
           generate_release_notes: true
           body: |
             ## netdev 设备工具台 ${{ github.ref_name }}
@@ -95,7 +105,8 @@ jobs:
 
             ### 怎么装
             ```bash
-            tar -xzf <下载的文件>.tar.gz && cd <解压出来的目录>
+            tar -xzf netdev-macos-arm64-installer.tar.gz
+            cd netdev-macos-arm64-installer
             bash install.sh --dry-run     # 先预览，不动任何文件
             bash install.sh               # 正式安装
             ```
@@ -106,7 +117,7 @@ jobs:
 
             ### 校验（可选，但建议）
             ```bash
-            shasum -a 256 -c <下载的文件>.tar.gz.sha256
+            shasum -a 256 -c netdev-macos-arm64-installer.tar.gz.sha256
             ```
 
       - name: 产物留档（无 tag 时也上传，方便测试）
@@ -115,6 +126,6 @@ jobs:
         with:
           name: netdev-bundle-manual
           path: |
-            ./*.tar.gz
-            ./*.sha256
+            ${{ env.BUNDLE_DIR }}/*.tar.gz
+            ${{ env.BUNDLE_DIR }}/*.sha256
           retention-days: 7
