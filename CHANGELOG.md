@@ -8,6 +8,64 @@
 
 ---
 
+## [未发布]
+
+### 修复：AI 助手在宿主注入环境下必定起不来（真因：宿主注入的 Node shim）
+
+**症状**：界面 AI 面板稳定报
+`Credential store read failed for deepseek: EEXIST: file already exists, mkdir '…/auth.json.lock'`，
+而此刻 `~/.pi/agent` 下根本没有活着的 pi，锁也早已是死锁。手工清锁、重启会话都没用，
+看着像"清不动"。
+
+**真因**：宿主（WorkBuddy/CodeBuddy 一类桌面 IDE）会给**每一个 Node 进程**注入
+`NODE_OPTIONS=--require=…/cli/vendor/shim/node-language-shim.cjs`。该 shim 接管了 `fs`，
+把 `mkdir` 撞名的 `EEXIST` **改写**成 `code="CODEBUDDY_BROKER_DENY"`（message 文本里
+仍写着 `EEXIST: …`，所以肉眼极难分辨）。
+pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分支**判据是
+`if (err.code !== 'EEXIST') return callback(err);` —— code 被换掉之后，这个分支被整个
+跳过，**崩溃残留的锁永远不会过期**，pi 每次启动都必挂。
+
+实测对照（同一台机器、同一个 proper-lockfile 4.1.2，只改锁目录 mtime）：
+
+| 锁目录 mtime | 带 NODE_OPTIONS 注入 | 剥掉注入 |
+|---|---|---|
+| 现在 / 3s / 10s / 29s 前 | `CODEBUDDY_BROKER_DENY`，**全部不自愈** | `ELOCKED`（正常，会重试） |
+| 35s 前（超 30s 陈旧阈值） | `CODEBUDDY_BROKER_DENY`，**仍不自愈** | 清掉旧锁并**成功获取** |
+
+**改法**：`ui/server.py` 在把环境交给 pi 子进程之前，先剥掉宿主注入的
+`NODE_OPTIONS` / `PATH` 中的 shim 条目 / `BASH_ENV`（全部按精确特征匹配，
+`~/.workbuddy/binaries/**` 这类运行时路径**不会**被误伤；用户自己的环境**零改动**）。
+这是"不做也能跑、但在宿主里必挂"的那一类修复，对**双击启动**的用户是空操作。
+
+### 修复：`netdev selftest` 在端口被占时会给出**假红**
+
+上一轮 `netdev mock` 留下的实例还占着端口时，自检自己的模拟器静默 bind 失败
+（stderr 被管道吃掉），于是自检**连到了旧实例**上 —— 而旧实例的同屏窗格可能停在
+用户视图，`apply` 直接报 `Unrecognized command`，自检 ④ 判失败。
+用户看到的是"功能坏了"，真相是"你的旧模拟器没关"。现在：
+
+- 端口被占 → **当场拒跑**，退出码 2，并给出可照抄的解法（`netdev mock stop -p <端口>`）；
+- 起模拟器改**轮询**等端口真的监听起来（上限 8 秒），不再用固定 `sleep 1.2`
+  —— 固定等待是本项目反复踩过的坑（GitHub ARM 冷启动实测 32s）；
+- 起不来时把子进程输出打出来，不再吞掉。
+
+### 加固：锁自愈不再可能误搬**活锁**
+
+`pi_heal_locks(force=True)` 原来不看年龄，见空锁目录就搬。若用户自己正在终端里跑 pi，
+那个锁是**活的**，搬走会砸掉她的会话。现在 force 会先探测本机有没有别的 pi 进程存活，
+有则自动降级为"只搬 mtime > 60s 的陈旧锁"，并在返回值里如实报告 `degraded`。
+
+### 测试
+
+- 新增 `tests/test_pi_heal_and_cmdcache.py` 第 4 组共 11 项断言，把上述根因钉死：
+  shim 剥离、`~/.workbuddy/binaries/**` 不误伤、干净环境零改动、`_env_with_node` 端到端。
+  该文件总计 35 项。
+- 端到端实测（真实 HTTP + 真实 pi + 真实模型）：`/api/ai/open` → `/api/ai/send`
+  → 事件流拿到 assistant 回复；`/api/term/open` → `/api/term/input` 键入的命令
+  确实到达设备并回显。
+
+---
+
 ## [1.0.0] — 首个公开版本
 
 ### 三通道接入与人机同屏

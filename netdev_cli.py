@@ -2451,10 +2451,43 @@ def cmd_selftest(a):
               f"{_P.rel_to_home(ROOT)}/config/devices.toml{C['reset']}")
         return 2
     sim = ROOT / "tests" / "mock_vrp.py"
-    port = engine.get_device("mock-hw").get("port", 20037)
+    dev = engine.get_device("mock-hw")
+    port = dev.get("port", 20037)
+    host = dev.get("host", "127.0.0.1")
+    # ★ 2026-10-03：**端口被占必须当场说清楚，不能闷头往下跑。**
+    #   实测踩到：上一轮 `netdev mock` 留下的实例还在 20022 上跑，selftest 自己
+    #   那个 mock 静默 bind 失败（stderr 被 PIPE 吃掉），于是自检**连到了旧实例**，
+    #   而那个实例的 tmux 窗格停在用户视图 → apply 报 "Unrecognized command"
+    #   → 自检 ④ 判失败。用户看到的是"功能坏了"，真相是"你的旧模拟器没关"。
+    #   这种假红对开源后的新用户杀伤力最大，所以宁可直接拒跑并给出解法。
+    if _mock_port_open(port):
+        print(f"{C['red']}✘ 端口 {port} 已被占用 —— 自检要独占一个模拟器{C['reset']}")
+        print(f"{C['dim']}   多半是之前跑过 `netdev mock` 没关。先停掉再跑自检：{C['reset']}")
+        print(f"{C['bold']}     netdev mock stop -p {port}{C['reset']}")
+        print(f"{C['dim']}   或者改 config/devices.toml 里 mock-hw 的 port 换一个空闲端口。{C['reset']}")
+        return 2
     proc = subprocess.Popen([sys.executable, str(sim), str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    time.sleep(1.2)
+    # ★ 固定 sleep 是本项目反复踩的坑（GitHub ARM 冷启动实测 32s）。
+    #   这里改成轮询到端口真的监听起来，上限 8 秒；超时就把子进程输出打出来。
+    _deadline = time.time() + 8
+    _up = False
+    while time.time() < _deadline:
+        if _mock_port_open(port):
+            _up = True
+            break
+        if proc.poll() is not None:      # 子进程自己退了（端口占用/脚本报错）
+            break
+        time.sleep(0.2)
+    if not _up:
+        try:
+            proc.terminate()
+            _o, _ = proc.communicate(timeout=5)
+        except Exception:
+            _o = ""
+        print(f"{C['red']}✘ 模拟器没能监听到 {host}:{port}{C['reset']}")
+        print(f"{C['dim']}{(_o or '(无输出)')[-1200:]}{C['reset']}")
+        return 1
     fails = []
     # 自检打的是本机模拟器（mock-hw，sim=true + 回环地址），没有真人可点弹窗。
     # 打开这条窄豁免，让 selftest 能在 CI（无 GUI）里跑通；finally 里必定清掉。

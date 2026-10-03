@@ -161,6 +161,85 @@ def test_detect():
         check(f"识别 {want or '不认识'} <= {text.splitlines()[0][:38]!r}", got == want, f"得到 {got!r}")
 
 
+# ======================================================================
+# 四、宿主注入的 Node shim：必须剥掉（否则 pi 的锁永远不自愈）
+# ======================================================================
+def test_host_shim_strip():
+    """2026-10-03 真根因回归。
+
+    宿主会给每个 Node 进程注入 NODE_OPTIONS=--require=…/node-language-shim.cjs，
+    该 shim 把 mkdir 撞名的 EEXIST 改写成 code=CODEBUDDY_BROKER_DENY
+    （message 文本仍是 "EEXIST: …"）。pi 用的 proper-lockfile 只在
+    `err.code === 'EEXIST'` 时才走陈旧锁清理分支 → 分支被跳过 →
+    **崩溃残留的锁永远不过期**，pi 每次启动必挂。
+
+    实测对照（同一个 proper-lockfile，只改锁目录 mtime）：
+      带 shim   ：现在 / -3s / -10s / -29s / -35s / 未来 → 全部 BROKER_DENY
+      剥掉 shim ：-29s → ELOCKED；-35s → 清掉旧锁并成功获取
+    """
+    print("\n[4] 宿主 Node shim 剥离（pi 锁自愈的前提）")
+    ui = ROOT / "ui"
+    if str(ui) not in sys.path:
+        sys.path.insert(0, str(ui))
+    try:
+        import server as S            # noqa: E402
+    except Exception as e:
+        check("ui/server.py 可导入", False, f"{type(e).__name__}: {e}")
+        return
+
+    SHIM = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/vendor/shim"
+
+    # 1) NODE_OPTIONS 只有 shim → 整键删掉
+    env = {"NODE_OPTIONS": f'--require="{SHIM}/node-language-shim.cjs"'}
+    S._strip_host_shim(env)
+    check("NODE_OPTIONS 全是宿主 shim 时整键删除", "NODE_OPTIONS" not in env, str(env))
+
+    # 2) NODE_OPTIONS 混有用户自己的参数 → 只剔 shim，保留其他
+    env = {"NODE_OPTIONS": f'--max-old-space-size=4096 --require="{SHIM}/node-language-shim.cjs"'}
+    S._strip_host_shim(env)
+    check("NODE_OPTIONS 混用时只剔 shim 那一段",
+          env.get("NODE_OPTIONS") == "--max-old-space-size=4096", str(env))
+
+    # 3) PATH 里的 shim 目录要被剔掉，**但 ~/.workbuddy/binaries 这类运行时路径绝不能误伤**
+    runtime = "/Users/mac/.workbuddy/binaries/node/versions/22.22.2-3/bin"
+    env = {"PATH": f"{SHIM}/brokered-bin:{runtime}:/usr/bin:/bin"}
+    S._strip_host_shim(env)
+    got = (env.get("PATH") or "").split(":")
+    check("PATH 里剥掉 shim 目录", f"{SHIM}/brokered-bin" not in got, str(got))
+    check("PATH 里**保留** workbuddy 运行时目录（不能拿 workbuddy 当关键词乱杀）",
+          runtime in got, str(got))
+    check("PATH 里保留系统目录", "/usr/bin" in got and "/bin" in got, str(got))
+
+    # 4) BASH_ENV 指向 shim → 删；指向用户自己的脚本 → 留
+    env = {"BASH_ENV": f"{SHIM}/shell-runtime-bash-env.sh"}
+    S._strip_host_shim(env)
+    check("BASH_ENV 指向宿主 shim 时删除", "BASH_ENV" not in env, str(env))
+    env = {"BASH_ENV": "/Users/mac/my-own.sh"}
+    S._strip_host_shim(env)
+    check("BASH_ENV 是用户自己的脚本则保留", env.get("BASH_ENV") == "/Users/mac/my-own.sh", str(env))
+
+    # 5) 干净环境是**空操作**（用户自己双击启动 UI 时走的正是这条路）
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/Users/mac"}
+    before = dict(env)
+    S._strip_host_shim(env)
+    check("干净环境零改动（幂等/无副作用）", env == before, f"{before} → {env}")
+
+    # 6) _env_with_node 端到端：剥 shim + 补 node 路径，两件事都做到
+    old = dict(os.environ)
+    try:
+        os.environ["NODE_OPTIONS"] = f'--require="{SHIM}/node-language-shim.cjs"'
+        os.environ["PATH"] = f"{SHIM}/safe-bin:/usr/bin:/bin"
+        e = S._env_with_node()
+        check("_env_with_node 剥掉了 NODE_OPTIONS", "NODE_OPTIONS" not in e, str(e.get("NODE_OPTIONS")))
+        check("_env_with_node 剔掉了 safe-bin", f"{SHIM}/safe-bin" not in (e.get("PATH") or ""),
+              str(e.get("PATH")))
+        check("_env_with_node 补上了 ~/.npm-global/bin",
+              str(pathlib.Path.home() / ".npm-global/bin") in (e.get("PATH") or ""), str(e.get("PATH")))
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
 def main():
     print("=" * 66)
     print("netdev 回归测试：pi 启动自愈 + 采集命令学习缓存")
@@ -168,6 +247,7 @@ def main():
     test_cmd_cache()
     test_pi_locks()
     test_detect()
+    test_host_shim_strip()
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
     if FAIL:

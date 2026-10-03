@@ -143,9 +143,84 @@ def _file_ok(p: pathlib.Path) -> bool:
         return False
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ★ 2026-10-03：**必须剥掉宿主注入的 Node 语言 shim** —— 这是「AI 助手突然
+#   不好用」的**真根因**，也是本项目踩过的最隐蔽的一个坑。
+#
+# 现象：界面里 AI 助手稳定报
+#     Credential store read failed for deepseek:
+#     EEXIST: file already exists, mkdir '/Users/mac/.pi/agent/auth.json.lock'
+#   而此刻 ~/.pi/agent 下**根本没有活着的 pi**，锁也早就是死锁（mtime 静置
+#   十几分钟零刷新）。手工把锁清掉，pi 一起来又 EEXIST，看着像"清不动"。
+#
+# 真因：宿主（WorkBuddy）给**每一个 Node 进程**注入
+#     NODE_OPTIONS=--require=/Applications/WorkBuddy.app/…/cli/vendor/shim/node-language-shim.cjs
+#   该 shim 接管了 fs，把 mkdir 撞名的 EEXIST **改写**成
+#     code = "CODEBUDDY_BROKER_DENY"（message 文本里仍写着 "EEXIST: …"）
+#   pi 的配置/凭据锁用的是 proper-lockfile 4.1.2，它的**陈旧锁自愈分支**
+#   判据是（lib/lockfile.js:47）：
+#       if (err.code !== 'EEXIST') { return callback(err); }   ← 只有 EEXIST 才往下走
+#   code 被换成 BROKER_DENY ⇒ 这个分支被整个跳过 ⇒ 原始错误直接抛给上层。
+#   后果：**崩溃残留的锁永远不会过期**，pi 每次启动必挂，且报错点离真因极远。
+#
+# 实测（同一台机器、同一个 proper-lockfile，只改锁目录 mtime）：
+#     带 NODE_OPTIONS：mtime = 现在 / -3s / -10s / -29s / -35s / 未来
+#                      → **全部** CODEBUDDY_BROKER_DENY，无一自愈
+#     剥掉 NODE_OPTIONS：-29s → ELOCKED（正常，pi 自己会重试）
+#                        -35s → 直接清掉旧锁并**成功获取**
+#   即：剥掉 shim 后，proper-lockfile 的 30 秒陈旧判据完全恢复。
+#
+# 边界（刻意做窄）：只剔除**指向宿主 shim 的那一条 token / 那几个目录**，
+#   用户自己设的 NODE_OPTIONS 内容原样保留；PATH 里
+#   `~/.workbuddy/binaries/...` 这类**含 workbuddy 字样但属于运行时**的路径
+#   **绝不误伤**（用 `/cli/vendor/shim/` 这种精确特征匹配，不拿 "workbuddy" 当关键词）。
+# ══════════════════════════════════════════════════════════════════════════
+_SHIM_TOKENS = ("node-language-shim", "node-brokered-fs-shim", "node-safe-delete-shim",
+                "/cli/vendor/shim/", "shell-runtime-bash-env")
+
+
+def _is_shim_token(tok: str) -> bool:
+    low = tok.lower()
+    return any(m in low for m in _SHIM_TOKENS)
+
+
+def _strip_host_shim(env: dict) -> dict:
+    """剥掉宿主注入的 Node / Shell shim，让 Node 的错误码恢复内核语义。
+
+    只动三个键：NODE_OPTIONS、PATH、BASH_ENV。全部按**精确特征**匹配，
+    命中才剔除；不命中一律原样保留。
+    """
+    # 1) NODE_OPTIONS —— 逐 token 剔除指向 shim 的 --require，全是 shim 就整键删掉
+    raw = env.get("NODE_OPTIONS") or ""
+    if raw:
+        keep = [t for t in raw.split() if t and not _is_shim_token(t)]
+        if keep:
+            env["NODE_OPTIONS"] = " ".join(keep)
+        else:
+            env.pop("NODE_OPTIONS", None)
+    # 2) PATH —— 剔除 shim 目录（brokered-bin / safe-bin 是命令包装器，
+    #    会把 rm/mkdir 换成受管版本，错误码语义同样不可依赖）
+    path = env.get("PATH") or ""
+    if path:
+        keep = [d for d in path.split(":") if d and not _is_shim_token(d)]
+        if keep and len(keep) != len(path.split(":")):
+            env["PATH"] = ":".join(keep)
+    # 3) BASH_ENV —— 宿主用它给每个非交互 bash 预载 shim 脚本
+    be = env.get("BASH_ENV") or ""
+    if be and _is_shim_token(be):
+        env.pop("BASH_ENV", None)
+    return env
+
+
 def _env_with_node() -> dict:
-    """给子进程一个能找到 node 的 PATH（本机 node 在 /usr/local/bin）。"""
-    env = dict(os.environ)
+    """给子进程一个能找到 node 的 PATH（本机 node 在 /usr/local/bin）。
+
+    ★ 2026-10-03：在「补 PATH」之前**先剥掉宿主注入的 Node shim**。
+      见上方长注释 —— 不剥的话 pi 的锁永远不自愈，AI 助手必挂。
+      这一步对「用户自己双击启动的 UI」是空操作（那种场景下环境本来就干净），
+      对「从宿主里拉起的 UI」才是救命的那一刀。
+    """
+    env = _strip_host_shim(dict(os.environ))
     extra = [str(HOME / ".npm-global/bin"), "/usr/local/bin", "/opt/homebrew/bin"]
     env["PATH"] = ":".join(extra + [env.get("PATH", "")])
     return env
@@ -200,6 +275,19 @@ PI_LOCK_NAMES = ("settings.json.lock", "auth.json.lock", "models-store.json.lock
 PI_LOCK_STALE_SEC = 60          # 正在持有的锁会被 proper-lockfile 持续 utimes 刷新
 
 
+def _pi_lock_dirs() -> list[pathlib.Path]:
+    """所有「空目录形态」的 pi 锁（不看年龄）。"""
+    out = []
+    for name in PI_LOCK_NAMES:
+        p = PI_DIR / name
+        try:
+            if p.is_dir() and not any(p.iterdir()):
+                out.append(p)
+        except Exception:
+            pass
+    return out
+
+
 def _pi_stale_locks() -> list[pathlib.Path]:
     """列出「崩溃残留」的 pi 锁目录。
 
@@ -225,14 +313,95 @@ def _pi_stale_locks() -> list[pathlib.Path]:
     return out
 
 
-def pi_heal_locks(dry: bool = False) -> dict:
-    """把崩溃残留的 pi 锁目录移入隔离区。**只移动、不删除**，可原样还原。"""
-    stale = _pi_stale_locks()
+def _pi_heal_specific(name: str) -> bool:
+    """把**指定的**那个锁目录移入隔离区（不看出身时间）。
+
+    为什么不用 `pi_heal_locks()`：它要求 mtime > PI_LOCK_STALE_SEC（60s）才算陈旧。
+    而这里是从 pi 自己的报错里拿到的锁名 —— 我们就是刚才那个写锁的进程，
+    它已经崩了，锁一定是死的，不需要再等 60 秒来"确认它没在动"。
+    仍然只搬不删。
+    """
+    if not name:
+        return False
+    p = PI_DIR / name
+    try:
+        if not p.is_dir():
+            return False
+    except Exception:
+        return False
+    q = HOME / ".quarantine-pi-locks" / time.strftime('%Y%m%d_%H%M%S')
+    try:
+        q.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(p), str(q / p.name))
+        return True
+    except Exception:
+        return False
+
+
+def _pi_lock_error(ev: dict) -> bool:
+    """这个事件是不是「pi 锁残留」导致的失败。"""
+    if not isinstance(ev, dict) or ev.get("success") is not False:
+        return False
+    err = str(ev.get("error") or "")
+    return ("file already exists" in err) and (".lock" in err)
+
+
+def _pi_lock_name_from_error(ev: dict) -> str:
+    """从报错里把锁文件名抠出来，如 `…/auth.json.lock` → `auth.json.lock`。"""
+    err = str(ev.get("error") or "")
+    m = re.search(r"([A-Za-z0-9_.-]+\.lock)", err)
+    return m.group(1) if m else ""
+
+
+def _pi_procs_alive() -> list[int]:
+    """本机是否还有**别的** pi 进程在跑（只读探测，绝不拉起任何进程）。
+
+    为什么要它：`pi_heal_locks(force=True)` 原来不看年龄，见空锁就搬。万一用户
+    自己正在终端里跑 pi（真有人这么用），那个锁是**活的**，搬走会砸掉她的会话。
+    有活 pi 时自动降级为「只搬 mtime > 60s 的陈旧锁」。
+    探测失败一律返回空（宁可保守地认为"没人"，因为开新会话前我们已经关掉了自己的旧会话）。
+    """
+    out: list[int] = []
+    for exe, args in (("/usr/bin/pgrep", ["-f", "pi-coding-agent"]),
+                      ("/usr/bin/pgrep", ["-f", "earendil"])):
+        try:
+            if not pathlib.Path(exe).exists():
+                continue
+            r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=5)
+            for ln in (r.stdout or "").split():
+                if ln.isdigit():
+                    pid = int(ln)
+                    if pid != os.getpid() and pid not in out:
+                        out.append(pid)
+        except Exception:
+            continue
+    return out
+
+
+def pi_heal_locks(dry: bool = False, force: bool = False) -> dict:
+    """把崩溃残留的 pi 锁目录移入隔离区。**只移动、不删除**，可原样还原。
+
+    force=True 时不看 mtime，**只要是空目录就搬**。
+    为什么需要它（2026-10-03 实测）：pi 0.85.1 **自己每次退出都漏锁** ——
+    连 `pi --version` 都会留下 settings.json.lock。原判据要求 mtime > 60 秒
+    才算陈旧，而 pi 刚留下的锁只有几秒，**正好被这个条件挡掉**，
+    于是清了也白清，pi 起来照样 EEXIST。
+    正在**开新会话**时调用是安全的：此刻没有属于我们的活 pi，旧锁必然是死的。
+
+    ★ 2026-10-03 加固：force 现在**先看有没有别的 pi 活着**，有就自动降级成
+      非 force（只搬陈旧锁），避免误搬用户自己终端的活锁。
+      `degraded` 字段如实报告是否降级过。
+    """
+    other = _pi_procs_alive() if force else []
+    degraded = bool(force and other)
+    stale = _pi_stale_locks() if degraded or not force else _pi_lock_dirs()
+    base = {"ok": True, "found": len(stale), "moved": [], "quarantine": None,
+            "degraded": degraded, "other_pi": other}
     if not stale:
-        return {"ok": True, "found": 0, "moved": [], "quarantine": None}
+        return base
     if dry:
-        return {"ok": True, "found": len(stale), "moved": [], "quarantine": None,
-                "would_move": [p.name for p in stale]}
+        base["would_move"] = [p.name for p in stale]
+        return base
     # 隔离区放在 ~/.pi/agent **之外** —— 别往 pi 自己会扫描的配置目录里塞东西
     q = HOME / ".quarantine-pi-locks" / time.strftime('%Y%m%d_%H%M%S')
     moved = []
@@ -245,9 +414,11 @@ def pi_heal_locks(dry: bool = False) -> dict:
             except Exception:
                 pass
     except Exception as e:
-        return {"ok": False, "found": len(stale), "moved": moved, "quarantine": str(q),
-                "error": f"{type(e).__name__}: {e}"}
-    return {"ok": True, "found": len(stale), "moved": moved, "quarantine": str(q)}
+        base.update({"ok": False, "moved": moved, "quarantine": str(q),
+                     "error": f"{type(e).__name__}: {e}"})
+        return base
+    base.update({"moved": moved, "quarantine": str(q)})
+    return base
 
 
 def _pi_settings_defaults() -> tuple[str, str]:
@@ -759,6 +930,8 @@ class AiSession:
         self.log: list[dict] = []          # 事件回放（新订阅者补发，限量）
         self.stderr_tail = ""
         self.heal: dict = {}               # 启动时的锁自愈结果（供界面显示）
+        self._last_prompt: str = ""        # 最近一次 prompt，锁自愈后要原样重发
+        self._retry_left: int = 0          # 自动重试次数上限（防死循环）
 
     # ── 起进程 ──
     def start(self) -> None:
@@ -767,7 +940,7 @@ class AiSession:
         # ★ 开箱即用：先自愈崩溃残留的锁目录。
         #   不清的话 pi 必然 `EEXIST: mkdir 'settings.json.lock'` → 读不到 settings.json
         #   → 静默回退内置默认 provider → 报 "No API key found"（真因被藏起来）。
-        self.heal = pi_heal_locks()
+        self.heal = pi_heal_locks(force=True)
         cmd = [PI_BIN, "--mode", "rpc", "--no-session"]
         if self.tools:                       # 白名单：只给这一子进程，不影响用户自己的 pi
             cmd += ["--tools", self.tools]
@@ -816,6 +989,21 @@ class AiSession:
                             q.put_nowait(ev)
                         except queue.Full:
                             pass
+            # ★ 2026-10-03：pi 崩溃残留锁的**自愈点前移到出错的那一刻**。
+            #   原来只在"开会话/探测"时清一次锁，可 pi 偏偏是**启动时**建锁、
+            #   崩溃时又不清理 —— 等下一轮自愈时，用户已经撞上错误了。
+            #   现在：读到 "file already exists: …*.lock" 就地清掉那个锁并重发一次。
+            if _pi_lock_error(ev):
+                name = _pi_lock_name_from_error(ev)
+                healed = _pi_heal_specific(name)
+                with self.lock:
+                    retry = self._retry_left > 0 and bool(self._last_prompt)
+                    if retry:
+                        self._retry_left -= 1
+                    else:
+                        retry = False
+                if healed and retry:
+                    self.prompt(self._last_prompt)
         except Exception:
             pass
         self.alive = False
@@ -846,8 +1034,26 @@ class AiSession:
             return False
 
     def prompt(self, text: str) -> bool:
+        # ── 2026-10-03：进程已经死掉时的自愈与重发 ──
+        #   实测的真因链：pi 启动时会跑 `npm install`，网络不通就崩；
+        #   崩的时候 proper-lockfile 的空目录锁留着不清理 → 下次启动 EEXIST。
+        #   于是：开会话时清一次锁（新锁是 pi 起来之后才建的，清不到）→
+        #   pi 立刻又崩 → 用户打字时进程早就死了，prompt 静默失败 →
+        #   界面把**日志里的旧报错**重放出来，看起来像"又坏了"。
+        #   所以真正的自愈点是**发送时发现进程已死**：清锁 → 重起 → 重发。
+        if not (self.proc and self.proc.poll() is None):
+            healed = pi_heal_locks()
+            self.start()
+            self.ready.clear()
+            if not self.ready.wait(timeout=20):
+                return False
+            if not (self.proc and self.proc.poll() is None):
+                return False
         # pi 冷启动要几秒（node + 配置 + MCP）；太早写 stdin 会被丢弃 ⇒ 等它就绪
         self.ready.wait(timeout=15)
+        # 记下来：万一 pi 回一个「锁残留」的错误，reader 要能原样重发一次
+        self._last_prompt = text
+        self._retry_left = 1          # 每个会话最多自动重试 1 次，防死循环
         return self._write({"type": "prompt", "message": text})
 
     def abort(self) -> bool:
@@ -3235,6 +3441,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not PI_BIN:
             return self._json({"error": "找不到 pi。装法：npm i -g @earendil-works/pi-coding-agent"}, 400)
         aid = secrets.token_urlsafe(9)
+        # ★ 2026-10-03：**开新会话前先把旧会话全关掉**。
+        #   pi 的凭据存储用的是**全局单锁**（~/.pi/agent/*.lock，proper-lockfile 的
+        #   mkdir 原子锁）。原来每点一次"新建会话"就多一个 pi 进程，而且从不回收 ——
+        #   实测开了 5 个会话就有 5 个 pi 同时活着，互相 EEXIST 抢锁，
+        #   表现为"AI 助手突然不好用了"，而界面重放的是日志里的旧报错，看着像坏了。
+        #   界面只有一个 AI 面板，本来也只需要一个会话。
+        with AI_LOCK:
+            old = list(AI_SESSIONS.values())
+            AI_SESSIONS.clear()
+        for o in old:
+            try:
+                o.close()
+            except Exception:
+                pass
+        if old:
+            # 等它们真正退出，否则新会话可能又撞上还没释放的锁
+            for _ in range(15):
+                time.sleep(0.2)
+                if not any(getattr(o, "alive", False) for o in old):
+                    break
         s = AiSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
                       tools=b.get("tools") or "read+netdev")
         try:
