@@ -360,7 +360,7 @@ button .bi, .mono .bi{pointer-events:none}
   flex:0 0 auto;color:var(--g);border-color:var(--g1)}
 .ai-in button.icon-btn:hover{background:rgba(var(--g-rgb),.30);border-color:var(--g);color:var(--g)}
 .ai-in button.icon-btn .dots{margin:0;vertical-align:0;
-  grid-template-columns:repeat(3,4px);grid-template-rows:repeat(3,4px);gap:1.5px}
+  grid-template-columns:repeat(3,4.5px);grid-template-rows:repeat(3,4.5px);gap:1.5px}
 /* ⚠ 这里必须用 animation-name 长写法，**不能用 animation 简写**：
    简写会把 animation-delay 一并重置为 0，于是那个"按对角线错峰"的
    .dots i:nth-child(n){animation-delay:…} 整组被吃掉 ——
@@ -369,7 +369,12 @@ button .bi, .mono .bi{pointer-events:none}
    品牌那是装饰，可以亮到 .16 再回来；停止按钮是控件，闪到快看不见就没法点了。
    所以单独一个 keyframes，峰值/节奏/时长都不动，只改低谷值。 */
 @keyframes dotpulse-btn{0%,70%,100%{opacity:.38}35%{opacity:1}}
-.ai-in button.icon-btn .dots i{width:4px;height:4px;opacity:1;animation-name:none}
+/* 点阵用**圆点**（2026-10-04 用户要求，与设备行/顶栏的"在线"小圆点同一套形状语言）。
+   只改这个按钮 —— 品牌标识与 .bk-busy 仍保持方正点阵，各司其职。
+   注：4px 圆形的墨量比同尺寸方形少约 21%，所以把尺寸抬到 4.5px 补回来，
+   间距 1.5px 不动（对角线错峰节奏靠的是 animation-delay，不是间距）。 */
+.ai-in button.icon-btn .dots i{width:4.5px;height:4.5px;border-radius:50%;
+  opacity:1;animation-name:none}
 /* 活动态 = 绿（与设备行/顶栏的"在线"圆点同一条规则，2026-10-04 用户要求）。
    空闲时仍是主题主色（极简主题下就是黑），一跑起来才变绿 —— 这样"它在动"
    这件事在浅色主题下也有颜色信号，光靠闪烁是不够的。 */

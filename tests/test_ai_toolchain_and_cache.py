@@ -648,6 +648,10 @@ def test_ai_stop_button_dotmatrix():
          那组对角错峰一并重置为 0，9 个点变成同步闪烁。
          观感完全变了，但**没有任何报错**、也不影响任何接口。
       ③ `aiBusy()` 必须同时管到停止按钮（它原先只管 AI 标题后面那个网状图标）。
+      ④ 点阵必须是**圆点**（2026-10-04 追加）—— 与设备行/顶栏那个"在线"小圆点
+         统一形状语言。这里最容易踩的是**只加 border-radius 不改栅格**：
+         格子还是 4px 而点变成 4.5px，点会溢出格子（overflow 可见所以不报错，
+         但排布会歪），以及**顺手把品牌标识也改圆**（用户只要求这一个按钮）。
     """
     print("\n[7] AI 面板停止按钮：3×3 点阵")
     html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
@@ -679,6 +683,22 @@ def test_ai_stop_button_dotmatrix():
     # ④ ink（墨水屏）主题会冻结动画并把点阵压暗；停止按钮是**控件**，要单独提亮
     check("ink 主题下停止按钮点阵单独提亮",
           '[data-theme="ink"] .ai-in .dots.stop i' in html)
+
+    # ⑤ 点阵是**圆点**（2026-10-04 用户要求）
+    def _rule(sel: str) -> str:
+        i = html.index(sel)
+        return html[i:html.index("}", i)]
+
+    dot_i = _rule(".ai-in button.icon-btn .dots i{")
+    check("停止按钮的点是圆形（border-radius:50%）", "border-radius:50%" in dot_i, dot_i)
+    check("圆形墨量比方形少，尺寸已补回来（4.5px 而非 4px）",
+          "width:4.5px" in dot_i and "height:4.5px" in dot_i, dot_i)
+    check("★ 栅格跟着改成 4.5px（只加圆角不改栅格 → 点会溢出格子，不报错但排布歪）",
+          "grid-template-columns:repeat(3,4.5px)" in html)
+    # 反例：只改了停止按钮，品牌标识与「接入中」仍是方正点阵
+    check("品牌标识仍是方点（用户只要求改这一个按钮）",
+          "border-radius" not in _rule(".brand .dots.logo i{"))
+    check(".bk-busy（接入中）仍是方点", "border-radius" not in _rule(".bk-busy .dots i{"))
 
 
 # ======================================================================
