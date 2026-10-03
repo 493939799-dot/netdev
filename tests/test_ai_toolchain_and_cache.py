@@ -46,18 +46,31 @@ def check(name: str, cond: bool, detail: str = ""):
 import platforms as P  # noqa: E402
 
 
+_UI_SERVER = None
+_UI_SERVER_TRIED = False
+
+
 def load_ui_server():
-    """把 ui/server.py 当模块加载（失败返回 None，并把原因记成一条 NG）。"""
+    """把 ui/server.py 当模块加载（失败返回 None，并把原因记成一条 NG）。
+
+    会缓存结果 —— 多个测试组都要用它，重复 import 既没意义，
+    又会让"可导入"这条 check 被重复计数、把用例总数搅乱。
+    """
+    global _UI_SERVER, _UI_SERVER_TRIED
+    if _UI_SERVER_TRIED:
+        return _UI_SERVER
+    _UI_SERVER_TRIED = True
     ui = ROOT / "ui"
     if str(ui) not in sys.path:
         sys.path.insert(0, str(ui))
     try:
         import server as S          # noqa: E402
         check("ui/server.py 可导入（语法 / 依赖无误）", True)
-        return S
+        _UI_SERVER = S
     except Exception as e:
         check("ui/server.py 可导入（语法 / 依赖无误）", False, f"{type(e).__name__}: {e}")
-        return None
+        _UI_SERVER = None
+    return _UI_SERVER
 
 
 # ======================================================================
@@ -198,6 +211,121 @@ def test_host_shim_strip():
     finally:
         os.environ.clear()
         os.environ.update(old)
+
+    # ── 7) ★ 2026-10-04：Python 侧（sitecustomize.py）──────────────────────
+    #    上一轮只修了 Node 侧，漏了这条，于是"快照删不掉"。
+    #    宿主把 shim 目录塞进 PYTHONPATH，里面的 sitecustomize.py 会在解释器启动时
+    #    被自动 import，接管 shutil.rmtree；被「批量删除守卫」拦下时 raise SystemExit。
+    #    ★ PYTHONPATH 写的是**目录本身（无尾斜杠）**，所以匹配特征也必须是
+    #      `/cli/vendor/shim` —— 原来带尾斜杠的写法对它**匹配不到**（这就是漏网的原因）。
+    env = {"PYTHONPATH": SHIM}
+    S._strip_host_shim(env)
+    check("PYTHONPATH = 宿主 shim 目录（无尾斜杠）时整键删除", "PYTHONPATH" not in env, str(env))
+
+    env = {"PYTHONPATH": f"{SHIM}:/home/u/mylib"}
+    S._strip_host_shim(env)
+    check("PYTHONPATH 混用时只剔 shim 那一段（保留用户自己的）",
+          env.get("PYTHONPATH") == "/home/u/mylib", str(env))
+
+    env = {"PYTHONPATH": "/home/u/mylib:/opt/pkgs"}
+    before = dict(env)
+    S._strip_host_shim(env)
+    check("PYTHONPATH 与宿主无关时零改动", env == before, f"{before} → {env}")
+
+    # 宿主为 shim 专门注入的键：连路径一起清掉。
+    # 残留"半套配置"会让 shim 走到"helper 不可用"分支 —— 那条分支同样是 SystemExit。
+    env = {"GENIE_TRASH_DIR": "/Applications/WorkBuddy.app/Contents/Resources/vendor/genie-trash",
+           "CODEBUDDY_SAFE_DELETE_ENABLED": "1",
+           "CODEBUDDY_SAFE_DELETE_BULK_THRESHOLD": "50",
+           "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS": "/tmp/x/broker.sock",
+           "CODEBUDDY_BROKERED_BIN_DIR": f"{SHIM}/brokered-bin",
+           "CODEBUDDY_CONFIG_DIR": "/Users/mac/.workbuddy",   # 与 shim 无关 → 必须留
+           "HOME": "/Users/mac"}
+    S._strip_host_shim(env)
+    for dead in ("GENIE_TRASH_DIR", "CODEBUDDY_SAFE_DELETE_ENABLED",
+                 "CODEBUDDY_SAFE_DELETE_BULK_THRESHOLD",
+                 "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS", "CODEBUDDY_BROKERED_BIN_DIR"):
+        check(f"剥掉宿主 shim 专用变量 {dead}", dead not in env, str(env))
+    check("**不能**误伤无关的 CODEBUDDY_*（如配置目录）",
+          env.get("CODEBUDDY_CONFIG_DIR") == "/Users/mac/.workbuddy", str(env))
+    check("不能误伤 HOME", env.get("HOME") == "/Users/mac", str(env))
+
+
+# ======================================================================
+# 三之二、批量删除守卫把删除变成 SystemExit：必须翻译成人话，且根因要堵住
+# ======================================================================
+def test_bulk_delete_guard_translation():
+    """2026-10-04 真事故回归：界面里点「彻底删除快照」连续 4 次只报 Load failed。
+
+    真因链（每一环都已实证）：
+      宿主把 shim 目录注入 PYTHONPATH → shim/sitecustomize.py 被解释器自动 import →
+      接管 shutil.rmtree → 删除前跑「批量删除守卫」（按轮次累计待删文件数，本机阈值 50）→
+      超阈值时 raise SystemExit(1) → **SystemExit 是 BaseException**，
+      业务的 `except Exception` 接不住 → 穿透 HTTP 处理函数；而
+      `threading.excepthook` 对 SystemExit **静默忽略** → 日志里连 traceback 都没有 →
+      连接断开 → 浏览器只报一句 "Load failed"。
+
+    现场证据：`logs/ui-service.log` 里
+      [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":53,"threshold":50,...}
+    连出 4 条。
+    """
+    print("\n[3b] 宿主批量删除守卫：SystemExit 必须被翻译成人话")
+    S = load_ui_server()
+    from lib import snapshot as SN       # noqa: E402  （lib/ 内部互相用相对导入，只能整包引）
+
+    orig = shutil.rmtree
+    try:
+        def _boom(*a, **k):
+            raise SystemExit(1)          # 与 sitecustomize.py 的真实行为一致
+        shutil.rmtree = _boom
+        try:
+            SN.rm_tree(ROOT / "backups" / "snapshots_trash" / "探针")
+            check("rm_tree 遇 SystemExit 必须抛错（不许静默通过）", False, "没有抛错")
+        except PermissionError as e:
+            msg = str(e)
+            check("rm_tree 把 SystemExit 翻成 PermissionError（Exception 能接住）", True)
+            check("错误里点明是宿主守卫干的", ("守卫" in msg and "宿主" in msg), msg[:160])
+            check("错误里点明 SystemExit 这一层", "SystemExit" in msg, msg[:160])
+            check("错误里给了补救动作 netdev ui restart", "netdev ui restart" in msg, msg[:160])
+        except BaseException as e:       # noqa: BLE001
+            check("rm_tree 把 SystemExit 翻成 PermissionError", False,
+                  f"抛的是 {type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree = orig
+
+    # 加固不许影响正常路径
+    d = tempfile.mkdtemp(prefix="netdev-rmtree-")
+    (pathlib.Path(d) / "x").write_text("x", encoding="utf-8")
+    SN.rm_tree(d)
+    check("rm_tree 正常路径照常删除", not pathlib.Path(d).exists())
+
+    srv_src = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
+    cli_src = (ROOT / "netdev_cli.py").read_text(encoding="utf-8")
+
+    # 调用点必须真的用上它，否则加固只是摆设
+    check("server.snap_purge 走 S.rm_tree", "S.rm_tree(" in srv_src)
+    check("server 不再裸调 _sh.rmtree", "_sh.rmtree" not in srv_src)
+    check("netdev CLI 的 purge 走 S.rm_tree", "S.rm_tree(" in cli_src)
+    check("netdev CLI 不再裸调 _sh.rmtree", "_sh.rmtree" not in cli_src)
+    check("HTTP 层显式兜住 SystemExit", "except (Exception, SystemExit)" in srv_src)
+
+    # ★ 根因修复：守护进程必须在 os.execv **之前**净化环境。
+    #   只净化"子进程的 env"是不够的 —— 钩子是在本进程启动阶段 import 进来的，撤不掉。
+    dz = (ROOT / "ui" / "daemonize.py").read_text(encoding="utf-8")
+    check("daemonize 引入了宿主钩子剥离", "strip_host_injection" in dz)
+    check("daemonize 在 os.execv 之前净化环境",
+          dz.index("strip_host_injection(os.environ)") < dz.index("os.execv("),
+          "顺序反了就等于没修")
+
+    # 界面：删除成功的提示不再倒 CLI 原始输出（\r 重绘 + ANSI 会拼成乱码）
+    html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+    seg = html[html.index("if(a==='del')"):html.index("if(a==='restore')")]
+    check("快照「删除」分支不再倒 CLI 原始 stdout/stderr",
+          ("r.stdout" not in seg) and ("r.stderr" not in seg), seg[-200:])
+    check("_api_snap_rm 的输出过了 clean_cli_tail", "clean_cli_tail(out" in srv_src)
+    if S is not None:
+        check("CLI 原始输出已去 ANSI 与 \\r 重绘",
+              "\r" not in S.clean_cli_tail("\x1b[2K进度1\r\x1b[32m✔ 好了\x1b[0m", 200))
 
 
 # ======================================================================
@@ -512,6 +640,7 @@ def main():
     test_cmd_cache()
     test_detect()
     test_host_shim_strip()
+    test_bulk_delete_guard_translation()
     test_py_files_compile()
     test_mcp_contract()
     test_ai_toolchain()

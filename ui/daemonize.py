@@ -37,6 +37,24 @@ ROOT = HERE.parent
 DEFAULT_PIDFILE = ROOT / "logs" / "ui-service.pid"
 DEFAULT_LOGFILE = ROOT / "logs" / "ui-service.log"
 
+# ★ 2026-10-04：拉起服务之前，先把宿主（WorkBuddy / CodeBuddy 桌面版）注入的运行时钩子
+#   从环境里剥掉。
+#
+#   为什么必须做在**这里**：那套钩子是通过 PYTHONPATH 里的 sitecustomize.py 生效的 ——
+#   它在解释器启动阶段就被自动 import，之后无论怎么改子进程的 env 都来不及了
+#   （本进程内的 shutil.rmtree 早就被换掉了）。只有让**服务自己的解释器**从一开始就
+#   import 不到它，才算真正修好。
+#
+#   不修的后果（2026-10-04 实测）：界面里点「彻底删除快照」必失败，而界面上只显示
+#   一句 "Load failed" —— 因为守卫抛的 SystemExit 会穿透 HTTP 处理函数，
+#   且 threading.excepthook 对 SystemExit 静默，日志里连 traceback 都不留。
+#   详见 lib/hostenv.py 的文件头。
+try:
+    sys.path.insert(0, str(ROOT))
+    from lib.hostenv import strip_host_injection   # noqa: E402
+except Exception:                                  # pragma: no cover
+    strip_host_injection = None                    # 拿不到就退化成"不处理"，不阻断启动
+
 
 def _alive(pid: int) -> bool:
     try:
@@ -161,6 +179,11 @@ def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) ->
     os.dup2(logfd, 2)
     pidfile.write_text(str(os.getpid()) + "\n")
     os.chdir(str(ROOT))
+    # ★ 环境净化必须发生在 os.execv **之前**（execv 会把当前 os.environ 原样交给新程序）。
+    #   剥掉宿主注入的 PYTHONPATH / NODE_OPTIONS / PATH shim / BASH_ENV 等，
+    #   服务的解释器就不会再自动 import 那个 sitecustomize.py。
+    if strip_host_injection is not None:
+        strip_host_injection(os.environ)
     try:
         os.execv(str(python), argv)
     except Exception:

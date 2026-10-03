@@ -153,6 +153,72 @@ shim 的 `brokered-bin` / `safe-bin` 会把 `mkdir` / `rm` 换成受管版本，
 
 这是"不做也能跑、但在宿主里必挂"的那一类修复，对**双击启动**的用户是空操作。
 
+### 修复：快照「彻底删除」只报 `Load failed`（同一个 shim，Python 侧 —— 上一轮漏了）
+
+**症状**：界面「快照管理」里点「彻底删除」，**连续 4 次**都是失败，提示只有一句
+`Load failed`；同一批操作里「已移入回收区」的成功提示还会显示成
+`已移入回收区：收区，不裸删）：2 份[0m #2 …` 这种拼接乱码。
+更要命的是 `logs/ui-service.log` 里**连 traceback 都没有** —— 看起来像"什么都没发生"。
+
+**真因**：宿主那套 shim 不只有 Node 半边。**同一个目录还被塞进 `PYTHONPATH`**，
+里面的 `sitecustomize.py` 会在**解释器启动时**被自动 import，把
+`os.remove` / `os.unlink` / `os.rmdir` / `shutil.rmtree` / `pathlib.Path.unlink`
+全部换成受管版本；每次真正删除前跑一次「批量删除守卫」——
+按**轮次**累计待删文件数，超过阈值（本机 `CODEBUDDY_SAFE_DELETE_BULK_THRESHOLD=50`）
+就打印标记并 **`raise SystemExit(1)`**。
+
+**为什么界面只说 `Load failed`**（三层叠在一起，每一层都在掩盖上一层）：
+
+| 层 | 发生了什么 |
+|---|---|
+| `SystemExit` 是 `BaseException` | 业务代码里的 `except Exception` **接不住**，一路穿透 HTTP 处理函数 |
+| `threading.excepthook` 对 `SystemExit` **静默忽略** | 日志里连 traceback 都不留，排障时"无迹可寻" |
+| 连接被断开 | 浏览器只剩 WebKit 对网络级失败的文案 `Load failed` |
+
+所以用户看到的是"netdev 删不掉快照"，而不是"宿主拦了这次删除"。
+
+**现场实据**（`logs/ui-service.log`，连出 5 条，时间点正是界面报错的那几次）：
+
+```
+[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":53,"threshold":50,
+  "scope":"turn","targets":["…/snapshots_trash/huawei_…_removed-20261004_004344"],
+  "targetCount":1}
+```
+
+**为什么"只删一项"也会中招**：守卫的计数是**本轮累计**，不是单次目标大小。
+用户先「清空回收区」批量删掉了 50+ 项 ⇒ 计数越线 ⇒ 此后**每一次**删除
+（哪怕只删一个目录）都直接命中。这也解释了"以前能用、突然就不能用了"。
+
+**乱码的真因**：前端把 CLI 原始输出 `slice(-300)` 直接贴进对话框 ——
+而那是同一条行用 `\r` **反复重绘**、还带 ANSI 颜色码的进度文本，
+从半帧中间切开就成了拼接乱码。
+
+**修法（根因 + 兜底 + 可读性，三层）**：
+
+- **根因**：新增 `lib/hostenv.py`，`ui/daemonize.py` 在 `os.execv` **之前**剥掉宿主注入的
+  `PYTHONPATH` / `NODE_OPTIONS` / `PATH` shim / `BASH_ENV` 及 `GENIE_TRASH_DIR`、
+  `CODEBUDDY_SAFE_DELETE_*` 等专用键。
+  **必须在 `execv` 之前** —— 钩子是在解释器启动阶段 import 进来的，
+  之后无论怎么改子进程的 env 都来不及（本进程里的 `shutil.rmtree` 早被换掉了）。
+  实测：净化后 execv 出来的新解释器 `PYTHONPATH` 为空、`sitecustomize` 未加载、
+  `shutil.rmtree` 是原生实现。
+- **兜底**：`lib/snapshot.py` 新增 `rm_tree()`，把 `SystemExit` 翻成**带解释的**
+  `PermissionError`；所有物理删除点（界面 `snap_purge`、CLI 的
+  `snap rm --purge` / `snap purge`）一律改走它，不再裸调 `shutil.rmtree`。
+  HTTP 处理函数显式写成 `except (Exception, SystemExit)`。
+  即便将来宿主换一套拦法，用户看到的也是"原因 + 补救动作"，而不是 `Load failed`。
+- **可读性**：`ui/server.py` 新增 `clean_cli_tail()`（先剥 ANSI，再对每行只保留
+  最后一个 `\r` 之后的内容 = 该行**最终态**）；界面在删除**成功**时不再倒原始输出，
+  失败时才给一句可读原因。
+
+`netdev ui restart` 后即可生效 —— **这个修复必须重启服务**，因为钩子是在服务
+启动那一刻注入的（`netdev doctor` 会提示"跑的是旧代码"，就是为这类情况准备的）。
+
+**新增守门测试**：断言 `SystemExit` 会被翻译（含三处提示文案）、两个删除调用点
+确实走 `rm_tree`、源码里不再有裸 `_sh.rmtree`、`daemonize` 里
+`strip_host_injection(os.environ)` 出现在 `os.execv(` **之前**（顺序反了就等于没修）、
+以及 PYTHONPATH / 宿主专用键被剥离而 `CODEBUDDY_CONFIG_DIR` / `HOME` 不被误伤。
+
 ### 修复：`netdev selftest` 在端口被占时会给出**假红**
 
 上一轮 `netdev mock` 留下的实例还占着端口时，自检自己的模拟器静默 bind 失败

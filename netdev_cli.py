@@ -1162,8 +1162,9 @@ def cmd_snap(a):
                 raise SystemExit("✘ 物理删除属破坏性操作，必须加 --yes")
             for sn in targets:
                 S.sha256_file  # noqa
-                import shutil as _sh
-                _sh.rmtree(sn["dir"])
+                # ★ 2026-10-04：走 S.rm_tree（把宿主「批量删除守卫」的 SystemExit
+                #   翻成可读错误），别再裸调 shutil.rmtree。
+                S.rm_tree(sn["dir"])
                 S.index_record({**{k: sn.get(k) for k in ("idx", "id", "at", "tag")}, "device": sn.get("device", "")},
                                "", "purged")
                 print(f"  {C['red']}已物理删除{C['reset']} #{sn.get('idx')} {sn['id']}")
@@ -1219,10 +1220,20 @@ def cmd_snap(a):
             for d_ in items[:10]:
                 print(f"  {d_.name}")
             return 0
-        import shutil as _sh
-        for d_ in items:
-            _sh.rmtree(d_)
-            print(f"  {C['red']}已删除{C['reset']} {d_.name}")
+        # ★ 2026-10-04：走 S.rm_tree。被宿主守卫拦下时它会抛带解释的 PermissionError，
+        #   比裸 shutil.rmtree 的「SystemExit 静默终止进程」好排障得多。
+        #   整批任何一条失败都立刻中止并把已完成的数量讲清楚，不留"删了一半"的疑团。
+        done = 0
+        try:
+            for d_ in items:
+                S.rm_tree(d_)
+                done += 1
+                print(f"  {C['red']}已删除{C['reset']} {d_.name}")
+        except Exception as e:
+            print(f"{C['red']}✘ 删除在 {done}/{len(items)} 处中断：{e}{C['reset']}")
+            if done:
+                print(f"{C['dim']}已成功删除 {done} 项，剩余 {len(items) - done} 项留在回收区。{C['reset']}")
+            return 1
         return 0
 
     if act == "list":

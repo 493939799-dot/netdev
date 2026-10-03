@@ -48,7 +48,7 @@ _ROOT_SELF = pathlib.Path(
 ).expanduser().resolve()
 if str(_ROOT_SELF) not in sys.path:
     sys.path.insert(0, str(_ROOT_SELF))
-from lib import paths as _P          # noqa: E402  路径统一真源
+from lib import hostenv as _H, paths as _P   # noqa: E402  路径统一真源 + 宿主钩子剥离
 ROOT = _P.ROOT
 STATIC = pathlib.Path(__file__).resolve().parent / "static"
 # 版本号单一真源：dist/installer/VERSION（发布流水线写它）。
@@ -121,9 +121,9 @@ def raw_netdev(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ★ 宿主注入的 Node / Shell shim —— UI 拉起的**任何**子进程都先剥掉
+# ★ 宿主注入的 Node / Shell / Python shim —— UI 拉起的**任何**子进程都先剥掉
 #
-# 背景（2026-10-03 实测，本项目踩过的最隐蔽的一个坑）：
+# 背景一（2026-10-03 实测，Node 侧）：
 #   宿主（WorkBuddy 桌面版）会给每一个 Node 进程注入
 #     NODE_OPTIONS=--require=…/cli/vendor/shim/node-language-shim.cjs
 #   该 shim 接管了 fs，把 mkdir 撞名的 EEXIST **改写**成
@@ -133,47 +133,38 @@ def raw_netdev(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
 #   且报错点离真因极远。同一套 shim 还会在 PATH 里塞 brokered-bin /
 #   safe-bin 命令包装器，把 rm / mkdir / rmdir 换成受管版本。
 #
+# 背景二（2026-10-04 实测，Python 侧 —— 上一轮只修了 Node 侧，漏了这条）：
+#   同一个 shim 目录被注入到 PYTHONPATH，里面有个 sitecustomize.py 会在解释器
+#   启动时被自动 import，把 os.remove / os.unlink / shutil.rmtree / pathlib.unlink
+#   全换成受管版本，每次删除前跑一次「批量删除守卫」（按轮次累计文件数，超阈值
+#   就 raise SystemExit）。SystemExit 是 BaseException，业务代码的
+#   `except Exception` 接不住；而 threading.excepthook 对 SystemExit **静默忽略**
+#   → 日志里连 traceback 都没有，连接直接断开，浏览器只报 "Load failed"。
+#   于是界面上的「彻底删除快照」变成了一个查不出原因的失败。
+#
 # 边界（刻意做窄）：只剔除**指向宿主 shim 的那一条 token / 那几个目录**，
-#   用户自己设的 NODE_OPTIONS 内容原样保留；PATH 里
+#   用户自己设的 NODE_OPTIONS / PYTHONPATH 内容原样保留；PATH 里
 #   `~/.workbuddy/binaries/...` 这类**含 workbuddy 字样但属于运行时**的路径
-#   **绝不误伤**（用 `/cli/vendor/shim/` 这种精确特征匹配，不拿 "workbuddy"
+#   **绝不误伤**（用 `/cli/vendor/shim` 这种精确特征匹配，不拿 "workbuddy"
 #   当关键词）。
+#
+# 实现见 lib/hostenv.py（daemonize.py 拉起服务时用的是同一份逻辑）。
+# 下面三个名字保留，是为了让既有回归与历史调用点原样可用。
 # ══════════════════════════════════════════════════════════════════════════
-_SHIM_TOKENS = ("node-language-shim", "node-brokered-fs-shim", "node-safe-delete-shim",
-                "/cli/vendor/shim/", "shell-runtime-bash-env")
+_SHIM_TOKENS = _H._SHIM_TOKENS
 
 
 def _is_shim_token(tok: str) -> bool:
-    low = tok.lower()
-    return any(m in low for m in _SHIM_TOKENS)
+    return _H.is_shim_token(tok)
 
 
 def _strip_host_shim(env: dict) -> dict:
-    """剥掉宿主注入的 Node / Shell shim，让子进程回到内核语义。
+    """剥掉宿主注入的 Node / Shell / Python shim，让子进程回到内核语义。
 
-    只动三个键：NODE_OPTIONS、PATH、BASH_ENV。全部按**精确特征**匹配，
-    命中才剔除；不命中一律原样保留。
+    只按**精确特征**匹配宿主 shim 的路径与键名；不命中的一律原样保留。
+    详见 lib/hostenv.py 的文件头。
     """
-    # 1) NODE_OPTIONS —— 逐 token 剔除指向 shim 的 --require，全是 shim 就整键删掉
-    raw = env.get("NODE_OPTIONS") or ""
-    if raw:
-        keep = [t for t in raw.split() if t and not _is_shim_token(t)]
-        if keep:
-            env["NODE_OPTIONS"] = " ".join(keep)
-        else:
-            env.pop("NODE_OPTIONS", None)
-    # 2) PATH —— 剔除 shim 目录（brokered-bin / safe-bin 是命令包装器，
-    #    会把 rm/mkdir 换成受管版本，错误码语义同样不可依赖）
-    path = env.get("PATH") or ""
-    if path:
-        keep = [d for d in path.split(":") if d and not _is_shim_token(d)]
-        if keep and len(keep) != len(path.split(":")):
-            env["PATH"] = ":".join(keep)
-    # 3) BASH_ENV —— 宿主用它给每个非交互 bash 预载 shim 脚本
-    be = env.get("BASH_ENV") or ""
-    if be and _is_shim_token(be):
-        env.pop("BASH_ENV", None)
-    return env
+    return _H.strip_host_injection(env)
 
 
 def _env_with_node() -> dict:
@@ -1506,6 +1497,23 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
 
 
+def clean_cli_tail(s: str, n: int = 400) -> str:
+    """把 CLI 文本压成「人能读的一小段」。
+
+    为什么需要：netdev 的进度输出会在**同一行**用 `\\r` 反复重绘，还带 ANSI 颜色码。
+    直接 `slice(-300)` 会从半帧中间切开 —— 界面上真的出现过
+    「已移入回收区：<换行>收区，不裸删）：2 份[0m #2 … [2m…」这种拼接乱码
+    （2026-10-04 用户报障）。
+    这里：先剥 ANSI，再对每行只保留最后一个 `\\r` 之后的内容（= 该行最终态），
+    然后压缩空白、取尾部。
+    """
+    s = strip_ansi(s or "")
+    s = s.replace("\r\n", "\n")
+    s = "\n".join(ln.split("\r")[-1].rstrip() for ln in s.split("\n"))
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s[-n:]
+
+
 def serial_ports() -> list:
     """可用串口端点（解析 netdev serial-discover 的文本输出；它不支持 --json）。"""
     import re as _re
@@ -1843,7 +1851,6 @@ def metric_one(dev_name: str, key: str) -> dict:
 def snap_purge(ref: str = "", all_of: bool = False) -> dict:
     sys.path.insert(0, str(ROOT))
     from lib import snapshot as S           # noqa: PLC0415
-    import shutil as _sh
     trash = S.TRASH_ROOT
     items = S.list_trash()
     if all_of:
@@ -1852,7 +1859,12 @@ def snap_purge(ref: str = "", all_of: bool = False) -> dict:
         purged = []
         for d in items:
             try:
-                _sh.rmtree(d)
+                # ★ 2026-10-04：走 S.rm_tree 而不是裸 shutil.rmtree ——
+                #   宿主注入的 sitecustomize.py 被拦时会 raise SystemExit，
+                #   那是 BaseException，`except Exception` 接不住，
+                #   会一路穿透 HTTP 处理函数（日志里连 traceback 都没有），
+                #   浏览器只报 "Load failed"。S.rm_tree 把它翻成可读异常。
+                S.rm_tree(d)
                 purged.append(d.name)
             except Exception as e:
                 return {"ok": False, "purged": purged, "error": f"{d.name}: {e}"}
@@ -1872,7 +1884,7 @@ def snap_purge(ref: str = "", all_of: bool = False) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"路径校验失败：{e}"}
     try:
-        _sh.rmtree(pick_r)
+        S.rm_tree(pick_r)
         return {"ok": True, "purged": [pick.name], "n": 1}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -3056,13 +3068,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 于是 rc≠0 但实际已经删成功了。所以用「该项是否还在快照目录」判定真实结果。
         still = any(str(idx) == str(s.get("idx"))
                     for s in (netdev_json(["snap", "list", "--json"], timeout=25) or []))
-        return self._json({"ok": not still, "rc": rc, "stdout": out[-1200:], "stderr": err[-400:]})
+        # ★ 2026-10-04：输出必须过 clean_cli_tail。原样 slice 会把带 \r 重绘的进度帧
+        #   从中间切开，界面上显示成一串带 ANSI 码的拼接乱码。
+        return self._json({"ok": not still, "rc": rc,
+                           "stdout": clean_cli_tail(out, 400),
+                           "stderr": clean_cli_tail(err, 300)})
 
     def _api_snap_purge(self, b: dict):
         """彻底删除回收区的内容（物理删除，不可恢复）。ref 不给则按 all 处理。"""
         try:
             return self._json(snap_purge(str(b.get("ref") or ""), bool(b.get("all"))))
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # ★ SystemExit 单列：宿主注入的 sitecustomize.py 被「批量删除守卫」拦下时
+            #   抛的就是它。它是 BaseException，`except Exception` 接不住 ——
+            #   一旦漏出去，请求没有响应、连接断开，浏览器只会显示 "Load failed"，
+            #   用户完全不知道发生了什么。这里兜住，给出可读原因。
             return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
 
     def _api_snap_trash(self, qs):

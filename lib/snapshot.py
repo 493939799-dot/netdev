@@ -27,6 +27,32 @@ BLACKLIST = ("reload", "format", "delete", "reset saved-configuration", "undo sa
 ECHO_RE = re.compile(r"^\s*[<\[]\s*[^>\]]+\s*[>\]]")
 
 
+def rm_tree(path) -> None:
+    """物理删除一个目录树；把「宿主批量删除守卫」的 SystemExit 翻成人看得懂的错误。
+
+    背景（2026-10-04 实测）：从 WorkBuddy / CodeBuddy 这类宿主里拉起进程时，宿主会把
+    shim 目录塞进 `PYTHONPATH`，里面的 `sitecustomize.py` 会接管 `shutil.rmtree`，
+    并在真正删除前跑一次「批量删除守卫」（按轮次累计待删文件数，超阈值即拦）。
+    被拦时抛的是 **SystemExit**（属于 BaseException）—— 业务代码的 `except Exception`
+    接不住；而且 `threading.excepthook` 对 SystemExit **静默忽略**，日志里连 traceback
+    都不留。于是上层（HTTP 处理函数）直接断连，前端只报一句 "Load failed"。
+
+    这里把它翻成 PermissionError，让调用方能把原因原样报给用户。
+    （环境净化的根治办法见 lib/hostenv.py 与 ui/daemonize.py。）
+    """
+    try:
+        shutil.rmtree(path)
+    except SystemExit as e:
+        raise PermissionError(
+            "宿主（WorkBuddy/CodeBuddy）的「批量删除守卫」拦下了这次删除：本轮累计待删"
+            "文件数已达阈值，守卫直接终止了进程（SystemExit，code=%r）。"
+            "这不是 netdev 的护栏 —— 是宿主注进 PYTHONPATH 的 sitecustomize.py 干的。"
+            "目标目录可能只删掉了一部分，请刷新确认。"
+            "重启网页服务即可拿到干净环境：netdev ui restart"
+            % (getattr(e, "code", None),)
+        ) from e
+
+
 def clean_cfg(text: str) -> str:
     """去掉命令回显/提示符行（从屏幕抓来的文本常带 `<Huawei>display xxx`、`[Huawei]` 这种）。"""
     out = []

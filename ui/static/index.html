@@ -2498,8 +2498,12 @@ async function snapAct(a, idx, id){
       modal.classList.remove('show');
       const r = await api('/api/snap/rm',{device:dev, idx:String(idx)});
       audit(r.ok?'WRITE':'FAIL', dev, `快照 #${idx} → 回收区${r.ok?'':'（失败）'}`);
+      // ★ 2026-10-04：成功时**不再**把 CLI 原始输出倒进对话框 —— 那是带 \r 重绘 + ANSI
+      //   颜色码的进度文本，切尾会得到「已移入回收区：/ 收区，不裸删）：2 份[0m #2…」
+      //   这种拼接乱码（用户实测报障）。失败时才用 errMsg(r) 给一句可读原因。
       say('系统',(r.ok?'🗑 已移入回收区：':'<span class="bad">删除失败：</span>')
-        +'<br><span class="m">'+esc((r.stdout||r.stderr||'').slice(-300))+'</span>','ai');
+        +'<b>'+esc(s.tag||('#'+idx))+'</b>'
+        +(r.ok?'':'<br><span class="m">'+esc(errMsg(r))+'</span>'),'ai');
       loadSnaps(); loadTrash();
     });
     modal.classList.add('show');
