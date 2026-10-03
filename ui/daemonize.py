@@ -106,16 +106,34 @@ def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) ->
 
     # ── double fork ──────────────────────────────────────────────────
     if os.fork() > 0:
-        # 父：等第一层子进程退出，然后报状态
-        os.wait()
-        time.sleep(1.2)
-        pid = read_pid(pidfile)
+        # 父：等第一层子进程退出，然后**轮询**到服务真的应答为止。
+        #
+        # 2026-10-03 修：原来这里是 `time.sleep(1.2)` 睡死 1.2 秒然后看一次。
+        # 在本机上服务 <1.2s 就起来，所以从没暴露；GitHub 的冷启动 runner 上
+        # 光是 import netmiko/scrapli/paramiko 就要好几秒，于是父进程提前判死刑，
+        # 报「启动后未能连上」——**而服务其实正在慢慢启动**。
+        # 后果连锁：紧接着的"重复 start"撞上 Address already in use（_bind）、
+        # status 说「无 PID 文件」、log 说「暂无日志」，全都是同一个根因。
+        #
+        # 教训（同本项目其他地方）：**固定 sleep 是误判的根源，一律换成轮询。**
+        try:
+            os.wait()          # 第一层子进程 fork 完就 _exit(0)，这里不会久等
+        except ChildProcessError:
+            pass
+        deadline = time.time() + float(os.environ.get("NETDEV_UI_START_TIMEOUT", "30"))
+        t0 = time.time()
+        pid = None
+        while time.time() < deadline:
+            pid = read_pid(pidfile)
+            if pid and _alive(pid) and port_open(port, host):
+                break
+            time.sleep(0.3)
         if pid and _alive(pid) and port_open(port, host):
             print(f"✔ netdev-ui 已在后台运行  http://{host}:{port}   PID {pid}")
             print(f"  日志：{logfile}")
             print(f"  停止：netdev ui stop   （等价于 python3 {HERE / 'daemonize.py'} --stop）")
             return 0
-        print(f"✘ 启动后未能连上 —— 看日志：{logfile}")
+        print(f"✘ 启动后未能连上（等了 {time.time() - t0:.0f} 秒仍无应答）—— 看日志：{logfile}")
         try:
             print(logfile.read_text(encoding="utf-8", errors="replace")[-1500:])
         except Exception:

@@ -80,9 +80,9 @@ jobs:
               echo "  ✔ $f 未被跟踪"
             fi
           done
-          echo "── 编译产物/缓存不应被跟踪 ──"
+          echo "── 编译产物/缓存不应被跟踪（.gitkeep 除外：它的作用就是让空目录存在）──"
           for pat in '.venv' '__pycache__' 'dist/deps' 'dist/stage' 'backups/' 'logs/' 'live/'; do
-            n=$(git ls-files -- "$pat" | wc -l | tr -d ' ')
+            n=$(git -c core.quotePath=false ls-files -- "$pat" | grep -v '/\.gitkeep$' | wc -l | tr -d ' ')
             if [ "$n" != "0" ]; then echo "  ✘ $pat 下有 $n 个文件被跟踪"; fail=1
             else echo "  ✔ $pat 干净"; fi
           done

@@ -76,7 +76,12 @@ def _health(port: int = PORT) -> dict | None:
     return None
 
 
-def _wait(pred, timeout=15.0, step=0.4) -> bool:
+def _wait(pred, timeout=None, step=0.4) -> bool:
+    # 2026-10-03：默认 15s 在 GitHub 冷启动 runner 上不够（那边光是 import
+    # netmiko/scrapli/paramiko 就要好几秒）。放宽到 40s，可用环境变量调。
+    # **只放宽等待，不放宽任何断言** —— 判据一条没动。
+    if timeout is None:
+        timeout = float(os.environ.get("NETDEV_TEST_WAIT", "40"))
     end = time.time() + timeout
     while time.time() < end:
         if pred():
