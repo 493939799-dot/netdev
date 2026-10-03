@@ -21,6 +21,13 @@ jobs:
     name: 离线自检 + 回归（macOS / Python 3.13）
     runs-on: macos-latest
     timeout-minutes: 20
+    env:
+      # GitHub 的 macOS runner 是全新虚拟机，第一次加载 cryptography/paramiko
+      # 的原生库要做代码签名校验，实测要 30 秒以上（本机不到 1.2 秒）。
+      # 启动等待上限给足，否则会误判"服务没起来"，并连锁产生
+      # "重复 start 撞端口 / status 说无 PID / 日志为空"这一串假象。
+      NETDEV_UI_START_TIMEOUT: "180"
+      NETDEV_TEST_WAIT: "90"
 
     steps:
       - uses: actions/checkout@v4

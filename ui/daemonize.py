@@ -120,7 +120,14 @@ def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) ->
             os.wait()          # 第一层子进程 fork 完就 _exit(0)，这里不会久等
         except ChildProcessError:
             pass
-        deadline = time.time() + float(os.environ.get("NETDEV_UI_START_TIMEOUT", "30"))
+        # 上限默认给到 120 秒：这是**后台服务**的启动，等久一点没有副作用，
+        # 而"等不够就误判失败"的代价很大（会连锁产生"重复 start 撞端口、
+        # status 说无 PID、日志为空"这一串假象）。
+        # 为什么需要这么久：GitHub 的 macOS ARM runner 是全新虚拟机，
+        # 第一次加载 cryptography / paramiko 的原生库要做代码签名校验，
+        # 实测要 30 秒以上（本机不到 1.2 秒，所以这个坑只在 CI 上暴露）。
+        # 调大：export NETDEV_UI_START_TIMEOUT=180
+        deadline = time.time() + float(os.environ.get("NETDEV_UI_START_TIMEOUT", "120"))
         t0 = time.time()
         pid = None
         while time.time() < deadline:
@@ -134,6 +141,8 @@ def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) ->
             print(f"  停止：netdev ui stop   （等价于 python3 {HERE / 'daemonize.py'} --stop）")
             return 0
         print(f"✘ 启动后未能连上（等了 {time.time() - t0:.0f} 秒仍无应答）—— 看日志：{logfile}")
+        print("  若是在 CI / 全新虚拟机上首次启动，冷启动可能要几十秒；"
+              "可用 NETDEV_UI_START_TIMEOUT 调大等待上限。")
         try:
             print(logfile.read_text(encoding="utf-8", errors="replace")[-1500:])
         except Exception:

@@ -27,6 +27,11 @@ jobs:
     name: 构建离线安装包并挂到 Release
     runs-on: macos-latest
     timeout-minutes: 45
+    env:
+      # GitHub 的 macOS runner 是全新虚拟机，第一次加载 cryptography/paramiko
+      # 的原生库要做代码签名校验，实测要 30 秒以上（本机不到 1.2 秒）。
+      NETDEV_UI_START_TIMEOUT: "180"
+      NETDEV_TEST_WAIT: "90"
 
     steps:
       - uses: actions/checkout@v4

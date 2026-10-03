@@ -100,9 +100,15 @@ def test_daemonize(tmp: pathlib.Path):
     py = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
 
     def run(*args):
+        # 2026-10-03：显式给足等待，不依赖默认值。
+        # 关键：daemonize 的等待上限（NETDEV_UI_START_TIMEOUT）必须 **小于**
+        # subprocess 自己的 timeout，否则还没等服务起来就被测试先掐死。
+        # GitHub 的 macOS ARM runner 冷启动实测要 30 秒以上（本机 <1.2s）。
+        env = dict(os.environ)
+        env["NETDEV_UI_START_TIMEOUT"] = os.environ.get("NETDEV_UI_START_TIMEOUT", "150")
         p = subprocess.run([py, str(daemon), "--port", str(PORT), "--host", HOST,
                             "--pidfile", str(pidf), "--logfile", str(logf), *args],
-                           capture_output=True, text=True, timeout=90)
+                           capture_output=True, text=True, timeout=240, env=env)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
 
     try:
@@ -158,12 +164,14 @@ def test_cli(tmp: pathlib.Path):
         "NETDEV_UI_HOST": HOST,
         "NETDEV_UI_PIDFILE": str(pidf),
         "NETDEV_UI_LOGFILE": str(logf),
+        # 同上：等待上限必须小于 subprocess 的 timeout
+        "NETDEV_UI_START_TIMEOUT": os.environ.get("NETDEV_UI_START_TIMEOUT", "150"),
     })
     py = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
 
     def ui(*args):
         p = subprocess.run([py, str(ROOT / "netdev_cli.py"), "ui", *args],
-                           capture_output=True, text=True, timeout=90, env=env)
+                           capture_output=True, text=True, timeout=240, env=env)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
 
     try:
