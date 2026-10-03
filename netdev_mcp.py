@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 from lib import approval, creds, engine, gates, mirror  # noqa: E402
 
 PROTOCOL = "2024-11-05"
-SERVER = {"name": "netdev", "version": "1.0.2"}
+SERVER = {"name": "netdev", "version": "1.0.3"}
 
 # MCP 服务器“自我介绍”：客户端握手时会把它交给 AI，让 AI 知道本服务器是干什么的、
 # 什么时候该用、有什么硬规矩。（pi 侧由 pi-mcp-adapter 读取并在 AI 查 netdev 时展示）

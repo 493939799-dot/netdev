@@ -86,6 +86,10 @@ else
   printf "    ${D}[dry-run] rsync payload/netops/ → %s/${X}\n" "$PREFIX"
 fi
 ok "程序文件已就位（netdev / lib / tools / tests）"
+# ★ 2026-10-04 开箱即用验证发现：payload 里没有 dist/（打包时排除），
+#   而 ui/server.py 的版本号真源在 dist/installer/VERSION ⇒ 新装机器
+#   /api/health 永远显示 "dev"。把安装包根目录的 VERSION 拷进来当真源。
+if [ -f "$HERE/VERSION" ]; then run "cp -f '$HERE/VERSION' '$PREFIX/VERSION'"; fi
 
 # ── 3. 运行环境（venv + 依赖，离线优先） ───────────────────────────────────
 step "3/8 建 Python 环境并装依赖（离线优先）"
@@ -199,6 +203,15 @@ if [ "$DRY" = 0 ]; then
     fi
     if NETDEV_ROOT="$PREFIX" "$PREFIX/netdev" web repair >/dev/null 2>&1; then
       ok "已生成终端页命令（netdev web repair → $HOME/.pi/commands.json）"
+      # ★ 2026-10-04 开箱即用验证发现：web repair 只往 $HOME/.pi/ 写真身，
+      #   不会建 $PREFIX/config/pi-commands.json ⇒ 新装机器上 netdev doctor
+      #   恒报「缺：config/pi-commands.json」。按仓库自身的惯例收编：
+      #   config/ 放真身，$HOME/.pi/ 放软链 —— 与 doctor 的期望一致。
+      if [ -f "$HOME/.pi/commands.json" ]; then
+        cp -p "$HOME/.pi/commands.json" "$PREFIX/config/pi-commands.json" 2>/dev/null || true
+        rm -f "$HOME/.pi/commands.json"
+        ln -s "$PREFIX/config/pi-commands.json" "$HOME/.pi/commands.json" 2>/dev/null || true
+      fi
     else
       warn "netdev web repair 未成功（可稍后手动执行）"
     fi

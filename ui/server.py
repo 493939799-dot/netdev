@@ -54,13 +54,18 @@ STATIC = pathlib.Path(__file__).resolve().parent / "static"
 # 版本号单一真源：dist/installer/VERSION（发布流水线写它）。
 # 原来 /api/health 里硬编码 "0.1"，而 VERSION 是 1.0.0 —— 同一件事两个答案，
 # 排障时会被误当成"装的是旧版"。读不到就退回一个明确的开发版号，不要瞎猜。
+# ★ 2026-10-04 开箱即用验证发现：安装包 payload 里没有 dist/（打包时排除），
+#   于是新装机器上这里永远显示 "dev"。改成先看安装根目录的 VERSION
+#   （install.sh 会把安装包的 VERSION 拷到那里），dev 检出再退回 dist 那份。
 def _app_version() -> str:
-    vf = ROOT / "dist" / "installer" / "VERSION"
-    try:
-        v = vf.read_text(encoding="utf-8").strip()
-        return v or "dev"
-    except Exception:
-        return "dev"
+    for vf in (ROOT / "VERSION", ROOT / "dist" / "installer" / "VERSION"):
+        try:
+            v = vf.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except Exception:
+            pass
+    return "dev"
 
 
 APP_VERSION = _app_version()

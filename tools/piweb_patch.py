@@ -21,7 +21,7 @@
 
 用法：
     piweb_patch.py            # 打补丁 + 缓存击穿（幂等）
-    piweb_patch.py --check    # 体检：patched+busted / patched-only / original / missing
+    piweb_patch.py --check    # 体检：patched+busted / patched-only / original / missing / not-installed
     piweb_patch.py --revert   # 全部还原（删 -*-p1.js、index.html 指回原入口、面板恢复原内容）
     piweb_patch.py --verify   # 走 HTTP 验证“浏览器拿到的确实是打过补丁的代码”
 """
@@ -80,6 +80,11 @@ def _panel_ref(entry_file: pathlib.Path) -> str:
 
 # ── 状态检查 ────────────────────────────────────────────────
 def check() -> tuple[str, str]:
+    # ★ 2026-10-04 开箱即用验证发现：新装机（自带 ui/server.py）根本没装 pi-web-ui，
+    #   之前这里把「没装」和「装了但产物变了」混成一个 missing 报错 → doctor 永远误报。
+    #   pi-web-ui 是可选组件（v1.0.0 起自带界面），没装 = 跳过，不算问题。
+    if not (HOME / ".npm-global/lib/node_modules/pi-web-ui").exists():
+        return "not-installed", "未安装 pi-web-ui（可选组件）—— 工具台自带界面，不需要这个补丁"
     entry = _entry_name()
     panel_orig = _orig_panel()
     if not entry or not panel_orig or not INDEX_HTML.exists():
@@ -271,7 +276,8 @@ if __name__ == "__main__":
     if arg == "--check":
         st, note = check()
         print(f"[{st}] {note}")
-        sys.exit(0 if st == "patched+busted" else 1)
+        # not-installed 也算通过：可选组件没装，doctor 不该为此告警
+        sys.exit(0 if st in ("patched+busted", "not-installed") else 1)
     if arg == "--verify":
         ok, msg = verify_http()
         print(("✔ " if ok else "✘ ") + msg)

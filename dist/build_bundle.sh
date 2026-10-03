@@ -31,6 +31,13 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/netdev-build-XXXXXX")"
 mkdir -p "$STAGE/payload" "$STAGE/runtime" "$OUT"
 
 printf "${B}▶ 1/6 复制程序代码（不含配置/日志/备份/虚拟环境）${X}\n"
+# ★ 2026-10-04：仓库根目录有几个指向本机绝对路径的软链
+#   （devices.toml / connections.json → $SRC/config/…，bin/netdev → $SRC/netdev）。
+#   之前没排除，结果包里带进了「指向 /Users/<我>/… 的断链」——
+#   虽然不含真实内容（tar 只存链接本身），但①把我的用户名暴露给下载者；
+#   ②目标机上它们是死链，看着像坏包。install.sh 第 4/6 步本来就会重建这三条，
+#   所以这里直接不打进去最干净。
+#   注意排除词按文件名匹配：config-template/ 里的是 devices.toml.example，不受影响。
 rsync -a \
   --exclude '.venv' --exclude 'dist' --exclude 'logs' --exclude 'live' --exclude 'backups' \
   --exclude 'config' --exclude 'state' --exclude '__pycache__' --exclude '*.pyc' \
@@ -39,6 +46,8 @@ rsync -a \
   --exclude '.git' --exclude '.archive' --exclude '.github' --exclude '*.bak-*' \
   --exclude 'tools/*.mjs' --exclude 'tools/mk_*.py' --exclude 'tools/ui_doctor.sh' \
   --exclude 'tools/ui_probe*' --exclude 'conn_*_probe.mjs' --exclude 'verify_terminal*' \
+  --exclude '/devices.toml' --exclude '/connections.json' --exclude '/bin/netdev' \
+  --exclude '/.chk' \
   "$SRC/" "$STAGE/payload/netops/"
 # 补全文件单独放（放进 payload/netops/config 会被安装器的 --exclude 'config/*' 挡掉）
 mkdir -p "$STAGE/payload/completions"

@@ -5,7 +5,16 @@
 set -uo pipefail
 export PATH="$HOME/homebrew/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# ★ 先解析软链再取目录：install.sh 会建 bin/netdev → 根目录/netdev 的软链（并进 PATH），
+#   $0 是软链路径时 dirname 会得到 bin/，ROOT 就错成了 bin/，找 bin/.venv 报"未找到 venv"
+#   （2026-10-04 开箱即用验证实测：真机、沙箱都复现）。bash 3.2 没有 readlink -f，用循环解析。
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_DIR/$SELF" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 # netdev 入口脚本位于项目根目录，ROOT 即脚本所在目录（非上一级）
 ROOT="${NETDEV_ROOT:-$HERE}"
 export NETDEV_ROOT="$ROOT"

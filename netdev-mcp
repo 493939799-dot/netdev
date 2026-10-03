@@ -3,7 +3,14 @@
 # ROOT 从脚本位置推导，支持任意安装路径；也可用 NETDEV_ROOT 覆盖。
 set -uo pipefail
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# ★ 先解析软链再取目录（同 netdev 启动器，2026-10-04 修）：$0 是软链时 dirname 会错。
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_DIR/$SELF" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 # netdev-mcp 入口脚本位于项目根目录，ROOT 即脚本所在目录
 ROOT="${NETDEV_ROOT:-$HERE}"
 export NETDEV_ROOT="$ROOT"

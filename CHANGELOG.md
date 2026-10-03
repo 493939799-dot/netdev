@@ -8,6 +8,36 @@
 
 ---
 
+## [1.0.3] — 2026-10-04
+
+（主题：**修安装包「开箱即用」的 5 个问题**。这批问题全部是用「沙箱新装机」
+（`HOME`/`--prefix` 双隔离）以新用户视角跑完整安装验证时暴露的 —— 真机上永远看不见，
+因为真机的环境是"养"出来的。）
+
+### ★ P0：装出来的 `netdev` 命令是坏的（启动器软链解析）
+
+install.sh 会建 `bin/netdev → 根目录/netdev` 软链并进 PATH，但启动器用
+`dirname "$0"` 推安装根 —— **经软链调用时 `$0` 就是软链路径**，ROOT 错成
+`bin/`，去找 `bin/.venv`，永远报「未找到 venv」。真机也复现（`which netdev`
+正是那条软链），只是此前一直没通过软链跑过 doctor。修法：启动器先循环解析
+软链再取目录（bash 3.2 没有 `readlink -f`）。`netdev-mcp` 同样的写法一并修掉。
+
+### 新装机 doctor 的其余 4 项
+
+| 症状 | 真因 | 修法 |
+| --- | --- | --- |
+| 界面版本号显示 `dev` | 安装包 payload 排除了 `dist/`，`_app_version()` 只会读 `dist/installer/VERSION` | install.sh 把 VERSION 拷到安装根；`_app_version()` 先看安装根再看 dist |
+| doctor 报缺 `config/pi-commands.json` | 新装机没有装 pi-web-ui，自然没生成过命令清单 | install.sh 收编（有则收编+软链，无则模板兜底，`lib/paths.py` 的 bootstrap 本来就会补） |
+| doctor 报 `左栏按钮补丁 [missing]` | 检查的是已下线的 pi-web-ui 前端补丁，新装机根本没装这个可选组件 | `piweb_patch.py check()` 区分「没装」（`not-installed`，通过）与「装了但产物变了」（真问题）；`--check` 对前者退 0 |
+| 包里出现指向 `/Users/mac/…` 的断链 + 多 3.4M 草稿 | 仓库根的 `devices.toml`/`connections.json` 是软链、`.chk/` 是草稿，rsync 全打进去了 | build_bundle.sh 排除表加锚定排除 |
+
+### 验证
+
+沙箱新装机（`HOME`/`--prefix` 双隔离 + `--no-launchd`）完整安装后
+`netdev doctor` **15/15**、界面 health 报正确版本号、全套回归 135/27/19/21 通过。
+
+---
+
 ## [1.0.1] — 2026-10-04
 
 ### 修复：AI 助手「读取设备配置」永远失败（真因一行，故障已潜伏 ≥ 4 天）
