@@ -829,7 +829,25 @@ class DirectSession:
                           r"timeout|warning|mismatch|not found|no such|exceed)")
 
     def _summarize_tool_result(self, name: str, payload: dict) -> dict:
-        """把 payload 里的大文本字段替换为「摘要 + 落盘路径」，其余元信息保留。"""
+        """把 payload 里的大文本字段替换为「摘要 + 落盘路径」，其余元信息保留。
+
+        ★ 2026-10-03 加固：摘要只是「锦上添花」，它自己失败【绝不能】把一次
+          成功的工具调用改判成失败。原来这里是裸的 —— 一行 join 抛 TypeError
+          穿透到 _call_tool 的 except，于是 isError=True，界面显示「执行失败」，
+          而真正的结果被整个丢掉（实测 netdev_run 因此长期"必失败"，
+          明明配置已经取回来并落盘了）。现在：整段包一层兜底，
+          摘要层出任何问题都【回退为原始结果 + 一句警告】。
+        """
+        try:
+            return self._summarize_tool_result_inner(name, payload)
+        except Exception as e:
+            safe = dict(payload) if isinstance(payload, dict) else {"data": payload}
+            safe["_note"] = (f"结果摘要失败（{type(e).__name__}: {e}），"
+                             f"已回退为原始结果 —— 本次工具调用本身的结果是有效的")
+            return safe
+
+    def _summarize_tool_result_inner(self, name: str, payload: dict) -> dict:
+        """摘要正体（见 _summarize_tool_result 的说明）。"""
         try:
             big = {k: payload[k] for k in self._BIG_TEXT_FIELDS if k in payload
                    and isinstance(payload[k], (str, list)) and len(str(payload[k])) > 400}
@@ -845,14 +863,23 @@ class DirectSession:
             return payload
         saved = {}
         for k, v in big.items():
-            text = "\n".join(v) if isinstance(v, list) else str(v)
-            fn = f"{time.strftime('%H%M%S')}_{name}_{k}.txt"
-            p = logdir / fn
             try:
+                # ★ 2026-10-03 修（这就是让 netdev_run 长期"必失败"的那一行）：
+                #   v 可能是「列表里装字典」—— 典型是 netdev_run 的 results
+                #   ([{"command":..., "output":...}])。原来直接 "\n".join(v)
+                #   必抛 TypeError: sequence item 0: expected str instance, dict found。
+                #   而且它【不在 try 里】，异常穿透到 _call_tool 的 except，
+                #   把一次成功的工具调用改判成 isError=True。
+                #   两处修正：① join 前逐元素 str() ② 整段都进 try（单个字段
+                #   落盘失败不许拖垮整份结果）。
+                text = "\n".join(str(x) for x in v) if isinstance(v, list) else str(v)
+                fn = f"{time.strftime('%H%M%S')}_{name}_{k}.txt"
+                p = logdir / fn
                 p.write_text(text + "\n", encoding="utf-8", errors="replace")
                 saved[k] = str(p)
             except Exception:
                 saved[k] = None
+                continue
         # 摘要：关键行 + 首尾
         for k, v in big.items():
             lines = v if isinstance(v, list) else str(v).splitlines()
@@ -872,6 +899,29 @@ class DirectSession:
         payload["_truncated"] = True          # 显式标记：这是摘要，不是全文
         return payload
 
+    @staticmethod
+    def _failure_reason(payload: dict) -> str:
+        """从工具返回里挑一句「为什么失败」—— 前端只显示这一句。
+
+        ★ 2026-10-03 加：原来 tool_execution_end 只带 isError、不带原因，
+          界面就只剩一句「⚠ xxx 执行失败」。模型和用户都不知道发生了什么，
+          实测模型只能靠猜（连猜 4 次全错），并把 2 次调用吹成 8 次。
+        """
+        try:
+            for k in ("error", "note", "message", "_note"):
+                v = payload.get(k)
+                if isinstance(v, str) and v.strip():
+                    return " ".join(v.split())[:200]
+            for k in ("results", "steps"):
+                items = payload.get(k)
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict) and it.get("ok") is False and it.get("error"):
+                            return " ".join(str(it["error"]).split())[:200]
+            return ""
+        except Exception:
+            return ""
+
     # ── 工具执行：直接复用 netdev_mcp（不重写任何设备逻辑）──
     def _call_tool(self, name: str, args: dict) -> str:
         self._emit({"type": "toolcall_start", "toolName": name, "args": args or {}})
@@ -880,17 +930,19 @@ class DirectSession:
             fn = netdev_mcp.HANDLERS.get(name)
             if not fn:
                 self._emit({"type": "tool_execution_end", "toolName": name,
-                            "isError": True})
+                            "isError": True, "error": f"未知工具: {name}"})
                 return f"未知工具: {name}"
             payload = fn(args or {})
             payload = netdev_mcp.envelope(name, args or {}, payload)
             payload = self._summarize_tool_result(name, payload)
+            _bad = bool(payload.get("ok") is False)
             self._emit({"type": "tool_execution_end", "toolName": name,
-                        "isError": bool(payload.get("ok") is False)})
+                        "isError": _bad,
+                        "error": self._failure_reason(payload) if _bad else None})
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as e:
             self._emit({"type": "tool_execution_end", "toolName": name,
-                        "isError": True})
+                        "isError": True, "error": f"{type(e).__name__}: {e}"})
             return f"工具执行异常: {type(e).__name__}: {e}"
 
     # ── 一次 HTTP 流式请求（标准库，零新依赖）──
@@ -3103,6 +3155,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+_SERVED_CODE = ("ui/server.py", "ui/static/index.html", "netdev_mcp.py")
+
+
+def _write_code_manifest(port: int) -> None:
+    """把「本进程启动时加载的代码」按内容哈希记下来，供 CLI 的陈旧自检对账。
+
+    ★ 2026-10-04 加。为什么必须用哈希而不是 mtime：
+      mtime 会被「碰一下再还原」的操作污染 —— 本仓的
+      tests/test_mcp_hotreload.py 就会临时改写 netdev_mcp.py 再还原，
+      内容和大小都没变，只有 mtime 变新了。用 mtime 判断会报假警
+      （doctor 平白让用户重启一次），而这正是我们要消灭的那类
+      「看起来有理、其实在撒谎」的信号。哈希只认内容，改过就是改过。
+
+    文件名带端口 —— 因为这可能是【隔离实例】：
+      tests/test_ui_lifecycle.py 会在 8899 端口另起一个实例（它自己的
+      pidfile / logfile 都是临时的）。若清单写死一个路径，那个实例就会
+      把 8898 正式实例的清单覆盖掉，自检于是对着错误的基准比对。
+    """
+    try:
+        import hashlib
+        import json as _json
+        files = {}
+        for rel in _SERVED_CODE:
+            p = ROOT / rel
+            if p.is_file():
+                files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted((ROOT / "lib").glob("*.py")):
+            files[str(p.relative_to(ROOT))] = hashlib.sha256(p.read_bytes()).hexdigest()
+        (ROOT / "logs" / f"ui-service-{port}.code.json").write_text(
+            _json.dumps({"pid": os.getpid(),
+                         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                         "files": files}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -3186,6 +3275,9 @@ def main() -> int:
     print(f"▮ netdev-ui 已启动  http://{a.host}:{a.port}   PID {os.getpid()}   "
           f"{time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     print(f"  tmux={TMUX or '未找到'}  设备窗格会话={TMUX_SESSION}  静态目录={STATIC}", flush=True)
+    # 记下本进程加载的代码指纹 —— 供 `netdev ui status` / `netdev doctor`
+    # 判断「服务跑的代码是不是比磁盘上的旧」（改完源码忘了重启，实测踩过）。
+    _write_code_manifest(a.port)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

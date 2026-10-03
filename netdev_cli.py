@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import pathlib
 import re
@@ -319,8 +320,21 @@ def cmd_list(a):
 
 
 def cmd_identify(a):
-    """连上设备读身份（型号/版本/ESN），并与清单里记录的 ESN 比对 —— 用于分辨“是不是我那台真机”。"""
+    """连上设备读身份（型号/版本/ESN），并与清单里记录的 ESN 比对 —— 用于分辨“是不是我那台真机”。
+
+    ★ 2026-10-03 加：优先走同屏会话（与 cmd_run 对齐）。
+      问题：原来只有直连一条路，串口被同屏桥占着时 _serial_open 会直接
+      raise SystemExit，并建议「tmux attach -t netops 然后按 Ctrl+]」——
+      那是给【人】看的动作，AI 没有 tmux 交互能力、执行不了，于是它只能
+      去换别的工具，越换越远（实测 AI 的日志里就是这么跑偏的）。
+      同一条只读命令，netdev run 会自动走同屏、identify 却硬拒 ——
+      工具之间行为不一致本身就是 bug。现在两边统一。
+    """
     dev = resolve_target(a.device)
+    win = _snap_window(dev)
+    if win:
+        return _identify_via_pane(dev, win)
+
     s = _open(dev)
     m = mirror.Mirror(dev["name"])
     got = {}
@@ -332,7 +346,32 @@ def cmd_identify(a):
             got[cmd] = r.text if r.ok else f"(失败: {r.error})"
     finally:
         s.close(); m.close()
+    return _identity_card(dev, got)
 
+
+def _identify_via_pane(dev, win):
+    """同屏版 identify：三条命令都打在用户看得见的屏上（与 _run_via_pane 一致）。"""
+    m = mirror.Mirror(dev["name"])
+    got = {}
+    try:
+        for cmd in ("display version", "display esn", "display clock"):
+            m.send(cmd, "read_only")
+            try:
+                text = _session_run(win, cmd, timeout=60)
+            except (SystemExit, PaneBusy) as e:
+                m.recv(str(e), ok=False)
+                print(f"{C['red']}✘ {e}{C['reset']}")
+                return 1
+            body = _trim_tail(_after_echo(text, cmd)) if text else ""
+            m.recv(body, ok=True)
+            got[cmd] = body
+    finally:
+        m.close()
+    return _identity_card(dev, got)
+
+
+def _identity_card(dev, got):
+    """把三条命令的回显解析成身份卡（直连 / 同屏两条路共用）。"""
     ver = got["display version"]
     esn = got["display esn"]
     import re as _re
@@ -3126,10 +3165,12 @@ def _doctor_rows():
     except Exception as e:
         rows.append(("同屏会话", False, f"查不到：{e}"))
     _uh = _ui_health()
-    rows.append((f"netdev-ui :{UI_PORT}", _uh["up"],
+    _stale, _why = _ui_code_stale() if _uh["up"] else (False, "")
+    rows.append((f"netdev-ui :{UI_PORT}", _uh["up"] and not _stale,
                  (f"HTTP 200 {_uh['detail']}  PID {_uh['pid'] or '未记'}"
                   if _uh["up"] else f"{'端口被占但服务不应答' if _uh['port_open'] else '无响应'}"
-                  f" → 启动：netdev ui start（或直接 netdev ui，没有就起、有就报状态）")))
+                  f" → 启动：netdev ui start（或直接 netdev ui，没有就起、有就报状态）")
+                 + (f"　⚠ 跑的是旧代码：{_why}" if _stale else "")))
     log = ROOT / "logs/ui-service.log"
     live = ROOT / "live"
     def _sz(p):
@@ -3334,6 +3375,45 @@ _UI_PLIST_TPL = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+def _ui_code_stale() -> tuple[bool, str]:
+    """服务跑的代码，是不是和磁盘上的不一样？（2026-10-04 加）
+
+    为什么需要它：ui/server.py 是【进程启动那一刻】读进内存的 —— 改完源码不重启，
+    跑的还是旧逻辑。实测踩过一次：bug 已修好、用户界面上却还是旧行为，
+    白排查了一轮（还以为是修复没生效）。
+
+    判据【按内容哈希】对账，不用 mtime，也不依赖 ps：
+      · ui/server.py 启动时会把「它加载的那些文件的 SHA-256」写进
+        logs/ui-service-<端口>.code.json（见 _write_code_manifest）；
+      · 这里拿当前磁盘上的哈希跟它比 —— 不一样 = 磁盘上的代码比服务新。
+      · 【文件名带端口】：测试会在 8899 另起隔离实例，带端口才不会互相覆盖。
+    为什么不用 mtime：mtime 会被「碰一下再还原」污染（本仓的
+      tests/test_mcp_hotreload.py 就会临时改写 netdev_mcp.py 再还原，
+      内容与大小都不变、只有 mtime 变新），用 mtime 会平白报假警。
+    返回 (是否陈旧, 给人看的说明)。
+    """
+    try:
+        man_f = ROOT / "logs" / f"ui-service-{UI_PORT}.code.json"
+        if not man_f.exists():
+            return False, ""            # 老版本服务没写清单 → 不猜、不报
+        import hashlib
+        man = json.loads(man_f.read_text(encoding="utf-8"))
+        changed = []
+        for rel, old in (man.get("files") or {}).items():
+            p = ROOT / rel
+            if not p.is_file():
+                changed.append(f"{rel}（已消失）")
+            elif hashlib.sha256(p.read_bytes()).hexdigest() != old:
+                changed.append(rel)
+        if changed:
+            show = "、".join(changed[:3]) + ("…" if len(changed) > 3 else "")
+            return True, (f"{show} 在服务启动（{man.get('started', '?')}）之后改过"
+                          f" → 跑的还是旧代码，重启：netdev ui restart")
+        return False, ""
+    except Exception:
+        return False, ""
+
+
 def _ui_status_lines() -> list[tuple[bool, str]]:
     h = _ui_health()
     rows: list[tuple[bool, str]] = []
@@ -3353,6 +3433,10 @@ def _ui_status_lines() -> list[tuple[bool, str]]:
         rows.append((loaded, f"{'开机自启':<7}{'已装已加载' if loaded else '已装未加载'}（{UI_PLIST.name}）"))
     else:
         rows.append((True, f"{'开机自启':<7}未装（想装：netdev ui install）"))
+    if h["up"]:
+        stale, why = _ui_code_stale()
+        if stale:
+            rows.append((False, f"{'代码版本':<8}{why}"))
     return rows
 
 

@@ -92,6 +92,6 @@
   一切不确定                 双击 ~/netops/bin/设备工具台.command → 1（体检）
 
 【版本与兼容】
-  本包：netdev v1.0.0（Apple 芯片构建，含离线依赖；装在有 python3 的机器上即用）
+  本包：netdev v1.0.1（Apple 芯片构建，含离线依赖；装在有 python3 的机器上即用）
   Intel Mac：需要用 Intel 机器重新构建运行时（脚本里已参数化，见 build_bundle.sh）
   报告与文档：装好后在 ~/netops/（或你的桌面 workbuddy 文件夹）

@@ -2009,9 +2009,13 @@ function onAiEvent(ev){
     //   实测看到过 {"args": {...}, "tool": "netdev_run"} 这样的原始 JSON。
     //   只把失败告知用户，其余交给 AI 自己总结。
     if(t==='tool_execution_end' && ev.isError){
+      // ★ 2026-10-03：带上失败原因。原来只有「⚠ xxx 执行失败」这一句，
+      //   用户和 AI 都看不出发生了什么 —— 实测 AI 只能靠猜，连猜 4 次全错。
       const nm = ev.toolName || '工具';
+      const why = (ev.error!=null && String(ev.error).trim())
+                    ? ' · '+esc(String(ev.error).trim().slice(0,180)) : '';
       const d=document.createElement('div'); d.className='tool';
-      d.innerHTML='<span class="bad">⚠ '+esc(nm)+' 执行失败</span>';
+      d.innerHTML='<span class="bad">⚠ '+esc(nm)+' 执行失败'+why+'</span>';
       (AIMSG||aiOut).appendChild(d); aiOut.scrollTop=aiOut.scrollHeight;
     }
   }else if(t==='agent_end'||t==='agent_settled'){

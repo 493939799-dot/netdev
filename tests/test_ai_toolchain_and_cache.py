@@ -379,6 +379,115 @@ def test_ai_toolchain():
     check("DirectSession 有工具结果摘要 + 落盘（防大回显冲垮上下文）",
           "_summarize_tool_result" in src and "_truncated" in src)
 
+    # ★ 2026-10-03 事故守门①：摘要器遇到「列表里装字典」不许抛异常 ——
+    #   事故现场：netdev_run 的 results = [{"command":…, "output":…}]，
+    #   摘要器里裸的 "\n".join(v) 直接抛 TypeError，异常穿透到 _call_tool 的
+    #   except → isError=True → 界面「⚠ netdev_run 执行失败」，
+    #   而真正的结果（171 行运行配置）被整个丢掉。
+    #   落盘指纹：logs/ai_tool/<aid>/ 里**只有 *_raw.txt、没有 *_results.txt**。
+    #   这类「后处理把成功伪造成失败」最隐蔽 —— 工具本身完全正常，
+    #   偏偏它是 AI 读配置的主力工具，症状看起来像"AI 坏了"。
+    class _Probe(S.DirectSession):
+        def __init__(self):
+            self.aid = "_selftest_summarize"
+        def _emit(self, ev):
+            pass
+    try:
+        _p = _Probe()
+        _payload = {"device": "x", "ok": True,
+                    "results": [{"command": "display current-configuration",
+                                 "ok": True, "output": "A" * 3000}],
+                    "raw": "A" * 3000}
+        out = _p._summarize_tool_result("netdev_run", dict(_payload))
+        check("摘要器能吃下「列表里装字典」的 results（不把成功伪装成失败）",
+              out.get("_truncated") is True and out.get("ok") is True,
+              f"_truncated={out.get('_truncated')!r} ok={out.get('ok')!r}")
+        sres = out.get("results")
+        check("摘要后 results 仍带全文落盘路径",
+              isinstance(sres, dict) and bool(sres.get("全文已落盘")), str(sres)[:140])
+        check("摘要成功后不出现回退警告 _note", not out.get("_note"), str(out.get("_note"))[:140])
+    except Exception as e:
+        check("摘要器能吃下「列表里装字典」的 results（不把成功伪装成失败）",
+              False, f"{type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(ROOT / "logs" / "ai_tool" / "_selftest_summarize", ignore_errors=True)
+
+    # ★ 2026-10-03 事故守门②：失败必须说得清原因 ——
+    #   原来 tool_execution_end 只带 isError、不带 error，界面只剩一句
+    #   「⚠ xxx 执行失败」。模型和用户都不知道发生了什么，实测模型连猜 4 次
+    #   全错，并把 2 次调用吹成 8 次。
+    check("DirectSession 会从结果里挑出失败原因", hasattr(S.DirectSession, "_failure_reason"))
+    check("失败原因能从 error 字段提取",
+          "清单里没有" in S.DirectSession._failure_reason(
+              {"ok": False, "error": "✘ 清单里没有 'x'"}), "空")
+    check("失败原因也能从结构化 steps/results 里提取",
+          S.DirectSession._failure_reason(
+              {"ok": False, "results": [{"ok": False, "error": "串口被占用"}]}) == "串口被占用")
+    check("成功的结果不提原因",
+          S.DirectSession._failure_reason({"ok": True}) == "")
+
+    # ★ 2026-10-04 事故守门③：改完源码但服务没重启 ——
+    #   症状是"bug 明明修好了，界面上还是旧行为"。ui/server.py 是进程启动那刻
+    #   读进内存的，不重启就一直跑旧逻辑。实测因此白排查了一轮。
+    #   现在 doctor / netdev ui status 会自己报「服务跑的代码比源文件旧」。
+    cli_src = (ROOT / "netdev_cli.py").read_text(encoding="utf-8")
+    check("doctor/ui status 自检「服务跑的代码是否比源文件旧」",
+          "_ui_code_stale" in cli_src and "netdev ui restart" in cli_src)
+    check("该自检已接进 ui status 与 doctor 两条展示路径",
+          cli_src.count("_ui_code_stale(") >= 3, f"引用 {cli_src.count('_ui_code_stale(')} 次")
+
+    # ★ 2026-10-04 事故守门⑤：清单文件必须【按端口分文件】。
+    #   第一版写死成 logs/ui-service.code.json —— 于是 tests/test_ui_lifecycle.py
+    #   在 8899 起的隔离实例会把 8898 正式实例的清单覆盖掉，自检就对着
+    #   错误的基准比对（实测抓到：清单里记的 pid 是个已经退出的临时进程）。
+    _srv_src = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
+    check("陈旧自检的清单按端口分文件（隔离实例不互相覆盖）",
+          "ui-service-{port}.code.json" in _srv_src
+          and "_write_code_manifest(a.port)" in _srv_src
+          and "ui-service-{UI_PORT}.code.json" in cli_src)
+
+    # ★ 2026-10-04 事故守门④：这条自检【自己不许静默失效】。
+    #   第一版用 mtime 判断 → 被 tests/test_mcp_hotreload.py 的「改写再还原」
+    #   污染（内容大小都不变、只有 mtime 变），会平白让用户重启一次（假警）；
+    #   第二版改用内容哈希，却发现 json 没导入 → 异常被 except 吞掉、
+    #   永远返回「干净」（静默死）。两种毛病都得由测试兜住。
+    #   这里在【临时目录】里造现场，绝不碰真实源文件。
+    try:
+        import hashlib as _hl
+        import json as _json
+        import netdev_cli as _cli
+        _orig_root = _cli.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as _td:
+                _cli.ROOT = pathlib.Path(_td)
+                (_cli.ROOT / "logs").mkdir(parents=True)
+                _probe = _cli.ROOT / "_probe.txt"
+                _probe.write_text("v1\n", encoding="utf-8")
+
+                def _put_manifest(digest):
+                    (_cli.ROOT / "logs" / f"ui-service-{_cli.UI_PORT}.code.json").write_text(
+                        _json.dumps({"pid": 0, "started": "2026-10-04 00:00:00",
+                                     "files": {"_probe.txt": digest}}), encoding="utf-8")
+
+                _put_manifest(_hl.sha256(b"v1\n").hexdigest())
+                check("陈旧自检：内容一致时闭嘴（不假报）",
+                      _cli._ui_code_stale()[0] is False, str(_cli._ui_code_stale()))
+                _probe.write_text("v2\n", encoding="utf-8")          # 真改内容
+                _fired, _why = _cli._ui_code_stale()
+                check("陈旧自检：内容变了会开口，且给出补救命令",
+                      _fired and "netdev ui restart" in _why, _why)
+                _probe.write_text("v1\n", encoding="utf-8")          # 只还原内容
+                os.utime(_probe, None)                               # 再碰一下 mtime
+                check("陈旧自检：只碰 mtime 不报（这正是它被改成哈希版的原因）",
+                      _cli._ui_code_stale()[0] is False, str(_cli._ui_code_stale()))
+                (_cli.ROOT / "logs" / f"ui-service-{_cli.UI_PORT}.code.json").unlink()
+                check("陈旧自检：没有清单时安静跳过（不猜、不报）",
+                      _cli._ui_code_stale() == (False, ""))
+        finally:
+            _cli.ROOT = _orig_root
+    except Exception as e:
+        check("陈旧自检可被调用且不静默失效", False, f"{type(e).__name__}: {e}")
+
     # ── 三个「已拆除」的守门断言：别哪天又被悄悄加回来 ──
     for dead in ("AiSession", "WbSession", "PI_BIN", "_rpc_startable", "pi_heal_locks",
                  "_wb_argv"):
