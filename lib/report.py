@@ -3,7 +3,8 @@ import datetime as _dt
 import html
 import pathlib
 
-OUT = pathlib.Path.home() / "Desktop" / "workbuddy"
+from . import paths as _paths
+OUT = pathlib.Path.home() / "Desktop" / "workbuddy"   # 交付目录按用户习惯固定，不随安装路径变
 
 CSS = """
 :root { --line:#d8dde3; --head:#1f3a5f; --bg:#f7f9fb; --warn:#b3261e; --ok:#1a7f37; }

@@ -67,9 +67,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["device", "target"], "properties": {
          "device": {"type": "string"}, "target": {"type": "string"},
          "source": {"type": "string"}, "count": {"type": "integer", "default": 5}}}},
-    {"name": "netdev_serial_run", "description": "串口通道执行命令（无 IP 设备 / 救砖）",
-     "inputSchema": {"type": "object", "required": ["command"], "properties": {
-         "command": {"type": "string"}, "device": {"type": "string", "default": "serial-huawei"}}}},
+      {"name": "netdev_serial_run", "description": "串口通道执行命令（无 IP 设备 / 救砖）",
+       "inputSchema": {"type": "object", "required": ["command", "device"], "properties": {
+           "command": {"type": "string"},
+           "device": {"type": "string", "description": "设备名，用 netdev list 查"}}}},
     {"name": "netdev_watch_tail", "description": "读取实时镜像流尾部（观察层②的一次性快照）",
      "inputSchema": {"type": "object", "properties": {
          "device": {"type": "string"}, "lines": {"type": "integer", "default": 40}}}},
@@ -265,9 +266,9 @@ def t_serial(args):
       用户在屏上什么都看不到 —— 与整体"人机同屏"的承诺不符。
       CLI 侧本来就有串口独占锁、凭据、同屏优先等完整逻辑，统一到那一条路。
     """
-    rc, out, err = _netdev_cli(["run", args.get("device", "serial-huawei"),
-                                args.get("command", "")], timeout=200)
-    return {"device": args.get("device", "serial-huawei"), "via": "CLI（同屏优先）",
+      rc, out, err = _netdev_cli(["run", args.get("device", ""),
+                                  args.get("command", "")], timeout=200)
+      return {"device": args.get("device", ""), "via": "CLI（同屏优先）",
             "command": args.get("command", ""), "ok": rc == 0,
             "output": (out or "")[-8000:],
             "error": ((err or "")[-600:] or None) if rc != 0 else None}

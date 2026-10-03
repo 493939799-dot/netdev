@@ -24,7 +24,8 @@ import os
 import pathlib
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+from . import paths as _paths
+ROOT = _paths.ROOT
 STATE = ROOT / "state"
 LOCKFILE = STATE / "portlocks.json"
 

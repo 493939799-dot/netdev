@@ -768,14 +768,14 @@ def serial_baud_cache_get(port):
     """读波特率缓存（上次探测到的值）。"""
     import json as _json
     try:
-        return _json.loads((pathlib.Path.home()/"netops/state/serial_baud.json").read_text()).get(port)
+        return _json.loads((_paths.state_dir()/"serial_baud.json").read_text()).get(port)
     except Exception:
         return None
 
 
 def serial_baud_cache_put(port, baud):
     import json as _json
-    f = pathlib.Path.home()/"netops/state/serial_baud.json"
+    f = _paths.state_dir()/"serial_baud.json"
     try:
         data = _json.loads(f.read_text()) if f.exists() else {}
     except Exception:

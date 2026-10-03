@@ -2,7 +2,8 @@
 """三种接入方式 · 真实场景健壮性复核
 
 覆盖：接入 → 开终端 → 监控 → 命令 → 快照 → 占用冲突 → AI/手动切换 → 重复与删除重接。
-真机：serial-huawei（Huawei AR111-S 串口）
+串口：SERIAL_DEV（见下方常量；默认用仓库自带的本机模拟器，
+        跑真机请 export NETDEV_PROBE_SERIAL=<你的串口设备名>）
 模拟：mock-hw（SSH 127.0.0.1:20022）
       telnet-lab（Telnet 127.0.0.1:2323）
 
@@ -23,6 +24,10 @@ import urllib.request
 # 换一台机器 / 换用户名，这个探针直接全灭，而且报错是「文件不存在」，
 # 看不出是路径写死。改成 ROOT + shutil.which 后任意安装位置都能跑。
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+# 串口目标设备名。**不要写死成某台真机的名字** —— 既泄露身份，别人也跑不了。
+# 默认用仓库自带的本机模拟器；跑自己的真机：export NETDEV_PROBE_SERIAL=<设备名>
+SERIAL_DEV = os.environ.get("NETDEV_PROBE_SERIAL", "mock-hw")
+
 NETDEV = str(ROOT / "netdev")
 TMUX = shutil.which("tmux") or "tmux"
 # netdev 入口脚本自己会补 PATH，这里给一个干净的最小环境
@@ -142,7 +147,7 @@ def probe_serial_conflict():
     tm = TMUX
 
     # 起桥
-    t = _req("/api/term/open", {"device": "serial-huawei", "rows": 40, "cols": 140}, 180)
+    t = _req("/api/term/open", {"device": SERIAL_DEV, "rows": 40, "cols": 140}, 180)
     if not t.get("sid"):
         rec("串口", "S1 重建桥", False, str(t.get("error") or t.get("__err__"))[:70]); return
     rec("串口", "S1 重建桥", True, t.get("window"))
@@ -162,7 +167,7 @@ def probe_serial_conflict():
     sys.path.insert(0, str(ROOT))
     try:
         from lib import engine
-        dev = engine.get_device("serial-huawei")
+        dev = engine.get_device(SERIAL_DEV)
         try:
             s = engine.connect(dev, password=None); s.close()
             rec("串口", "S3 直连被独占拦下", False, "竟然成功了（护栏失效）")
@@ -177,7 +182,7 @@ def probe_serial_conflict():
     try:
         import netdev_mcp as M
         try:
-            r = M.t_serial({"device": "serial-huawei", "command": "display clock"})
+            r = M.t_serial({"device": SERIAL_DEV, "command": "display clock"})
             rec("串口", "S4 MCP t_serial 被拦", not r.get("ok"),
                 ("已拦：" + str(r.get("error", ""))[:50]) if not r.get("ok") else "竟然执行了")
         except Exception as e:
@@ -186,12 +191,12 @@ def probe_serial_conflict():
         rec("串口", "S4 MCP t_serial 被拦", False, f"导入失败 {e}")
 
     # 桥是否还活着（拦截后不该受影响）
-    e2 = subprocess.run([tm, "list-panes", "-t", "netops:serial-huawei", "-F", "#{pane_dead}"],
+    e2 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
                         capture_output=True, text=True).stdout.strip()
     rec("串口", "S5 拦截后桥安然无恙", e2 == "0", f"pane_dead={e2 or '?'}")
 
     # 串口写操作必须走 apply（run 通道拒绝写）
-    r = _req("/api/netdev/run", {"device": "serial-huawei", "command": "vlan 3999"})
+    r = _req("/api/netdev/run", {"device": SERIAL_DEV, "command": "vlan 3999"})
     rec("串口", "S6 写操作被闸门拒绝", (not r.get("ok")) or ("拒" in str(r.get("error", ""))),
         str(r.get("error") or r.get("output") or "")[:60])
 
@@ -203,7 +208,7 @@ def probe_handoff():
     tm = TMUX
 
     # 确保有桥
-    t = _req("/api/term/open", {"device": "serial-huawei", "rows": 40, "cols": 140}, 180)
+    t = _req("/api/term/open", {"device": SERIAL_DEV, "rows": 40, "cols": 140}, 180)
     if not t.get("sid"):
         rec("切换", "H0 准备桥", False, str(t.get("error"))[:60]); return
     win = t.get("window")
@@ -213,18 +218,18 @@ def probe_handoff():
     marker = "display esn"
     subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", marker], capture_output=True)
     subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
-    cap = wait_prompt(win, 25) + read_screen("serial-huawei", 60)
+    cap = wait_prompt(win, 25) + read_screen(SERIAL_DEV, 60)
     rec("切换", "H1 手动敲命令 → 屏可见", "ESN of device" in cap, marker)
 
     # H2 AI 读同一块屏（screen_read 等价物 = 面板读取）
-    via_api = _req("/api/monitor?device=serial-huawei", None, 200)
+    via_api = _req(f"/api/monitor?device={SERIAL_DEV}", None, 200)
     rec("切换", "H2 AI 侧能读同一块屏", not via_api.get("__err__"),
         f"via={via_api.get('via')}")
 
     # H3 AI 发命令（走 screen-send 通道）→ 手动能看见
-    send_via_netdev("serial-huawei", "display version")
+    send_via_netdev(SERIAL_DEV, "display version")
     time.sleep(4)
-    cap2 = wait_prompt(win, 30) + read_screen("serial-huawei", 60)
+    cap2 = wait_prompt(win, 30) + read_screen(SERIAL_DEV, 60)
     rec("切换", "H3 AI 发命令 → 手动可见", "VRP (R) software" in cap2, "display version")
 
     # H4 双方并发不炸：AI 读的同时手动写
@@ -232,15 +237,15 @@ def probe_handoff():
     errs = []
     def reader():
         for _ in range(3):
-            try: _req("/api/monitor?device=serial-huawei", None, 120)
+            try: _req(f"/api/monitor?device={SERIAL_DEV}", None, 120)
             except Exception as e: errs.append(str(e))
             time.sleep(0.6)
     th = threading.Thread(target=reader); th.start()
     subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", "display clock"], capture_output=True)
     subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
     th.join()
-    wait_prompt("serial-huawei", 20)
-    e3 = subprocess.run([tm, "list-panes", "-t", "netops:serial-huawei", "-F", "#{pane_dead}"],
+    wait_prompt(SERIAL_DEV, 20)
+    e3 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
                         capture_output=True, text=True).stdout.strip()
     rec("切换", "H4 并发（AI 读 + 手动写）不炸", e3 == "0" and not errs, f"pane_dead={e3} errs={len(errs)}")
 
@@ -286,7 +291,7 @@ def main():
     devs = run_devices()
     print("目标:", ", ".join(f"{k}({v['kind']})" for k, v in devs.items()))
 
-    for chan, dev in (("串口", "serial-huawei"), ("SSH", "mock-hw"), ("Telnet", "telnet-lab")):
+    for chan, dev in (("串口", SERIAL_DEV), ("SSH", "mock-hw"), ("Telnet", "telnet-lab")):
         if dev not in devs:
             print(f"\n  ! {chan} 目标 {dev} 不在列表，跳过")
             continue

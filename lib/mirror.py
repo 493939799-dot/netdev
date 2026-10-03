@@ -5,7 +5,9 @@ import pathlib
 import re
 import time
 
-ROOT = pathlib.Path.home() / "netops"
+from . import paths as _paths   # 路径统一真源（装到非 ~/netops 也必须对）
+
+ROOT = _paths.ROOT
 LIVE = ROOT / "live"
 LOGS = ROOT / "logs"
 LIVE.mkdir(parents=True, exist_ok=True)

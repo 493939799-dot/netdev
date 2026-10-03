@@ -15,6 +15,21 @@ export PATH="$HOME/bin:$ROOT/bin:$HOME/homebrew/bin:/opt/homebrew/bin:/usr/local
 cd "$ROOT" || exit 1
 C_B="\033[1m"; C_D="\033[2m"; C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_X="\033[0m"
 
+# 提示"设备名"时的默认值：取设备清单里的第一台。
+# 原来这里写死的是作者自己真机的名字 —— 既是个人信息，也会让别人误以为
+# 自己的机器上有个叫那个名字的设备。通用工具不该替用户预设具体设备。
+first_dev() {
+  "$NETDEV" list --json 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    ds = d if isinstance(d, list) else (d.get("devices") or [])
+    print(ds[0].get("name", "") if ds else "")
+except Exception:
+    print("")
+'
+}
+
 pause() { printf "\n${C_D}按回车返回菜单…${C_X}"; read -r _ || true; }
 
 # ── 网页服务：进菜单先确保它在跑（幂等，已在跑则秒回）────────────
@@ -83,8 +98,8 @@ while true; do
       ;;
     3)
       clear; echo "【备份设备配置】"; echo
-      printf "  设备名（直接回车 = serial-huawei）："; read -r dev || dev=""
-      dev="${dev:-serial-huawei}"
+      printf "  设备名（直接回车 = %s）：" "$(first_dev)"; read -r dev || dev=""
+      dev="${dev:-$(first_dev)}"
       printf "  标签/客户名（如 客户A-到货，可空）："; read -r tag || tag=""
       printf "  备注（可空）："; read -r note || note=""
       args=("$NETDEV" snap save "$dev")
@@ -97,8 +112,8 @@ while true; do
       ;;
     4)
       clear; echo "【恢复配置】"; echo
-      printf "  设备名（直接回车 = serial-huawei）："; read -r dev || dev=""
-      dev="${dev:-serial-huawei}"
+      printf "  设备名（直接回车 = %s）：" "$(first_dev)"; read -r dev || dev=""
+      dev="${dev:-$(first_dev)}"
       echo
       "$NETDEV" snap list "$dev" || true
       printf "\n  用哪份快照？（填编号如 4，回车 = 最新）："; read -r ref || ref=""

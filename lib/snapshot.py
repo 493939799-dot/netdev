@@ -18,7 +18,9 @@ import re
 import shutil
 import time
 
-SNAP_ROOT = pathlib.Path.home() / "netops" / "backups" / "snapshots"
+from . import paths as _paths   # 路径统一真源
+
+SNAP_ROOT = _paths.ROOT / "backups" / "snapshots"
 BLACKLIST = ("reload", "format", "delete", "reset saved-configuration", "undo saved-configuration")
 
 
@@ -498,7 +500,7 @@ def plan_restore(old_text: str, new_text: str, mode: str = "full"):
     return steps, warnings, rep
 
 
-TRASH_ROOT = pathlib.Path.home() / "netops" / "backups" / "snapshots_trash"
+TRASH_ROOT = _paths.ROOT / "backups" / "snapshots_trash"
 
 
 def move_to_trash(snap, note: str = "") -> pathlib.Path:
@@ -521,7 +523,7 @@ def list_trash():
 
 
 # ── 索引清单 + 导出（防止"快照被删了都不知道"）────────────────────────────────
-INDEX_FILE = pathlib.Path.home() / "netops" / "backups" / "snapshots.index.tsv"
+INDEX_FILE = _paths.ROOT / "backups" / "snapshots.index.tsv"
 WORKBUDDY = pathlib.Path.home() / "Desktop" / "workbuddy"
 
 

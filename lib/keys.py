@@ -17,7 +17,9 @@ import re
 import select
 import time
 
-STATE = pathlib.Path.home() / "netops" / "state"
+from . import paths as _paths   # 路径统一真源
+
+STATE = _paths.state_dir()
 STATE.mkdir(parents=True, exist_ok=True)
 CACHE = STATE / "keys.json"
 

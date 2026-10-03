@@ -2175,7 +2175,7 @@ function drawCpuChart(){
 }
 async function loadMonitor(quiet){
   if(monBusy) return; monBusy=true;
-  const dev0 = CURDEV || 'serial-huawei';
+  const dev0 = CURDEV || '';
   const d0 = (window.DEVICES||[]).find(x=>x.name===dev0) || {};
   // 临时目标窗格不在线：不再硬拦截 —— 2026-09-30 后端静默直连通道对临时目标同样可用，
   // 只有直连也失败时才提示"开一次终端走同屏"。原来这里 return 会泄漏 monBusy（按钮永久失效）。
@@ -2250,7 +2250,7 @@ document.querySelectorAll('.mcard').forEach(el=>el.onclick=async ()=>{
   // 其它卡片：不弹窗，直接在卡片里取值并显示
   const key = el.dataset.key;
   if(!key) return;
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   // ⚠ 副标题元素【可能不存在】（CPU 卡就没有 .ms），
   //   以前用 `|| el` 兜底，结果整张卡的文字被替换成了“失败”（实测踩到）。
   const sub = el.querySelector('.ms');
@@ -2280,7 +2280,7 @@ document.querySelectorAll('.mcard').forEach(el=>el.onclick=async ()=>{
 /* ── ⚡ AI 学习：采不到值时点这里 ── */
 let LEARN_CTX = null;
 async function openLearn(key){
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   const modal=$('modalLearn'), box=$('lnBody');
   pushModalZ(modal);
   const label={cpu:'CPU',ram:'RAM',crc:'CRC/错包',if:'INT'}[key]||key;
@@ -2370,7 +2370,7 @@ function firstLine(t){ return String(t||'').split('\n').map(x=>x.trim()).filter(
 
 /* ── 接口详情弹窗 ── */
 async function showIfDetail(){
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   const modal=$('modalIf'), box=$('ifBody');
   pushModalZ(modal);
   $('ifSub').textContent=`设备 ${dev}`;
@@ -2382,7 +2382,7 @@ async function showIfDetail(){
   await renderIfTable(d);
 }
 async function renderIfTable(d){
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   const box=$('ifBody');
   const allIfs=d.interfaces||[];
   window._IFS = allIfs;
@@ -2441,7 +2441,7 @@ document.querySelectorAll('[data-ifflt]').forEach(b=>b.onclick=async()=>{
 /* ═══════ 快照管理（真：netdev snap） ═══════ */
 let SNAPS=[];
 async function loadSnaps(){
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   let r; try{ r = await api('/api/snap/list?device='+encodeURIComponent(dev)); }catch(e){ return; }
   SNAPS = r.snapshots||[];
   const tb=$('snapTable');
@@ -2458,7 +2458,7 @@ async function loadSnaps(){
   tb.querySelectorAll('button').forEach(b=>b.onclick=()=>snapAct(b.dataset.a, +b.dataset.i, b.dataset.id));
 }
 async function snapAct(a, idx, id){
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   const s = SNAPS.find(x=>x.idx===idx) || {};
   if(a==='export'){
     window.open(`/api/snap/file?id=${encodeURIComponent(id)}&name=running.cfg`, '_blank');
@@ -2510,7 +2510,7 @@ function showRestoreDialog(dev, idx, preview){
   modal.classList.add('show');
 }
 $('snapNew').onclick=async ()=>{
-  const dev = CURDEV || 'serial-huawei';
+  const dev = CURDEV || '';
   const tag = prompt('给这份快照起个标签（例如：客户A-到货）','UI手工');
   if(tag===null) return;
   $('snapHint').textContent='正在抓取（只读，可能十几秒）…';
@@ -2561,7 +2561,7 @@ function showTrash(){
     if(!it) return;
     const nm = shortName(it.name);
     if(b.dataset.act === 'unrm'){
-      const r = await api('/api/snap/unrm',{device:CURDEV||'serial-huawei', ref: it.name});
+      const r = await api('/api/snap/unrm',{device:CURDEV||'', ref: it.name});
       audit(r.ok?'WRITE':'FAIL', CURDEV||'-', `还回收区 → 快照列表：${nm}`);
       say('系统', (r.ok?'♻ 已恢复到快照列表：':'<span class="bad">恢复失败：</span>')+'<b>'+esc(nm)+'</b>','ai');
     }else{

@@ -3606,7 +3606,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ══ 清理“僵尸窗格” ══
     #   只把「名字像自动生成的串口窗格」（serial--dev-cu-* / telnet-* / ssh-*）
-    #   且当前没人认领的算作僵尸 —— 避免把用户手动开的窗格（如 serial-huawei）误判。
+    #   且当前没人认领的算作僵尸 —— 避免把用户手动开的窗格（如 switch-01）误判。
     @staticmethod
     def _looks_autogen(w: str) -> bool:
         return bool(__import__("re").match(r"^(serial--|telnet-|ssh-)", w or ""))
