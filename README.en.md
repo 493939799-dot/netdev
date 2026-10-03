@@ -77,11 +77,25 @@ needs nothing preinstalled and no network access. Installs to `~/netops` by defa
 
 ### From source
 
+> **Prerequisite**: Python 3.10+ and [uv](https://docs.astral.sh/uv/). The stock
+> macOS `python3` (Xcode CLT, 3.9) **cannot** install the pinned versions in
+> `requirements.txt` (verified: `cffi==2.1.1` resolves to nothing). One command
+> installs uv — it also brings its own Python 3.13, no Homebrew needed:
+>
+> ```bash
+> curl -LsSf https://astral.sh/uv/install.sh | sh
+> ```
+
 ```bash
 git clone <this-repo> netops && cd netops
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+uv venv --python 3.13 .venv
+uv pip install -r requirements.txt
 ./netdev doctor
 ```
+
+No real hardware needed for a first look: `./netdev mock start` boots a simulated
+Huawei VRP device on 127.0.0.1:20022, then `./netdev device-add --name mock-hw
+--protocol ssh --host 127.0.0.1 --port 20022` and `./netdev run mock-hw "display version"`.
 
 ### Build the bundle yourself
 
@@ -164,9 +178,10 @@ hardware won't get contributions.
 
 ```bash
 ./netdev selftest                                          # end-to-end, against the simulator
-./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 57 checks
+./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 135 checks
 ./.venv/bin/python tests/test_approval_gates.py            # 19 checks (security-critical)
 ./.venv/bin/python tests/test_ui_lifecycle.py              # 27 checks
+./.venv/bin/python tests/test_mock_cmd.py                  # 21 checks
 ```
 
 CI runs all four on every push.

@@ -57,10 +57,16 @@ jobs:
 
       # ── 关键：把「目标平台」的依赖装进 dist/deps ──────────────────
       # 必须在 macOS 上装（依赖里有 C 扩展，Linux 装出来的 .so 不能用）。
+      # ★ 必须锁 Python 3.12（2026-10-04 修）：runner 默认 3.13 装 deps 的话，
+      #   build_bundle.sh 从 deps 反推出 3.13，再去找 uv 管的 cpython-3.13* ——
+      #   runner 上 uv 从没下载过它 → 独立 Python 被静默跳过 → CI 包变成
+      #   「目标机需自备 python3」的劣化包。先 uv python install 3.12，
+      #   deps 与包内运行时同源，行为与维护者本机出包一致。
       - name: 准备离线依赖 dist/deps
         run: |
+          uv python install 3.12
           mkdir -p dist/deps
-          uv pip install --target dist/deps -r requirements.txt
+          uv pip install --target dist/deps --python 3.12 -r requirements.txt
           echo "依赖体积：$(du -sh dist/deps | cut -f1)"
           # 许可证一起带上（开源合规的基本要求）
           mkdir -p dist/deps/_licenses
