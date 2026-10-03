@@ -6,7 +6,10 @@
 #    1. 本机没有配 SSH 密钥，也没有缓存凭据，直接 `git push` 会要求输入用户名密码；
 #    2. 把 Token **粘在聊天窗口里**会让它进入对话记录 —— 已经出过这个事故，
 #       所以这里用隐藏输入（屏幕不显示、不进 shell 历史、不进命令行参数）；
-#    3. 推送成功后 macOS 钥匙串会自动记住它，**以后直接 git push 就行**。
+#    3. 推送成功后由本脚本**显式**把 Token 写进钥匙串。
+#       不能指望 git 自动记：凭据来自 GIT_ASKPASS 时 git **不会**回写 credential
+#       helper（2026-10-03 实测：推送成功后钥匙串里依然没有条目，结果每次都要重新粘）。
+#       存进去之后，以后直接 git push 就行，别的工具也能复用同一枚凭据。
 #
 #  用法：双击本文件（或在终端里执行 bin/推送更新.command）
 # ==========================================================================
@@ -113,7 +116,27 @@ if git push origin main; then
   echo "  ✔ 推送成功"
   echo "=============================================="
   echo
-  echo "Token 已交给 macOS 钥匙串保管，下次不用再输。"
+
+  # ── 显式把 Token 写进钥匙串 ──────────────────────────────────────────
+  # 为什么必须显式做：实测（2026-10-03）git 用 GIT_ASKPASS 拿到凭据后
+  # **不会**回写 credential.helper，于是"推送成功但钥匙串仍为空"，
+  # 下次推送又要重新粘 Token —— 这也正是"AI 想代你推送却推不动"的原因。
+  # 用户名从 remote URL 里现取（https://github.com/<user>/<repo>.git），
+  # 不写死，换账号/换机器都不用改脚本。
+  GH_USER="$(git remote get-url origin 2>/dev/null \
+             | sed -E 's#^https://[^/]+/([^/]+)/.*#\1#')"
+  if [ -n "$GH_USER" ]; then
+    printf 'protocol=https\nhost=github.com\nusername=%s\npassword=%s\n\n' \
+      "$GH_USER" "$NETDEV_PUSH_TOKEN" | git credential-osxkeychain store 2>/dev/null
+    if security find-internet-password -s github.com -a "$GH_USER" >/dev/null 2>&1; then
+      echo "✔ Token 已写入 macOS 钥匙串 —— 以后 git push 不用再输，"
+      echo "  别的工具（包括替你干活的 AI）也能直接用。"
+    else
+      echo "⚠ Token 没能写进钥匙串（下次推送需重新粘贴，不影响本次推送结果）。"
+    fi
+  else
+    echo "⚠ 没能从 origin 解析出用户名，跳过写钥匙串。"
+  fi
   echo "想让它忘掉：钥匙串访问.app 里搜 github.com，删掉对应条目即可。"
   echo
   echo "★ 如果这枚 Token 曾经出现在聊天/截图/任何公开地方，"
