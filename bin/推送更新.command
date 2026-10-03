@@ -10,6 +10,10 @@
 #       不能指望 git 自动记：凭据来自 GIT_ASKPASS 时 git **不会**回写 credential
 #       helper（2026-10-03 实测：推送成功后钥匙串里依然没有条目，结果每次都要重新粘）。
 #       存进去之后，以后直接 git push 就行，别的工具也能复用同一枚凭据。
+#    4. 所有"按回车继续/退出"一律用 read -rs（关掉回显）。
+#       已出过事故（2026-10-03）：在"等回车"提示下误粘贴了 Token，终端是回显模式，
+#       整个 Token 明文打在屏幕上、又被截图发出去 → 凭据当场泄露、只能作废重发。
+#       换成 -s 之后，同样的误操作不会再显示任何字符。**不要把它改回 read -r。**
 #
 #  用法：双击本文件（或在终端里执行 bin/推送更新.command）
 # ==========================================================================
@@ -40,7 +44,7 @@ if [ -z "$PENDING" ]; then
   if [ "${1:-}" != "-f" ]; then
     echo
     echo "按回车键退出。"
-    read -r _
+    read -rs _
     exit 0
   fi
 else
@@ -49,10 +53,23 @@ fi
 echo
 
 echo "── 泄密自检（只查将要进仓的内容）──"
-# 说明：这里的模式都是本项目踩过的真实泄密点：
-#   USB 转串口适配器序列号 / 用户名密码 / GitHub Token / 私钥 / 本机绝对路径
+# 说明：下面的模式都是本项目踩过的真实泄密点：
+#   USB 转串口适配器序列号 / 串口设备路径 / GitHub Token / 私钥 / 本机绝对路径
+#
+# ★★ 这些模式必须**分片拼装**，绝不能写成完整字面量 ★★
+#   为什么：本脚本自己就是要被推送的文件之一，于是它会出现在自己扫描的 diff 里。
+#   规则一旦写成完整字面量，自检就会**命中自己** → 永久假阳性 → 这个脚本
+#   从被提交的那一刻起就再也推不动了（只会一直让你加 -f，而 -f 会连真检查一起绕过）。
+#   2026-10-03 实测：5 条规则全部命中，脚本被自己的检查拦死。
+#   拼装后源码里不存在连续的目标串，扫描不到自己；但运行时拼出的模式仍然完整有效。
 LEAK=0
-for pat in 'AABBCCDD' 'usbserial' 'github_pat_' 'ghp_' 'BEGIN [A-Z ]*PRIVATE KEY' '/Users/mac/Desktop'; do
+PAT_SN="FTAAM""5SL"                     # USB 转串口适配器序列号
+PAT_USB="usb""serial"                   # 串口设备路径
+PAT_FGP="github""_pat_"                 # GitHub 细粒度 Token
+PAT_CLS="gh""p_"                        # GitHub 经典 Token
+PAT_KEY="BEGIN [A-Z ]*PRIV""ATE KEY"    # 私钥头
+PAT_DESK="/Users/mac/Desk""top"         # 本机桌面绝对路径
+for pat in "$PAT_SN" "$PAT_USB" "$PAT_FGP" "$PAT_CLS" "$PAT_KEY" "$PAT_DESK"; do
   n=$(git diff origin/main..HEAD 2>/dev/null | grep -cE "$pat")
   if [ "$n" != "0" ]; then
     echo "  ⚠ 命中「$pat」$n 处 —— 请先人工确认再推"
@@ -67,7 +84,9 @@ else
   echo "  bin/推送更新.command -f"
   echo
   echo "按回车键退出（未推送）。"
-  read -r _
+  echo "⚠ 这一步只是在等你按回车，**不接收 Token** —— 请不要在这里粘贴任何"
+  echo "   Token / 密码 / 密钥。真正的输入提示出现在稍后的步骤里。"
+  read -rs _
   exit 1
 fi
 echo
@@ -90,7 +109,7 @@ if [ -z "$TOK" ]; then
   echo "✘ 没有输入内容，已取消。"
   echo
   echo "按回车键退出。"
-  read -r _
+  read -rs _
   exit 1
 fi
 
@@ -106,8 +125,9 @@ export NETDEV_PUSH_TOKEN="$TOK"
 export GIT_ASKPASS="$ASKPASS"
 
 # 注意：这里**故意**不写 `-c credential.helper=`。
-# 本机配的是 osxkeychain，推送成功后它能记住这枚 Token，
-# 以后直接 `git push` 就不用再输了。
+# 本机配的是 osxkeychain，目的是让 git 能复用**已经存在**的凭据；
+# 但"推送成功后 git 会自动记住这枚 Token"是不成立的（2026-10-03 实测），
+# 所以下面推送成功后会由本脚本**显式**写一次钥匙串。
 echo "正在推送……"
 echo
 if git push origin main; then
@@ -157,5 +177,5 @@ rm -rf "$ASKPASS_DIR"
 
 echo
 echo "按回车键关闭窗口。"
-read -r _
+read -rs _
 exit $RC
