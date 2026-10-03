@@ -2682,6 +2682,112 @@ def _launchd_has(label: str) -> bool:
     return label in r.stdout
 
 
+MOCK_PID = None   # 运行时在 cmd_mock 里按需解析
+
+
+def _mock_paths(port: int):
+    st = _P.state_dir()
+    return st / "mock.pid", st / f"mock-{port}.log"
+
+
+def _mock_pid():
+    """返回 (pid, pidfile)；没在跑时 pid 为 None。"""
+    pidf, _ = _mock_paths(0)
+    try:
+        pid = int(pidf.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None, pidf
+    try:
+        os.kill(pid, 0)          # 探活，不杀
+        return pid, pidf
+    except Exception:
+        return None, pidf        # 残留 pid 文件：进程已死
+
+
+def cmd_mock(a):
+    """本机设备模拟器（华为 VRP）—— 没有真设备也能把界面跑起来看。
+
+    为什么要这个命令：README 说"任何人按两条命令就能复现，不需要真设备"，
+    但模拟器原本只被 `netdev selftest` 短暂拉起。读者要自己知道去
+    tests/ 里跑一个 Python 脚本 —— 这不叫"开箱即用"。
+    """
+    port = int(getattr(a, "port", 20022) or 20022)
+    pidf, logf = _mock_paths(port)
+    act = a.action
+    if act == "restart":
+        cmd_mock(argparse.Namespace(action="stop", port=port))
+        act = "start"
+    pid, pidf = _mock_pid()
+    if act == "status":
+        if pid:
+            print(f"{C['grn']}✔{C['reset']} 模拟器在跑   PID {pid}   ssh://127.0.0.1:{port}")
+            return 0
+        print(f"{C['yel']}!{C['reset']} 模拟器没在跑   启动：{C['bold']}netdev mock start{C['reset']}")
+        return 1
+    if act == "stop":
+        if not pid:
+            print("本来就没在跑")
+            return 0
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                time.sleep(0.15)
+                try:
+                    os.kill(pid, 0)
+                except Exception:
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except Exception as e:
+            print(f"{C['red']}✘{C['reset']} 停不掉：{e}")
+            return 1
+        try:
+            pidf.unlink()
+        except Exception:
+            pass
+        print(f"已停止 PID {pid}")
+        return 0
+    # start / ensure
+    if pid:
+        print(f"已在跑（PID {pid}）  ssh://127.0.0.1:{port}")
+        return 0
+    sim = ROOT / "tests" / "mock_vrp.py"
+    if not sim.exists():
+        print(f"{C['red']}✘{C['reset']} 找不到模拟器脚本：{_P.rel_to_home(sim)}")
+        return 2
+    logf.parent.mkdir(parents=True, exist_ok=True)
+    py = str(ROOT / ".venv/bin/python")
+    if not os.path.exists(py):
+        py = sys.executable
+    with open(logf, "ab") as fh:
+        proc = subprocess.Popen([py, str(sim), str(port)], stdout=fh, stderr=fh,
+                                stdin=subprocess.DEVNULL, start_new_session=True,
+                                cwd=str(ROOT))
+    pidf.write_text(str(proc.pid), encoding="utf-8")
+    for _ in range(40):                      # 等它真的在监听，别"起完就说好了"
+        time.sleep(0.15)
+        if _mock_port_open(port):
+            print(f"{C['grn']}✔{C['reset']} 模拟器已启动  ssh://127.0.0.1:{port}   PID {proc.pid}")
+            print(f"  {C['dim']}现在可以在网页界面「＋ 接入」里选 {port} 端口的 SSH 设备{C['reset']}")
+            print(f"  {C['dim']}日志：{_P.rel_to_home(logf)}{C['reset']}")
+            return 0
+    print(f"{C['yel']}!{C['reset']} 起了但 6 秒内没监上，看日志：{_P.rel_to_home(logf)}")
+    return 1
+
+
+def _mock_port_open(port: int) -> bool:
+    import socket as _sk
+    s = _sk.socket()
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", int(port))) == 0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def cmd_logs(a):
     act = a.action
     if act == "status":
@@ -3643,6 +3749,12 @@ def main(argv=None):
     lg.add_argument("action", nargs="?", default="status", choices=["status", "rotate", "install-agent", "uninstall-agent"])
     lg.add_argument("--max-mb", type=int, default=20, help="pi-web-ui.log 阈值（MB，默认 20）")
     lg.set_defaults(fn=cmd_logs)
+
+    mk = sub.add_parser("mock", help="本机设备模拟器：没有真设备也能看到界面跑起来（start/stop/status）")
+    mk.add_argument("action", nargs="?", default="status",
+                    choices=["status", "start", "stop", "restart"])
+    mk.add_argument("-p", "--port", type=int, default=20022, help="监听端口（默认 20022，与 devices.toml.example 一致）")
+    mk.set_defaults(fn=cmd_mock)
 
     pl = sub.add_parser("policy", help="写操作人审策略：show/ask/allow（放宽需人批）")
     pl.add_argument("action", nargs="?", default="show", choices=["show", "readonly", "ask", "allow"])

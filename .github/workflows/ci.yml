@@ -73,6 +73,9 @@ jobs:
       - name: 回归 · 网页服务生命周期（27 项，跑在 8899 不碰 8898）
         run: ./.venv/bin/python tests/test_ui_lifecycle.py
 
+      - name: 回归 · netdev mock 模拟器命令（12 项）
+        run: ./.venv/bin/python tests/test_mock_cmd.py
+
       - name: 端到端自检（打本机模拟器：run / 闸门 / apply+save / backup）
         run: ./netdev selftest
 

@@ -68,6 +68,21 @@
 > 注：早期文档写的 `expect` 依赖是**误报**。全仓已核：串口/SSH/Telnet 桥均为纯 Python
 > （pyserial / paramiko），没有任何 `spawn` / `expect -c` 调用。
 
+## 开箱即用：先不用真设备看一眼
+
+**`./netdev mock start`** —— 在 `127.0.0.1:20022` 起一个模拟华为 VRP 的设备。
+然后到网页界面点「**＋ 接入**」选它，连上就能敲 `display version`。
+`./netdev mock stop` 收工。
+
+```
+./netdev mock start        # 起（有就报状态，不重复起）
+./netdev mock status       # 在跑 = 退出码 0；没跑 = 1
+./netdev mock stop
+```
+
+它用的就是 `tests/mock_vrp.py` —— 所以**下面所有测试也是靠它离线跑的**，
+任何人 clone 下来不接任何真硬件就能验证整套东西。
+
 ## 开箱即用：设备接入与监控
 
 **平台不用懂，系统自动识别。** 接入设备时「平台」字段默认「自动识别」——连接后系统会发一条 `display version`，按厂商 banner 自动判断（华为 / 华三 / 锐捷 / 思科 / 迈普），再据此选对监控命令与解析规则。留空即可，不用记 platform 代号。
@@ -218,6 +233,7 @@ uv pip install -r requirements.txt
 ./netdev doctor                                         # 环境 / 服务 / 串口 / 命令清单 / 日志
 python3 tests/test_pi_heal_and_cmdcache.py             # 回归：pi 残留锁自愈 + 命令学习缓存 + 平台识别（24 项）
 python3 tests/test_approval_gates.py                   # 回归：写操作人审闸门（19 项，安全关键）
+python3 tests/test_mock_cmd.py                         # 回归：netdev mock 模拟器命令（12 项）
 python3 tests/test_ui_lifecycle.py                     # 回归：网页服务起停 / 幂等 / 真脱离进程组（27 项）
 ```
 
