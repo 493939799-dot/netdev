@@ -637,68 +637,77 @@ def test_ai_toolchain():
 # 七、AI 面板的停止按钮：3×3 点阵（2026-10-04 用户要求「统一风格」）
 # ======================================================================
 def test_ai_stop_button_dotmatrix():
-    """原来是一个实心方块字符「■」，和界面里的点阵语言（品牌标识 / 接入中）不统一。
+    """停止按钮的图标沿革：实心方块「■」→ 3×3 方点阵 → 3×3 圆点阵 → **一颗圆点**。
+
+    用户最后一次的要求是「整个换掉」—— 那 9 个格不要了，换成**一颗**小圆点，
+    就是设备行「窗格在线」那一颗（7px 圆 + 6px 柔光）。语义也跟着对齐设备行：
+    不活动 = 主题主色实心点；活动 = 变绿 + 呼吸。
 
     这条守的都是**「改了不报错、只会悄悄变样」**的地方 —— 正是本项目专门写测试
     兜住的那一类：
 
-      ① 按钮里必须是 .dots 的 9 个格，且不再出现「■」字面量；
-      ② 空闲/忙两态靠 .busy 类切；★ 必须用 `animation-name` **长写法** ——
-         写成 `animation` 简写会把 `.dots i:nth-child(n){animation-delay:…}`
-         那组对角错峰一并重置为 0，9 个点变成同步闪烁。
-         观感完全变了，但**没有任何报错**、也不影响任何接口。
-      ③ `aiBusy()` 必须同时管到停止按钮（它原先只管 AI 标题后面那个网状图标）。
-      ④ 点阵必须是**圆点**（2026-10-04 追加）—— 与设备行/顶栏那个"在线"小圆点
-         统一形状语言。这里最容易踩的是**只加 border-radius 不改栅格**：
-         格子还是 4px 而点变成 4.5px，点会溢出格子（overflow 可见所以不报错，
-         但排布会歪），以及**顺手把品牌标识也改圆**（用户只要求这一个按钮）。
+      ① 按钮里必须只有**一颗**点，且不再出现「■」字面量、也不再有点阵的 9 个 `<i>`；
+      ② 点的尺寸/柔光必须与设备行那颗**同规格**（7px / 0 0 6px）——
+         不一致就变成"两种材质"，但**不会报任何错**；
+      ③ 空闲/忙两态靠 .busy 类切；★ 必须用 `animation-name` **长写法** ——
+         写成 `animation:dotbeat` 简写会把 duration/timing/iteration-count
+         一并重置成默认值，于是 `animation-duration` 变成 `0s`、**动画根本不跑**，
+         点就一直静静躺着。观感完全变了，但**没有任何报错**、也不影响任何接口。
+      ④ `aiBusy()` 必须同时管到停止按钮（它原先只管 AI 标题后面那个网状图标）。
+      ⑤ 颜色一律走 `currentColor`（底色 + 柔光各写一遍就会漏掉一处）。
     """
-    print("\n[7] AI 面板停止按钮：3×3 点阵")
+    print("\n[7] AI 面板停止按钮：一颗圆点")
     html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
 
-    # ① 按钮本体
-    check("停止按钮改用 .dots 点阵", 'aria-label="停止"><span class="dots stop"' in html)
+    # ① 按钮本体：一颗点，不是九颗
+    check("停止按钮改用 .ai-stop-dot（单颗点）",
+          'aria-label="停止"><span class="ai-stop-dot"' in html)
     check("停止按钮里已无「■」字面量", 'aria-label="停止">■' not in html)
-    a = html.index('class="dots stop"')
+    a = html.index('class="ai-stop-dot"')
     seg = html[a:html.index("</button>", a)]
-    check("点阵正好 9 格（3×3）", seg.count("<i></i>") == 9, str(seg.count("<i></i>")))
+    check("★ 9 个点阵格已整个移除（不再是 <i> 点阵）", seg.count("<i>") == 0, seg)
+    check("点元素是自闭的、没有子节点", "<span class=\"ai-stop-dot\" aria-hidden=\"true\"></span>" in html)
 
     # ② 忙闲两态 +「不能改成简写」这条最容易踩
     check("空闲态显式关掉动画（否则会一直闪）", "animation-name:none" in html)
-    check("忙态用 animation-name 切动效", "animation-name:dotpulse-btn" in html)
-    check("★ 不许用 animation 简写（会重置对角错峰 delay → 9 点同步闪）",
-          "animation:dotpulse-btn" not in html,
-          "写成简写就没有对角流动了，且不报任何错")
-    check("低谷抬高的 keyframes 已定义", "@keyframes dotpulse-btn" in html)
-    check("对角错峰依赖的 nth-child delay 仍在",
-          ".dots i:nth-child(9){animation-delay:.40s}" in html)
+    check("忙态用 animation-name 切动效", "animation-name:dotbeat" in html)
+    check("★ 不许用 animation 简写（会重置 duration → 变成 0s，动画根本不跑）",
+          "animation:dotbeat" not in html,
+          "写成简写 duration 就是默认 0s，点不会呼吸，且不报任何错")
+    check("呼吸的 keyframes 已定义", "@keyframes dotbeat" in html)
 
-    # ③ aiBusy 必须管到它
+    def _rule(sel: str) -> str:
+        i = html.index(sel)
+        return html[i:html.index("}", i)]
+
+    # ③ 与设备行那颗点**同规格**（尺寸 + 柔光），否则就是两种材质
+    dot = _rule(".ai-in button.icon-btn .ai-stop-dot{")
+    check("点 7px，与设备行 .st 同尺寸", "width:7px" in dot and "height:7px" in dot, dot)
+    check("圆形（border-radius:50%）", "border-radius:50%" in dot, dot)
+    check("柔光 0 0 6px，与设备行同款", "box-shadow:0 0 6px" in dot, dot)
+    check("★ 底色与柔光都走 currentColor（只写一处会漏）",
+          dot.count("currentColor") == 2, dot)
+    st = _rule(".st{")
+    check("设备行那颗点确实还是 7px（两边没跑偏）", "width:7px" in st and "height:7px" in st, st)
+    check("设备行那颗点确实还带 0 0 6px 柔光", "box-shadow:0 0 6px" in html)
+
+    # ④ aiBusy 必须管到它
     js = html[html.index("function aiBusy(on)"):html.index("function termBusy(")]
     check("aiBusy 会切停止按钮的 .busy",
           "getElementById('aiStop')" in js and "classList.toggle('busy'" in js)
     check("aiBusy 仍保留 AI 标题图标的原逻辑（没被改坏）",
           "ico.net" in js and "_aiT" in js)
 
-    # ④ ink（墨水屏）主题会冻结动画并把点阵压暗；停止按钮是**控件**，要单独提亮
-    check("ink 主题下停止按钮点阵单独提亮",
-          '[data-theme="ink"] .ai-in .dots.stop i' in html)
-
-    # ⑤ 点阵是**圆点**（2026-10-04 用户要求）
-    def _rule(sel: str) -> str:
-        i = html.index(sel)
-        return html[i:html.index("}", i)]
-
-    dot_i = _rule(".ai-in button.icon-btn .dots i{")
-    check("停止按钮的点是圆形（border-radius:50%）", "border-radius:50%" in dot_i, dot_i)
-    check("圆形墨量比方形少，尺寸已补回来（4.5px 而非 4px）",
-          "width:4.5px" in dot_i and "height:4.5px" in dot_i, dot_i)
-    check("★ 栅格跟着改成 4.5px（只加圆角不改栅格 → 点会溢出格子，不报错但排布歪）",
-          "grid-template-columns:repeat(3,4.5px)" in html)
-    # 反例：只改了停止按钮，品牌标识与「接入中」仍是方正点阵
-    check("品牌标识仍是方点（用户只要求改这一个按钮）",
-          "border-radius" not in _rule(".brand .dots.logo i{"))
-    check(".bk-busy（接入中）仍是方点", "border-radius" not in _rule(".bk-busy .dots i{"))
+    # ⑤ 旧设计不许复活
+    check("★ 旧的 .dots.stop 点阵写法没有残留",
+          "dots stop" not in html and "dots.stop" not in html)
+    check("★ 旧的 dotpulse-btn 已随点阵一起去掉（别留死 CSS）",
+          "dotpulse-btn" not in html)
+    # 反例：品牌标识与「接入中」的点阵仍该在，不许被顺手删掉
+    check("品牌标识的 3×3 点阵仍在", ".brand .dots.logo" in html)
+    check(".bk-busy（接入中）的点阵仍在", ".bk-busy .dots" in html)
+    check("品牌点阵的对角错峰 delay 仍在（没被顺手清掉）",
+          ".dots i:nth-child(9){animation-delay:.40s}" in html)
 
 
 # ======================================================================
@@ -733,10 +742,10 @@ def test_active_state_is_green():
     dot = rule(".dot{")
     check("顶栏「在线」点同一条规则", "--st-on" in dot and "var(--g)" not in dot, dot)
 
-    busy = rule(".ai-in button.icon-btn.busy .dots i{")
-    check("AI 点阵忙态 = 绿", "color:var(--st-on)" in busy, busy)
-    idle = rule(".ai-in button.icon-btn .dots i{")
-    check("AI 点阵空闲态**不**上绿色（只有活动才绿）", "--st-on" not in idle, idle)
+    busy = rule(".ai-in button.icon-btn.busy .ai-stop-dot{")
+    check("AI 停止点忙态 = 绿", "color:var(--st-on)" in busy, busy)
+    idle = rule(".ai-in button.icon-btn .ai-stop-dot{")
+    check("AI 停止点空闲态**不**上绿色（只有活动才绿）", "--st-on" not in idle, idle)
 
     # 三个状态仍要能互相区分 —— 别为了"在线变绿"把另两个弄没了
     for sel in (".st.off{", ".st.warn{"):
