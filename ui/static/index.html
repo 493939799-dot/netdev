@@ -55,6 +55,10 @@
 [data-theme="ink"] .win,[data-theme="ink"] .dlg{box-shadow:none}
 [data-theme="ink"] .win-bar{letter-spacing:1px}
 [data-theme="ink"] .brand .dots.logo i{opacity:.75}
+/* 墨水屏主题会把所有点阵压到 .55 且冻结动画（见上面 * 规则）。
+   停止按钮的点阵是**图标**不是"运行中"指示，压暗到 .55 会读不出来 —— 单独提亮。
+   冻结动画可以接受：ink 主题的设计前提就是"静态纸面"。 */
+[data-theme="ink"] .ai-in .dots.stop i{opacity:.85!important}
 
 [data-theme="minimal"]{--g:#000000;--g1:#1a1a1a;--g2:#4d4d4d;--g3:#b8b8b8;--g4:#dcdcdc;
   --bg:#ffffff;--dim:#808080;--warn:#8b6914;--bad:#c23621;
@@ -326,9 +330,9 @@ button.mono:hover{background:rgba(var(--g-rgb),.24);border-color:var(--g1);color
     cursor:pointer;white-space:nowrap}
 .ai-in button:hover{background:rgba(var(--g-rgb),.3)}
 
-/* 停止按钮：纯图标（方块）—— 去掉文字更清爽，图标本身已足够表意。
+/* 停止按钮：纯图标 —— 原来是一个实心方块字符「■」，去掉文字更清爽。
    aria-label 保留，读屏和 tooltip 仍能说明它是干什么的。 */
-/* 停止按钮：绿色（与界面统一）。它只是"中断当前动作"，不是破坏性操作，
+/* 停止按钮：主色（与界面统一）。它只是"中断当前动作"，不是破坏性操作，
    没有理由用警示红 —— 破坏性动作用红的地方已经够多了（删除/清空）。
    悬停也只是加深底色，保持同一套视觉语言。 */
 /* ── 线形图标（Bootstrap Icons，内嵌 sprite）─────────────────────────
@@ -338,9 +342,27 @@ button.mono:hover{background:rgba(var(--g-rgb),.24);border-color:var(--g1);color
   display:inline-block;overflow:visible}
 .bi.wide{width:1.15em;height:1.15em}
 button .bi, .mono .bi{pointer-events:none}
-.ai-in button.icon-btn{width:26px;padding:0;font-size:11px;line-height:24px;text-align:center;
+/* ★ 2026-10-04 用户要求：停止按钮的图标由实心方块「■」改成 3×3 点阵，
+   与左上角品牌标识、「接入中」的等待点阵**同一套视觉语言**（4px 格 / 1.5px 隙）。
+   为什么要区分忙闲：点阵在这个界面里一直代表"正在跑"（品牌=系统运行中、
+   .bk-busy=接入中）。若让停止按钮常闪，会读成"它自己在忙"，语义是反的。
+   所以：空闲 = 静态实心点阵（纯图标）；AI 正在跑 = 才套上对角闪动 ——
+   那正是最需要你点到它的时候。忙闲由 aiBusy() 切 .busy 类。 */
+.ai-in button.icon-btn{width:26px;padding:0;display:flex;align-items:center;justify-content:center;
   flex:0 0 auto;color:var(--g);border-color:var(--g1)}
 .ai-in button.icon-btn:hover{background:rgba(var(--g-rgb),.30);border-color:var(--g);color:var(--g)}
+.ai-in button.icon-btn .dots{margin:0;vertical-align:0;
+  grid-template-columns:repeat(3,4px);grid-template-rows:repeat(3,4px);gap:1.5px}
+/* ⚠ 这里必须用 animation-name 长写法，**不能用 animation 简写**：
+   简写会把 animation-delay 一并重置为 0，于是那个"按对角线错峰"的
+   .dots i:nth-child(n){animation-delay:…} 整组被吃掉 ——
+   9 个点变成同步闪烁，看着像"整块在呼吸"，不是点阵流动（2026-10-04 实测到）。 */
+/* 点阵"流动"的节奏与品牌完全一致（同一个对角错峰），只把**低谷抬高**：
+   品牌那是装饰，可以亮到 .16 再回来；停止按钮是控件，闪到快看不见就没法点了。
+   所以单独一个 keyframes，峰值/节奏/时长都不动，只改低谷值。 */
+@keyframes dotpulse-btn{0%,70%,100%{opacity:.38}35%{opacity:1}}
+.ai-in button.icon-btn .dots i{width:4px;height:4px;opacity:1;animation-name:none}
+.ai-in button.icon-btn.busy .dots i{animation-name:dotpulse-btn}
 
 table{width:100%;border-collapse:collapse;font-size:10.5px}
 th,td{border:1px solid var(--g4);padding:2px 5px;text-align:left}
@@ -532,7 +554,7 @@ td.ops{white-space:nowrap}
       <textarea id="aiIn" rows="1" autocomplete="off" spellcheck="false"
         placeholder="说需求，例如：给财务限 300M　—　Enter 发送 · Shift+Enter 换行"></textarea>
       <button id="aiStop" class="icon-btn" title="停止（中断 AI 当前正在做的事，不会关掉会话）"
-              aria-label="停止">■</button>
+              aria-label="停止"><span class="dots stop" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></button>
     </div>
   </section>
 
@@ -828,6 +850,12 @@ var SHOW_PW = false;
    pick = 终端后面的镐头+矿物图（终端读写时动） */
 let _aiT=null, _termT=null;
 function aiBusy(on){
+  /* ★ 停止按钮的 3×3 点阵：AI 正在跑时才闪（2026-10-04 用户指定）。
+     这里让它**即时**跟随 on，不走下面 net 图标那 600ms 收尾 ——
+     那个收尾是给"思考中"留余韵的，而停止按钮必须如实反映"现在还能不能停"。
+     用 getElementById 而不走 $()：$ 是文件后面的 const，避免任何 TDZ 风险。 */
+  const sp=document.getElementById('aiStop');
+  if(sp) sp.classList.toggle('busy', !!on);
   const ic=document.querySelector('.ico.net'); if(!ic) return;
   if(on){ ic.classList.add('busy'); clearTimeout(_aiT); }
   else  { clearTimeout(_aiT); _aiT=setTimeout(()=>ic.classList.remove('busy'), 600); }

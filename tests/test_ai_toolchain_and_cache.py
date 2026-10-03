@@ -633,6 +633,54 @@ def test_ai_toolchain():
           f"recommended={r.get('recommended')!r} authed={r['agents'][0].get('authed')!r}")
 
 
+# ======================================================================
+# 七、AI 面板的停止按钮：3×3 点阵（2026-10-04 用户要求「统一风格」）
+# ======================================================================
+def test_ai_stop_button_dotmatrix():
+    """原来是一个实心方块字符「■」，和界面里的点阵语言（品牌标识 / 接入中）不统一。
+
+    这条守的都是**「改了不报错、只会悄悄变样」**的地方 —— 正是本项目专门写测试
+    兜住的那一类：
+
+      ① 按钮里必须是 .dots 的 9 个格，且不再出现「■」字面量；
+      ② 空闲/忙两态靠 .busy 类切；★ 必须用 `animation-name` **长写法** ——
+         写成 `animation` 简写会把 `.dots i:nth-child(n){animation-delay:…}`
+         那组对角错峰一并重置为 0，9 个点变成同步闪烁。
+         观感完全变了，但**没有任何报错**、也不影响任何接口。
+      ③ `aiBusy()` 必须同时管到停止按钮（它原先只管 AI 标题后面那个网状图标）。
+    """
+    print("\n[7] AI 面板停止按钮：3×3 点阵")
+    html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+
+    # ① 按钮本体
+    check("停止按钮改用 .dots 点阵", 'aria-label="停止"><span class="dots stop"' in html)
+    check("停止按钮里已无「■」字面量", 'aria-label="停止">■' not in html)
+    a = html.index('class="dots stop"')
+    seg = html[a:html.index("</button>", a)]
+    check("点阵正好 9 格（3×3）", seg.count("<i></i>") == 9, str(seg.count("<i></i>")))
+
+    # ② 忙闲两态 +「不能改成简写」这条最容易踩
+    check("空闲态显式关掉动画（否则会一直闪）", "animation-name:none" in html)
+    check("忙态用 animation-name 切动效", "animation-name:dotpulse-btn" in html)
+    check("★ 不许用 animation 简写（会重置对角错峰 delay → 9 点同步闪）",
+          "animation:dotpulse-btn" not in html,
+          "写成简写就没有对角流动了，且不报任何错")
+    check("低谷抬高的 keyframes 已定义", "@keyframes dotpulse-btn" in html)
+    check("对角错峰依赖的 nth-child delay 仍在",
+          ".dots i:nth-child(9){animation-delay:.40s}" in html)
+
+    # ③ aiBusy 必须管到它
+    js = html[html.index("function aiBusy(on)"):html.index("function termBusy(")]
+    check("aiBusy 会切停止按钮的 .busy",
+          "getElementById('aiStop')" in js and "classList.toggle('busy'" in js)
+    check("aiBusy 仍保留 AI 标题图标的原逻辑（没被改坏）",
+          "ico.net" in js and "_aiT" in js)
+
+    # ④ ink（墨水屏）主题会冻结动画并把点阵压暗；停止按钮是**控件**，要单独提亮
+    check("ink 主题下停止按钮点阵单独提亮",
+          '[data-theme="ink"] .ai-in .dots.stop i' in html)
+
+
 def main():
     print("=" * 66)
     print("netdev 回归测试：AI 工具链 + 采集缓存 + 宿主 shim 剥离")
@@ -644,6 +692,7 @@ def main():
     test_py_files_compile()
     test_mcp_contract()
     test_ai_toolchain()
+    test_ai_stop_button_dotmatrix()
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
     if FAIL:
