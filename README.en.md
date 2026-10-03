@@ -60,6 +60,21 @@ and type into it; you watch it happen and can take over at any moment.
 
 ## Install
 
+### Prebuilt installer (recommended)
+
+**[⬇ Download netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)** (~37 MB)
+
+```bash
+tar -xzf netdev-macos-arm64-installer.tar.gz
+cd netdev-macos-arm64-installer
+bash install.sh --dry-run     # preview (writes nothing)
+bash install.sh               # install
+```
+
+The bundle ships its **own Python runtime and every dependency** — the target Mac
+needs nothing preinstalled and no network access. Installs to `~/netops` by default
+(use `--prefix <dir>` to change it). Uninstall with `bash uninstall.sh`.
+
 ### From source
 
 ```bash
@@ -68,12 +83,12 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 ./netdev doctor
 ```
 
-### Build a self-contained bundle
+### Build the bundle yourself
 
-The source repo does **not** contain `payload/` or `runtime/`. To produce an
-offline `.tar.gz` for another Mac:
+The source repo does **not** contain `payload/`, `runtime/` or `dist/deps/`:
 
 ```bash
+uv pip install --target dist/deps --python 3.12 -r requirements.txt   # offline deps FIRST
 bash dist/build_bundle.sh --with-python
 # → ~/Desktop/workbuddy/<date>_netdev设备工具台_macOS_<arch>_安装包.tar.gz
 
@@ -81,6 +96,11 @@ tar -xzf <that file> && cd <extracted>
 bash install.sh --dry-run     # preview
 bash install.sh               # install
 ```
+
+> ⚠️ The `.so` files inside `dist/deps` determine which Python version gets bundled
+> (the build script infers it from them). Generate the deps and run the build with the
+> **same** Python minor version — otherwise the target machine crashes on
+> `import _cffi_backend`.
 
 ## Quick start
 

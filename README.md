@@ -176,20 +176,44 @@ AI 助手**只有一个后端：直连 OpenAI 兼容 API**。不依赖本机装�
 
 ## 两种安装方式
 
-### 方式一：用预构建包（推荐）
+### 方式一：下载安装包（推荐）
 
-源码仓库本身**不含** `payload/` 和 `runtime/`，直接 `bash install.sh` 会失败。需要先构建分发包：
+**[⬇ 下载 netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)**（约 37 MB）
+
+下载后，在终端里依次执行：
+
+```bash
+tar -xzf netdev-macos-arm64-installer.tar.gz
+cd netdev-macos-arm64-installer
+bash install.sh --dry-run   # 先预览会做什么（不写盘）
+bash install.sh             # 正式安装
+```
+
+安装包**自带 Python 与全部依赖**，目标 Mac **不需要预装任何东西**，也**不需要联网**。
+默认装到 `~/netops`；想换位置用 `--prefix <目录>`。
+
+装完：双击 `~/netops/ui/启动.command`，浏览器打开 <http://127.0.0.1:8898>。
+卸载：进安装目录执行 `bash uninstall.sh`（会先移入隔离区，不直接删）。
+
+<details>
+<summary>想自己从源码构建这个包？</summary>
+
+源码仓库本身**不含** `payload/` 和 `runtime/`，直接 `bash install.sh` 会失败，需先构建分发包：
 
 ```bash
 bash dist/build_bundle.sh --with-python
-# 产物：~/Desktop/workbuddy/<日期>_netdev设备工具台_macOS_arm64_安装包.tar.gz
-
-cd ~/Desktop/workbuddy
-tar -xzf <日期>_netdev设备工具台_macOS_arm64_安装包.tar.gz
-cd <日期>_netdev设备工具台_macOS_arm64_安装包
-bash install.sh --dry-run   # 先预览
-bash install.sh             # 正式安装
+# 产物：~/Desktop/workbuddy/<日期>_netdev设备工具台_macOS_<arch>_安装包.tar.gz
 ```
+
+构建前需准备离线依赖（否则包内不含 netmiko 等，目标机得联网装）：
+
+```bash
+uv pip install --target dist/deps --python 3.12 -r requirements.txt
+```
+
+> ⚠️ `dist/deps` 里的 `.so` 决定了包内 Python 的版本（构建脚本从中反推），
+> 所以**生成依赖与构建必须用同一个 Python 小版本**，否则目标机加载 `_cffi_backend.so` 等会直接崩。
+</details>
 
 ### 方式二：开发者就地运行
 

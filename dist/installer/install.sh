@@ -183,8 +183,22 @@ if [ "$DRY" = 0 ]; then
   # 交给 netdev web repair 生成：它会写出正确格式（3 条聚合命令 + 设备按钮），
   # 并处理旧按钮清理与备份，保证装完 doctor 直接全绿，不再需要用户手动 repair。
   if [ -x "$PREFIX/netdev" ]; then
+    # ★★ 注意：`netdev web repair` 写的是 **$HOME/.pi/commands.json**，
+    #   它**不认** --workdir。默认安装时 WORKDIR 恰好等于 HOME，所以一直没暴露；
+    #   但一旦用 `--workdir` 装到别处，就会**无声覆盖**用户家目录里已有的命令文件。
+    #   2026-10-03 实测踩到：装到 /tmp/netdev-itest，结果 ~/.pi/commands.json
+    #   （软链 → 真仓库的 config/pi-commands.json）被改成指向 /tmp 的路径。
+    #   这里先把家目录那份备份好，至少不会丢。
+    if [ -e "$HOME/.pi/commands.json" ]; then
+      cp -pL "$HOME/.pi/commands.json" \
+        "$PREFIX/backups/commands.json.bak-home-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    fi
+    if [ "$WORKDIR" != "$HOME" ]; then
+      warn "命令按钮实际装在 $HOME/.pi/（netdev web repair 只认 HOME，不认 --workdir）"
+      warn "已把原有的 $HOME/.pi/commands.json 备份到 $PREFIX/backups/"
+    fi
     if NETDEV_ROOT="$PREFIX" "$PREFIX/netdev" web repair >/dev/null 2>&1; then
-      ok "已生成终端页命令（netdev web repair → $CMDFILE）"
+      ok "已生成终端页命令（netdev web repair → $HOME/.pi/commands.json）"
     else
       warn "netdev web repair 未成功（可稍后手动执行）"
     fi
