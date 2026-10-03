@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <title>NETDEV // 网络设备调试终端</title>
+<!-- 内联图标：浏览器每次都会自动请求 /favicon.ico，没有就 404（控制台每次加载都报红）。
+     用 data URI 内联，压根不发这个请求，标签页也有正经图标。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0f0c'/%3E%3Crect x='6' y='9' width='20' height='13' rx='2' fill='none' stroke='%2334e07a' stroke-width='2'/%3E%3Cpath d='M10 20l4-4 3 3 5-6' fill='none' stroke='%2334e07a' stroke-width='2' stroke-linecap='round'/%3E%3Crect x='13' y='25' width='6' height='2' rx='1' fill='%2334e07a'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/xterm.css">
 <style>
 :root{
@@ -1136,11 +1139,21 @@ async function loadDevices(){
       <span class="mt">${esc(d.address||'')}${d.window_live?'<br><span class="k">窗格在线</span>':''}</span>
       <span class="del" title="断开：释放通道（设备仍保留在连接簿里）">✕</span>
     </div>`;
-  }).join('') + `<hr><div class="m" style="font-size:10px">
+  }).join('') + (shownDevs.length
+    // 有已接入设备：教用户怎么用
+    ? `<hr><div class="m" style="font-size:10px">
       点设备 = 开一个真实终端（attach 到 netdev 的 tmux 设备窗格）<br>
       窗格不在时，后端会先调 <b>netdev shell</b> 把它建起来<br>
       <span class="k">＋</span> 接入新设备走 netdev 的三合一菜单
-    </div>`;
+    </div>`
+    // 一台都没接入：**不能说"点设备"——列表里根本没有设备可点**（实测被用户截图指出）
+    : `<hr><div class="m" style="font-size:10px">
+      ${devs.length
+        ? `设备库里有 <b>${devs.length}</b> 台，但<b>都还没接入</b>，所以这里不显示。<br>
+           点上面的 <span class="k">＋</span> 接入（SSH / Telnet / 串口），接入后就会出现在这里。`
+        : `设备库还是空的。<br>点上面的 <span class="k">＋</span> 接入第一台设备，
+           或直接双击菜单里的「设备工具台」→ 快速接入。`}
+    </div>`);
   // 默认选中第一台在线设备：让监控/快照有明确目标（不用先手动点）
   if(!CURDEV){
     const live = devs.find(d=>d.window_live) || devs[0];
