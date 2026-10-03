@@ -113,21 +113,41 @@ if [ -z "$TOK" ]; then
   exit 1
 fi
 
-# 用 GIT_ASKPASS 把 Token 交给 git：
+# 用户名从 remote URL 里现取（https://github.com/<user>/<repo>.git），不写死。
+GH_USER="$(git remote get-url origin 2>/dev/null \
+           | sed -E 's#^https://[^/]+/([^/]+)/.*#\1#')"
+[ -n "$GH_USER" ] || GH_USER="git"
+
+# 用 GIT_ASKPASS 把凭据交给 git：
 #   · 不进命令行参数（ps 看不到）
 #   · 不写进任何文件（只放在本进程的环境变量里）
 #   · 不落进 shell 历史
+# ★★ askpass 必须**区分** git 的两种提问，绝不能一律回 Token ★★
+#   git 认证时会分别问两次："Username for 'https://github.com'" 和
+#   "Password for 'https://…'"。若对两次都回 Token，git 拿到的就是
+#   username=Token / password=Token。GitHub 照收（它忽略用户名），
+#   但 git 在成功后会把这份**错位的凭据写进钥匙串** —— 于是钥匙串里
+#   出现一条「账户名 = 你的 Token」的记录，而
+#   `security find-internet-password -s github.com`（连 -w 都不用加）
+#   就能把 Token 原样打印出来。2026-10-03 实测踩到，这是真实暴露面。
 ASKPASS_DIR="$(mktemp -d)"
 ASKPASS="$ASKPASS_DIR/askpass.sh"
-printf '#!/bin/sh\nprintf "%%s" "$NETDEV_PUSH_TOKEN"\n' > "$ASKPASS"
+cat > "$ASKPASS" <<'ASKEOF'
+#!/bin/sh
+case "$1" in
+  *[Uu]sername*) printf "%s" "$NETDEV_PUSH_USER"  ;;
+  *)             printf "%s" "$NETDEV_PUSH_TOKEN" ;;
+esac
+ASKEOF
 chmod 700 "$ASKPASS"
+export NETDEV_PUSH_USER="$GH_USER"
 export NETDEV_PUSH_TOKEN="$TOK"
 export GIT_ASKPASS="$ASKPASS"
 
 # 注意：这里**故意**不写 `-c credential.helper=`。
-# 本机配的是 osxkeychain，目的是让 git 能复用**已经存在**的凭据；
-# 但"推送成功后 git 会自动记住这枚 Token"是不成立的（2026-10-03 实测），
-# 所以下面推送成功后会由本脚本**显式**写一次钥匙串。
+# 本机配的是 osxkeychain —— 更正一条先前的误判：git **确实会**在认证成功后
+# 把凭据回写钥匙串（2026-10-03 二次实测；之前以为它不回写，是错的）。
+# 回写本身是好事，前提是上面 askpass 交出去的 username 是对的。
 echo "正在推送……"
 echo
 if git push origin main; then
@@ -137,14 +157,15 @@ if git push origin main; then
   echo "=============================================="
   echo
 
-  # ── 显式把 Token 写进钥匙串 ──────────────────────────────────────────
-  # 为什么必须显式做：实测（2026-10-03）git 用 GIT_ASKPASS 拿到凭据后
-  # **不会**回写 credential.helper，于是"推送成功但钥匙串仍为空"，
-  # 下次推送又要重新粘 Token —— 这也正是"AI 想代你推送却推不动"的原因。
-  # 用户名从 remote URL 里现取（https://github.com/<user>/<repo>.git），
-  # 不写死，换账号/换机器都不用改脚本。
-  GH_USER="$(git remote get-url origin 2>/dev/null \
-             | sed -E 's#^https://[^/]+/([^/]+)/.*#\1#')"
+  # ── 把凭据以**正确形状**写进钥匙串 ────────────────────────────────────
+  # 两步：先清掉该 host 下的旧条目，再写一条 username 正确的。
+  # 为什么要先清：历史版本与"错位回写"会在钥匙串里留下「账户名 = Token」
+  # 或「密码为空」这类脏条目，而 git 取凭据时**只认第一条** ——
+  # 命中脏条目就会认证失败，而且不会再提示你输密码，极难排查。
+  for _ in 1 2 3 4 5 6 7 8; do
+    security find-internet-password -s github.com >/dev/null 2>&1 || break
+    security delete-internet-password -s github.com >/dev/null 2>&1 || break
+  done
   if [ -n "$GH_USER" ]; then
     printf 'protocol=https\nhost=github.com\nusername=%s\npassword=%s\n\n' \
       "$GH_USER" "$NETDEV_PUSH_TOKEN" | git credential-osxkeychain store 2>/dev/null
