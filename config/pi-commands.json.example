@@ -1,0 +1,19 @@
+{
+  "commands": [
+    {
+      "name": "→ 快速接入（SSH / Telnet / 串口）",
+      "command": "/usr/bin/python3 __PREFIX__/tools/quick_conn.py quick",
+      "cwd": "${pwd}"
+    },
+    {
+      "name": "≡ 管理接入目标（接入/列出/新增/删除）",
+      "command": "/usr/bin/python3 __PREFIX__/tools/quick_conn.py manage",
+      "cwd": "${pwd}"
+    },
+    {
+      "name": "↕ 备份 / 恢复 / 管理快照",
+      "command": "/usr/bin/python3 __PREFIX__/tools/snapshot.py menu",
+      "cwd": "${pwd}"
+    }
+  ]
+}

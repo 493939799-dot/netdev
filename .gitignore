@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Project runtime artifacts
+logs/*
+!logs/.gitkeep
+live/*
+!live/.gitkeep
+backups/*
+!backups/.gitkeep
+state/*
+!state/.gitkeep
+config/state/*
+!config/state/.gitkeep
+
+# User-specific / generated
+config/workbuddy*.json
+config/codebuddy*.json
+# ★ 凭据文件：明文存 API Key / token，开源仓里绝不能有（2026-10-01 补）
+config/direct.json
+config/direct.json.bak*
+config/cred*.json
+config/*token*.json
+config/*key*.json
+# ★ 个人化的 AI 工作约定（含本机工作目录、现场设备型号、客户标识）——
+#   开源仓只放脱敏模板 config/AGENTS.workspace.md.example（2026-10-03 补）
+config/AGENTS.workspace.md
+# ★ 真实设备清单（含真机地址、串口号、**USB 适配器序列号**）——
+#   开源仓只放 config/devices.toml.example。装完首次使用时由 install.sh 播种。
+#   忘了排除的后果：适配器序列号会永久留在 git 历史里（2026-10-03 补）
+config/devices.toml
+config/devices.toml.bak-*
+# ★ 连接簿（会积累真机地址与端口）→ 只留空模板
+config/connections.json
+# ★ 带本机安装路径的活文件（把 ~/netops 写死在里面）→
+#   对应的 .example 模板用 __PREFIX__ 占位，进公开仓
+config/pi-commands.json
+config/_netdev
+config/netdev.bash
+# 采集命令学习缓存（机器本地状态，无保密性但会被每台机器覆盖）
+config/cmd-cache.json
+# 自动生成的补全文件（由 netdev web install 写出）
+config/completions/
+*.info
+
+# ★ 本机可能出现的任何形式的环境变量凭据（2026-10-03 补）
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 备份与隔离区（本项目的一贯纪律：只搬不删，但也不进版本库）
+*.bak-*
+*.bak
+*.orig
+*/.quarantine-*/
+# 归档区：搬出来但没删的东西（只增不减，别当垃圾清掉）
+.archive/
+
+# ★ 不要再造第二份菜单（2026-10-03 补）
+#   菜单的单一真源是 bin/设备工具台.command；build_bundle.sh 从那里取，
+#   install.sh 再把它装成 bin/设备工具台.command。
+#   历史上这里放了一份 dist/installer/tools-menu.command，两份各自演化，
+#   结果源码里修好的菜单在新装机器上被旧模板覆盖回去。
+dist/installer/tools-menu.command
+
+# ★ 机器本地的绝对路径软链（2026-10-03 补）
+#   它们指向 /Users/<某人>/netops/… ，提交后在别人机器上就是断链。
+#   真身在 config/ 下，外面这些只是本机方便用的软链。
+bin/netdev
+/connections.json
+/devices.toml
+/state
+
+# Build artifacts
+dist/stage/
+dist/stage.stale-*/
+dist/last_bundle.txt
+# ★ 打包时从 config/*.example 生成的模板副本（真源在 config/，2026-10-03 补）
+dist/installer/config-template/
+# ★ 离线二进制依赖（35MB 编译产物）—— 走 GitHub Release 附件，不进 git 仓（2026-10-03 补）
+dist/deps/
+*.tar.gz
+*.sha256
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,105 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────
+# 全部检查都在**离线**环境跑：仓库自带本机模拟器（tests/mock_vrp.py
+# 模拟华为 VRP），所以 CI 不需要真设备、不需要网络、不需要任何凭据。
+# 这一点是刻意的：开源项目如果"要接设备才能测"，就没几个人能提 PR。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 离线自检 + 回归（macOS / Python 3.13）
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 tmux（人机同屏依赖）
+        run: brew install tmux || echo "brew 安装失败，若 runner 自带则忽略"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 建 venv 并装依赖
+        run: |
+          python3 -m venv .venv
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/pip install -r requirements.txt
+
+      - name: 语法自检（不写 .pyc，避免只读文件系统/沙箱的干扰）
+        run: |
+          ./.venv/bin/python - <<'PY'
+          import ast, pathlib, sys
+          bad = 0
+          for p in sorted(pathlib.Path('.').rglob('*.py')):
+              if '.venv' in p.parts or '__pycache__' in p.parts:
+                  continue
+              try:
+                  ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
+              except SyntaxError as e:
+                  print(f'  NG {p}: {e}'); bad = 1
+          print('语法自检：', '全部通过' if not bad else '有错')
+          sys.exit(bad)
+          PY
+
+      - name: 从模板生成设备清单（全新克隆里没有，自检要用自带的模拟器）
+        run: cp config/devices.toml.example config/devices.toml
+
+      - name: 回归 · pi 残留锁自愈 + 命令学习缓存 + 平台识别（24 项）
+        run: ./.venv/bin/python tests/test_pi_heal_and_cmdcache.py
+
+      - name: 回归 · 写操作人审闸门（19 项，安全关键）
+        run: ./.venv/bin/python tests/test_approval_gates.py
+
+      - name: 回归 · 网页服务生命周期（27 项，跑在 8899 不碰 8898）
+        run: ./.venv/bin/python tests/test_ui_lifecycle.py
+
+      - name: 端到端自检（打本机模拟器：run / 闸门 / apply+save / backup）
+        run: ./netdev selftest
+
+      - name: 确认没有凭据/产物被提交（.gitignore 自检）
+        run: |
+          echo "── 凭据类文件必须不在版本库里 ──"
+          fail=0
+          for f in config/direct.json config/AGENTS.workspace.md; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "  ✘ $f 被跟踪了 —— 这不应该发生"; fail=1
+            else
+              echo "  ✔ $f 未被跟踪"
+            fi
+          done
+          echo "── 编译产物/缓存不应被跟踪 ──"
+          for pat in '.venv' '__pycache__' 'dist/deps' 'dist/stage' 'backups/' 'logs/' 'live/'; do
+            n=$(git ls-files -- "$pat" | wc -l | tr -d ' ')
+            if [ "$n" != "0" ]; then echo "  ✘ $pat 下有 $n 个文件被跟踪"; fail=1
+            else echo "  ✔ $pat 干净"; fi
+          done
+          echo "── 单一真源：菜单只能有一份 ──"
+          # 菜单曾有两份（bin/ 与 dist/installer/），install.sh 用后者覆盖前者，
+          # 导致源码里修好的菜单在新装机器上被旧模板盖回去。build_bundle.sh 已改为从 bin/ 取。
+          if [ -e dist/installer/tools-menu.command ]; then
+            echo "  ✘ dist/installer/tools-menu.command 又出现了 —— 菜单只有一份，在 bin/设备工具台.command"; fail=1
+          else
+            echo "  ✔ 菜单只有一份（bin/设备工具台.command）"
+          fi
+          if grep -q 'INST/tools-menu.command' dist/build_bundle.sh; then
+            echo "  ✘ build_bundle.sh 又从 dist/installer 取菜单了"; fail=1
+          else
+            echo "  ✔ build_bundle.sh 从 bin/ 取菜单"
+          fi
+          exit $fail
+
+      - name: doctor（服务未启动时允许红，只看有没有崩）
+        run: ./netdev doctor || true

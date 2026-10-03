@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────
+#  netdev 设备清单（模板）
+#
+#  ★ 这是**模板**。你自己的 `config/devices.toml` 已被 .gitignore 排除
+#    （里面有真实设备的地址、串口号、适配器序列号，不该进公开仓）。
+#
+#  第一次用：
+#    cp config/devices.toml.example config/devices.toml   然后按下面改
+#
+#  ── 密码不写在本文件里 ──────────────────────────────────────
+#  本文件**只写变量名 / 钥匙串条目名**，绝不写密码本身。三种取法：
+#    1) 走 macOS 钥匙串（推荐，跨工具通用）：
+#         security add-generic-password -a "$USER" -s netdev-<设备名> -w
+#       然后下面写   password_keychain = "netdev-<设备名>"
+#    2) 走环境变量：
+#         export NETDEV_<设备名>_PASSWORD='...'
+#       然后下面写   password_env = "NETDEV_<设备名>_PASSWORD"
+#    3) 什么都不写 → 每次接入弹原生输入框（最省事，但自动化脚本里用不了）
+#
+#  ── 字段说明 ────────────────────────────────────────────────
+#    name          设备名（后续所有命令用它 referencing）
+#    protocol      ssh | telnet | serial
+#    host/port     ssh/telnet 必填；serial 填 /dev/cu.* 设备名
+#    baud          串口速率；写 "auto" 会自动探测（推荐，见下）
+#    backspace     "auto"（自动适配）或 0/1 强制
+#    platform      留空 = 自动识别（发 display version 按 banner 判断）
+#    sim           true 标记为「非真机」，netdev list 会明确标出来
+# ─────────────────────────────────────────────────────────────
+
+# ══ 本机模拟器 ══════════════════════════════════════════════
+# 仓库自带 tests/mock_vrp.py（模拟华为 VRP）。
+# 装完就能 `./netdev selftest` 跑通全流程 —— 不需要任何真设备。
+# 想跑模拟器：先起它，再 netdev connect
+#   ./.venv/bin/python tests/mock_vrp.py 20022
+[[device]]
+name         = "mock-hw"
+protocol     = "ssh"
+host         = "127.0.0.1"
+port         = 20022
+username     = "admin"
+backspace    = "auto"           # 模拟器也走同一套退格适配
+platform     = "huawei_vrp"
+password_env = "NETDEV_MOCK_PASSWORD"
+allow_no_credential = true      # 本机模拟器：无需真实凭据
+read_timeout = 15
+sim          = true             # ★ 标记为非真机
+tags         = ["模拟器", "非真机"]
+
+# ══ 你的真机 ═════════════════════════════════════════════════
+# 照上面的格式加。几条经验：
+#   · platform 留空即可，接入时会自动识别（华为/华三/锐捷/思科/迈普）
+#   · 串口 baud 写 "auto"：不同型号/固件速率不一样，写死容易一接就花屏
+#   · 拿不准先 `netdev serial-discover` 看有哪些 /dev/cu.*
+#   · 型号带 SSH 的老设备可能只支持 SHA1 密钥交换，
+#     netmiko 侧已按平台自动降级，一般不用管
+#
+# [[device]]
+# name     = "switch-01"
+# protocol = "serial"
+# port     = "/dev/cu.usbserial-XXXX"    # ← 用 serial-discover 查，别照抄
+# baud     = "auto"
+# username = "admin"
+# platform = ""                          # 留空 = 自动识别
+# password_keychain = "netdev-switch-01"

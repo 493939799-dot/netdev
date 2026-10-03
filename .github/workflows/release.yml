@@ -1,0 +1,115 @@
+name: Release
+
+# ─────────────────────────────────────────────────────────────
+# 打 tag 时自动构建「离线安装包」并挂到 GitHub Release 上。
+#
+# 为什么依赖不进 git 仓：
+#   离线依赖（编译好的 .so + 独立 Python）约 35MB~150MB。
+#   放进 git 仓会让 clone 变慢、仓库永久膨胀，而且**历史里删不掉**。
+#   所以：仓里只放 requirements.txt（锁定版本），
+#   真正的二进制包在 CI 上现装现打，挂到 Release 附件。
+#
+# 维护者本地也能出包（不需要 CI）：
+#   bash dist/build_bundle.sh --with-python
+#   但要先准备好 dist/deps/（见 .github/workflows/release.yml 里的下载步骤）
+# ─────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags: ['v*']          # 推 v1.0.0 这种 tag 就会触发
+  workflow_dispatch:      # 也可以在网页上手动点一次
+
+permissions:
+  contents: write         # 需要写 Release
+
+jobs:
+  build:
+    name: 构建离线安装包并挂到 Release
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 装 uv（装离线依赖用）
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ── 关键：把「目标平台」的依赖装进 dist/deps ──────────────────
+      # 必须在 macOS 上装（依赖里有 C 扩展，Linux 装出来的 .so 不能用）。
+      - name: 准备离线依赖 dist/deps
+        run: |
+          mkdir -p dist/deps
+          uv pip install --target dist/deps -r requirements.txt
+          echo "依赖体积：$(du -sh dist/deps | cut -f1)"
+          # 许可证一起带上（开源合规的基本要求）
+          mkdir -p dist/deps/_licenses
+          uv pip list --format=freeze > dist/deps/_licenses/requirements.lock.txt 2>/dev/null || true
+
+      - name: 打包（含独立 Python，完全离线）
+        run: bash dist/build_bundle.sh --with-python
+
+      - name: 校验产物结构
+        run: |
+          set -uo pipefail
+          fail=0
+          TARBALL="$(ls ./*.tar.gz | head -1)"
+          echo "产物：$TARBALL"
+          echo "── 必含 ──"
+          for must in "install.sh" "uninstall.sh" "config-template/devices.toml.example" \
+                      "config-template/AGENTS.workspace.md" "tools-menu.command" "VERSION"; do
+            if tar -tzf "$TARBALL" | grep -q "$must"; then echo "  ✔ $must"
+            else echo "  ✘ 缺 $must"; fail=1; fi
+          done
+          echo "── 必不含（泄密/体积）──"
+          for never in "/.git/" "/.venv/" "/logs/" "/backups/" "config/devices.toml" \
+                        "config/AGENTS.workspace.md" "config/direct.json"; do
+            if tar -tzf "$TARBALL" | grep -q -- "$never"; then echo "  ✘ 包里有 $never"; fail=1
+            else echo "  ✔ 不含 $never"; fi
+          done
+          ls -lh "$TARBALL" | awk '{print "  体积: " $5}'
+          exit $fail
+
+      - name: 上传到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./*.tar.gz
+            ./*.sha256
+          generate_release_notes: true
+          body: |
+            ## netdev 设备工具台 ${{ github.ref_name }}
+
+            macOS 离线安装包。**下载 `.tar.gz` 即可**，`.sha256` 是校验文件（可选）。
+
+            ### 怎么装
+            ```bash
+            tar -xzf <下载的文件>.tar.gz && cd <解压出来的目录>
+            bash install.sh --dry-run     # 先预览，不动任何文件
+            bash install.sh               # 正式安装
+            ```
+            装完双击 `~/netops/bin/设备工具台.command`，或：
+            ```bash
+            cd ~/netops && ./netdev ui open
+            ```
+
+            ### 校验（可选，但建议）
+            ```bash
+            shasum -a 256 -c <下载的文件>.tar.gz.sha256
+            ```
+
+      - name: 产物留档（无 tag 时也上传，方便测试）
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: netdev-bundle-manual
+          path: |
+            ./*.tar.gz
+            ./*.sha256
+          retention-days: 7

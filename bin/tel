@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+USAGE = """tel — 轻量 Telnet 客户端（基于系统 Python 3.9 的 telnetlib，无需安装）
+
+用法:
+  tel 192.168.1.1
+  tel 192.168.1.1 2323
+  tel 192.168.1.1 23 15      # 第三个参数是超时秒数，默认 10
+
+退出: Ctrl + C
+注意: Telnet 为明文传输，仅限内网或可信网络使用，公网请一律用 SSH。"""
+
+import sys
+import io
+import telnetlib
+
+# macOS 默认 locale 为 C，Python 3.9 会用 ASCII 输出，中文提示会抛 UnicodeEncodeError
+# 这里强制把标准流切成 UTF-8
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name, None)
+    try:
+        if _stream is not None and (_stream.encoding or "").lower().replace("-", "") != "utf8":
+            setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8", errors="replace"))
+    except (AttributeError, ValueError):
+        pass
+
+DEFAULT_PORT = 23
+DEFAULT_TIMEOUT = 10
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        die(USAGE)
+
+    host = args[0]
+    try:
+        port = int(args[1]) if len(args) > 1 else DEFAULT_PORT
+        timeout = int(args[2]) if len(args) > 2 else DEFAULT_TIMEOUT
+    except ValueError:
+        die("错误: 端口和超时必须是数字")
+
+    sys.stderr.write("正在连接 %s:%d (超时 %ds)...\n" % (host, port, timeout))
+    try:
+        tn = telnetlib.Telnet(host, port, timeout=timeout)
+    except Exception as e:
+        die("连接失败: %s" % e)
+
+    sys.stderr.write("已连接。按 Ctrl+C 退出。\n")
+    try:
+        tn.interact()
+    except KeyboardInterrupt:
+        sys.stderr.write("\n连接已断开。\n")
+    except EOFError:
+        sys.stderr.write("\n远端已关闭连接。\n")
+    finally:
+        tn.close()
+
+
+if __name__ == "__main__":
+    main()

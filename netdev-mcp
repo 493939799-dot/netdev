@@ -1,0 +1,10 @@
+#!/bin/bash
+# netdev MCP 服务器启动包装（供 pi / 其他 MCP 客户端调用）
+# ROOT 从脚本位置推导，支持任意安装路径；也可用 NETDEV_ROOT 覆盖。
+set -uo pipefail
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# netdev-mcp 入口脚本位于项目根目录，ROOT 即脚本所在目录
+ROOT="${NETDEV_ROOT:-$HERE}"
+export NETDEV_ROOT="$ROOT"
+exec "$ROOT/.venv/bin/python" "$ROOT/netdev_mcp.py"

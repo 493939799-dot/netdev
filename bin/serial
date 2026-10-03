@@ -1,0 +1,76 @@
+#!/bin/zsh
+# serial — 串口连接工具（基于 macOS 自带的 screen，无需安装任何东西）
+#
+# 用法:
+#   serial                              列出当前可用的串口设备
+#   serial 1                            连接列表中的第 1 个设备，波特率 115200
+#   serial 1 9600                       连接第 1 个设备，波特率 9600
+#   serial /dev/cu.usbserial-1420 9600  直接指定设备路径
+#
+# 退出连接: 先按 Ctrl+A，松开，再按 K，出现提示后按 y
+#           或先按 Ctrl+A，松开，再按 Ctrl+\
+# 常见波特率: 9600 / 19200 / 38400 / 57600 / 115200
+
+BAUD_DEFAULT=115200
+
+list_devices() {
+  local i=1
+  local d
+  echo "当前可用串口设备:"
+  local found=0
+  for d in /dev/cu.*(N); do
+    printf "  [%d] %s\n" "$i" "$d"
+    i=$((i + 1))
+    found=1
+  done
+  if [[ $found -eq 0 ]]; then
+    echo "  (未检测到任何串口设备)"
+    echo ""
+    echo "  排查: 1) 确认 USB 转串口线已插好"
+    echo "        2) CH340/CP2102/FT232 等芯片需安装对应驱动"
+    echo "        3) 插上后重新运行本命令查看是否出现"
+    return
+  fi
+  echo ""
+  echo "说明: USB 串口通常名为 cu.usbserial-* / cu.usbmodem-* / cu.wchusbserial*"
+  echo "      cu.* 用于呼出(callout)，tty.* 用于呼入，连接设备请选 cu.*"
+}
+
+if [[ $# -eq 0 ]]; then
+  list_devices
+  echo ""
+  echo "连接示例: serial 1 115200"
+  exit 0
+fi
+
+target=$1
+baud=${2:-$BAUD_DEFAULT}
+
+# 如果第一个参数是纯数字，视为列表序号
+if [[ "$target" =~ ^[0-9]+$ ]]; then
+  i=1
+  matched=""
+  for d in /dev/cu.*(N); do
+    if [[ $i -eq $target ]]; then
+      matched="$d"
+      break
+    fi
+    i=$((i + 1))
+  done
+  if [[ -z "$matched" ]]; then
+    echo "错误: 序号 $target 不存在，请先运行 serial 查看列表"
+    exit 1
+  fi
+  target="$matched"
+fi
+
+if [[ ! -e "$target" ]]; then
+  echo "错误: 设备 $target 不存在"
+  exit 1
+fi
+
+echo "正在连接 $target  波特率 $baud"
+echo "退出请按 Ctrl+A 松开后按 K，再按 y 确认"
+echo "-------------------------------------------"
+# TERM 设为 vt100 可避免部分嵌入式设备的控制字符乱码
+TERM=vt100 screen "$target" "$baud"

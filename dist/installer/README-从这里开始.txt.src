@@ -1,0 +1,90 @@
+════════════════════════════════════════════════════════════════════════
+  网络设备调试 · 从这里开始（不懂技术也能看懂）
+  更新日期：2026-09-19
+════════════════════════════════════════════════════════════════════════
+
+【这是什么？】
+  一个文件夹：~/netops   （也就是 访达 → 你的用户名 → netops）
+  它装着"用浏览器连网络设备"这件事的全部家当：
+    · 浏览器里的网页（netdev-ui，端口 8898）负责显示
+    · 这个文件夹负责真正去连设备（串口 / SSH / Telnet）
+
+  日常你只用一个地方：浏览器 http://127.0.0.1:8898 → 顶栏「终端」
+
+────────────────────────────────────────────────────────────────────────
+【你平时要做的 3 件事】
+  1. 接设备：终端页 → 左栏「🔌 串口接入」→ 选串口（其它接入方式同理）
+  2. 先备份：终端页 → 左栏「💾 备份设备配置」→ 填客户名，回车
+  3. 改坏了：终端页 → 左栏「♻️ 恢复配置备份」→ 选编号 → 看差异 → 按 y
+
+  不想开浏览器时，双击这个文件也能干活：
+    ~/netops/bin/设备工具台.command
+
+────────────────────────────────────────────────────────────────────────
+【文件都在哪（重要）】
+  ~/netops/config/          ★ 所有"配置"都集中在这（能改的都在这）
+      devices.toml            正式设备清单（哪些设备、地址、平台）
+      connections.json        随手记的连接（含端口）
+      pi-commands.json        终端页左栏那 8 个按钮的定义
+      AGENTS.workspace.md     给 AI 的操作约定
+      state/                  小缓存（波特率、退格键、最近接入）
+      _netdev / netdev.bash   命令行的 Tab 补全
+  ~/netops/bin/             工具台（双击即用）
+  ~/netops/docs/            所有报告（= 桌面的 workbuddy 文件夹，同一份）
+  ~/netops/tools lib tests  程序代码（★ 不要删）
+  ~/netops/backups/         ★ 备份与快照（你的命根子）
+      snapshots/              每次备份的"设备配置快照"（含 配置记录_#N.txt）
+      snapshots_trash/        删除快照的回收区（可取回）
+      *.bak-*                 各种自动备份
+  ~/netops/logs/  live/     运行留档、镜像日志（可删，只影响查历史）
+
+【外面有几个"软链"（快捷方式），别当成重复文件删掉】
+  ~/.pi/commands.json              → ~/netops/config/pi-commands.json
+  ~/AGENTS.md                      → ~/netops/config/AGENTS.workspace.md
+  ~/.zsh/completions/_netdev       → ~/netops/config/_netdev
+  ~/.bash_completion.d/netdev      → ~/netops/config/netdev.bash
+  ~/netops/devices.toml            → ~/netops/config/devices.toml
+  ~/netops/connections.json        → ~/netops/config/connections.json
+  ~/netops/state                   → ~/netops/config/state
+  （带小箭头图标的就是软链；删了它们 = 删了"入口"，真身还在，但功能会坏）
+
+────────────────────────────────────────────────────────────────────────
+【绝对不能删（删了功能立刻坏）】
+  ~/netops/netdev                ~/netops/netdev_cli.py        ~/netops/netdev_mcp.py
+  ~/netops/lib/                  ~/netops/tools/serial_bridge.py
+  ~/netops/tools/telnet_bridge.py  ~/netops/tools/quick_conn.py
+  ~/netops/tools/snapshot.py     ~/netops/tools/scrollback.py
+  ~/netops/config/               ~/netops/backups/
+  ~/.pi/agent/                   （你的聊天记录，最不该删）
+  ~/Library/LaunchAgents/com.netdev.ui.plist  和  com.netdev.logrotate.plist
+
+【可以放心删（删了不影响功能）】
+  ~/netops/tools/*.mjs   mk_*.py   ui_doctor.sh    ← 开发/验证脚本
+  ~/netops/logs/*.log    ~/netops/live/*.log       ← 历史留档（用 netdev logs rotate 归档更好）
+  各个 .DS_Store、__pycache__
+
+【改东西前的 3 步（对不懂技术的人最要命的一条）】
+  ① 先看清：不要用访达直接删，先问我（AI）或双击「设备工具台」跑一次体检
+  ② 要删就先搬：把东西拖到 ~/netops/backups/ 里，别直接废纸篓
+  ③ 用一天再说：确认没问题了再真正删掉
+
+────────────────────────────────────────────────────────────────────────
+【出问题了怎么办】
+  症状                      第一步
+  ────────────────────────  ────────────────────────────────────────────
+  觉得哪里不对 / 卡         双击「设备工具台」→ 选 1（体检），把结果发我
+  网页打不开                双击 ui/启动.command 重新启动；或执行 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.netdev.ui.plist
+  终端页按钮不见了          netdev web repair      （一条命令装回 8 个按钮）
+  点接入没反应              可能是串口线松了/被别的程序占了 → 体检里会报
+  会话里全是乱码            波特率不对 → 重新接入即可（会自动探测）
+  想看以前的内容            终端里往上滚滚轮，或按 Ctrl+B 再按 [
+  快照不见了                netdev snap list（会告警）+ 桌面 workbuddy 里有副本
+
+【万一要我帮忙】
+  直接把这句话发给我："跑 netdev doctor 看结果"，或者"帮我恢复快照备份"
+  我会自己查、自己修，并把结果用大白话告诉你。
+
+════════════════════════════════════════════════════════════════════════
+  目录体积参考：程序 49MB（含 Python 环境 40MB）｜ 备份 1MB ｜ 日志 3MB
+  报告与说明都在这：~/netops/docs/    （= 桌面 workbuddy）
+════════════════════════════════════════════════════════════════════════

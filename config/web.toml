@@ -1,0 +1,3 @@
+# pi-web-ui 左栏「命令」区的生成选项
+# device_buttons：是否给每台设备生成「↗ 接 xx」按钮（false = 只留 3 条功能按钮）
+device_buttons = false

@@ -1,0 +1,20 @@
+#!/bin/bash
+# netdev —— 网络设备调试通道入口
+# 用法见 `netdev -h`；本脚本只做一件事：用项目自带 venv 的 python 执行 CLI。
+# ROOT 从脚本位置推导，支持任意安装路径（--prefix 换目录也能用）；也可用 NETDEV_ROOT 覆盖。
+set -uo pipefail
+export PATH="$HOME/homebrew/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# netdev 入口脚本位于项目根目录，ROOT 即脚本所在目录（非上一级）
+ROOT="${NETDEV_ROOT:-$HERE}"
+export NETDEV_ROOT="$ROOT"
+PY="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "❌ 未找到 venv：$PY" >&2
+  echo "   修复：cd $ROOT && python3 -m venv .venv && .venv/bin/pip install netmiko pyserial scrapli" >&2
+  exit 1
+fi
+
+exec "$PY" "$ROOT/netdev_cli.py" "$@"
