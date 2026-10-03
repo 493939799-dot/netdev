@@ -64,6 +64,7 @@ def serve_one(conn, addr):
         conn.sendall(bytes([IAC, WILL, 1, IAC, WILL, 3, IAC, DO, 24]))
         time.sleep(0.4)
         buf = ""
+        esc = 0          # ANSI 转义序列吞字节预算（0 = 不在序列里）
 
         def w(s):
             conn.sendall(s.replace("\n", "\r\n").encode())
@@ -91,6 +92,22 @@ def serve_one(conn, addr):
                 cleaned.append(data[i])
                 i += 1
             for ch in cleaned.decode("utf-8", "replace"):
+                # ★ 先把 ANSI 转义序列整段吞掉，别让它落进命令缓冲。
+                #   终端会对设备的查询自动回一段能力应答（`\x1b[?1;2c`、`0;276;0c`
+                #   之类），这些字节会从窗格漏进设备输入流。真机行编辑器不会把它们
+                #   当命令字符；模拟器若不吞，命令就变成 `[1;2cdisplay clock` →
+                #   永远 "Unrecognized command"（与 mock_vrp.py 同源修复，
+                #   2026-10-03 实测踩到）。
+                if esc:
+                    esc -= 1
+                    if esc == 15 and ch in "[O(":
+                        continue             # 引导符本身不算终结字节
+                    if "@" <= ch <= "~":     # 终结字节 → 序列结束
+                        esc = 0
+                    continue
+                if ch == "\x1b":
+                    esc = 16                 # 上限 16 字符，畸形序列也别吞掉整条命令
+                    continue
                 if ch in "\r\n":
                     w("\n")
                     if state == "user":
@@ -114,6 +131,15 @@ def serve_one(conn, addr):
                     if buf:
                         buf = buf[:-1]
                         w("\b \b")
+                elif ch == "\x15":
+                    # Ctrl-U = 清空当前行。netdev 在同屏下发前会先发一个 C-u
+                    # 清掉残留的终端能力应答碎片；模拟器若不认它，那个字节会被
+                    # 并在命令前面 → 永远 "Unrecognized command"（详见 mock_vrp.py 同名分支）
+                    for _ in buf:
+                        w("\b \b")
+                    buf = ""
+                elif ch < " ":
+                    pass          # 其余控制字符：真机行编辑会忽略，别污染 buf
                 elif ch == "?":
                     w("\n  version   clock   current-configuration   esn\n" + st.prompt + buf)
                 else:

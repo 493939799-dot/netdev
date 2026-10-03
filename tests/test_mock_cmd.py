@@ -101,6 +101,83 @@ def main() -> int:
     netdev_cli.cmd_mock(ns2("stop"))
     check("停第二个后第一个的记录仍在（互不影响）", netdev_cli._mock_pid(other)[0] is None)
 
+    print("\n八、行编辑语义：C-u 清行 + ANSI 转义吞噬，模拟器必须吃掉它们")
+    # ★ 2026-10-03 实测踩到的真 bug：
+    #   netdev 的 _session_run 在下发命令前会发一个 C-u(0x15) 清掉当前行
+    #   （防残留的终端能力应答碎片 `;2c` / `0;276;0c` 被当成命令前缀）。
+    #   真机 VRP 的行编辑器把 C-u 当"清行"；模拟器原来把它当普通字符并进 buf，
+    #   命令于是变成 "\x15display version" → 永远 Unrecognized command。
+    #   症状极像"netdev 坏了"，而且**只在同屏窗格存在时才出现** ——
+    #   没有窗格时 netdev 走直连，不发 C-u，所以最容易漏掉这一条。
+    rc = netdev_cli.cmd_mock(ns("start"))
+    check("重新起模拟器（为行编辑测试）", rc == 0 and port_open(PORT), f"rc={rc}")
+    try:
+        import paramiko
+    except Exception as e:
+        check("paramiko 可用（行编辑测试需要真连一次）", False, f"{type(e).__name__}: {e}")
+        netdev_cli.cmd_mock(ns("stop"))
+        return _report()
+
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        cli.connect("127.0.0.1", port=PORT, username="admin", password="admin",
+                    timeout=8, look_for_keys=False, allow_agent=False)
+        ch = cli.invoke_shell()
+        time.sleep(1.0)
+
+        def drain(sec=1.5):
+            time.sleep(sec)
+            out = ""
+            while ch.recv_ready():
+                out += ch.recv(65535).decode("utf-8", "replace")
+            return out
+
+        drain(0.8)                                   # 吃掉 banner 与提示符
+
+        ch.send("\x15display version\n")             # ← netdev 的真实发法
+        got = drain(1.5)
+        check("C-u 清行后命令仍被正确识别（不再是 Unrecognized）",
+              "Unrecognized" not in got and "VRP (R) software" in got, repr(got[-160:]))
+
+        ch.send("display versionZZZ\x7f\x7f\x7f\n")  # 退格仍要能改行
+        got2 = drain(1.5)
+        check("退格键仍能修正命令（行编辑没被改坏）",
+              "Unrecognized" not in got2 and "VRP (R) software" in got2, repr(got2[-160:]))
+
+        ch.send("\x03")                              # Ctrl-C 不能被当成命令
+        drain(0.6)
+        ch.send("display clock\n")
+        got3 = drain(1.5)
+        check("Ctrl-C 之后仍能正常下发命令",
+              "Unrecognized" not in got3 and "Time Zone" in got3, repr(got3[-160:]))
+
+        # ★ 转义序列污染（2026-10-03 实测）：终端会对设备的查询自动回一段能力应答
+        #   （`\x1b[?1;2c` / `0;276;0c`），这些字节会从同屏窗格漏进设备输入流。
+        #   真机的行编辑器不当它们是命令字符；模拟器不吞的话命令会变成
+        #   `[1;2cdisplay version` → 永远 Unrecognized（且 `?` 还会误触发 help）。
+        ch.send("\x1b[?1;2cdisplay version\n")
+        got4 = drain(1.5)
+        check("ANSI 转义碎片不污染命令行（碎片 + 命令仍被识别）",
+              "Unrecognized" not in got4 and "VRP (R) software" in got4, repr(got4[-160:]))
+
+        ch.send("\x1b[?1;2c\x15display clock\n")      # 碎片 + C-u = netdev 同屏的真实下发路径
+        got5 = drain(1.5)
+        check("碎片 + C-u 清行 = netdev 同屏的真实下发路径",
+              "Unrecognized" not in got5 and "Time Zone" in got5, repr(got5[-160:]))
+        try:
+            cli.close()
+        except Exception:
+            pass
+    except Exception as e:
+        check("行编辑测试跑通（真连模拟器）", False, f"{type(e).__name__}: {e}")
+    finally:
+        netdev_cli.cmd_mock(ns("stop"))
+
+    return _report()
+
+
+def _report() -> int:
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
     if FAIL:

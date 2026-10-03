@@ -265,13 +265,22 @@ def t_serial(args):
       每条命令都打在用户看得见的屏上）。原来这里自己 netmiko/pyserial 直连，
       用户在屏上什么都看不到 —— 与整体"人机同屏"的承诺不符。
       CLI 侧本来就有串口独占锁、凭据、同屏优先等完整逻辑，统一到那一条路。
+
+    ★ 2026-10-03 修 IndentationError：下面 4 行曾经被多缩进 2 格，
+      整个文件**语法都不成立**（Python 直接 IndentationError 退出）。
+      后果极隐蔽：pi 启动 MCP 服务端时它秒崩，pi **静默丢弃**这个服务端，
+      于是模型手里一个 netdev 工具都没有，只能"凭空编"工具调用
+      （表现为把 <|DSML|tool_calls> 这类标记当普通文本吐出来）。
+      排查入口：`python3 -m py_compile netdev_mcp.py`。
     """
-      rc, out, err = _netdev_cli(["run", args.get("device", ""),
-                                  args.get("command", "")], timeout=200)
-      return {"device": args.get("device", ""), "via": "CLI（同屏优先）",
+    rc, out, err = _netdev_cli(["run", args.get("device", ""),
+                                args.get("command", "")], timeout=200)
+    return {"device": args.get("device", ""), "via": "CLI（同屏优先）",
             "command": args.get("command", ""), "ok": rc == 0,
             "output": (out or "")[-8000:],
             "error": ((err or "")[-600:] or None) if rc != 0 else None}
+
+
 def _tmux(*args):
     import shutil, subprocess
     t = shutil.which("tmux") or str(pathlib.Path.home() / "homebrew/bin/tmux")

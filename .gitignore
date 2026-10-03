@@ -27,6 +27,8 @@ config/state/*
 !config/state/.gitkeep
 
 # User-specific / generated
+# ★ 2026-10-03：WorkBuddy / codebuddy 两个后端已整体拆除，不会再生成这两个文件。
+#   规则保留是**防御性的** —— 老装机残留的副本里含明文 JWT，绝不能进仓。
 config/workbuddy*.json
 config/codebuddy*.json
 # ★ 凭据文件：明文存 API Key / token，开源仓里绝不能有（2026-10-01 补）
@@ -69,6 +71,10 @@ config/completions/
 *.bak
 *.orig
 */.quarantine-*/
+# ★ 项目本地的工作检查区：放「改文件前的带时间戳备份」「搬出来但没删的隔离件」。
+#   这里可能躺着老凭据（例如已下线后端生成的 workbuddy-product.json），
+#   所以必须 gitignore —— 2026-10-03 补。
+.chk/
 # 归档区：搬出来但没删的东西（只增不减，别当垃圾清掉）
 .archive/
 

@@ -81,7 +81,7 @@ uv venv --python 3.13 .venv && uv pip install -r requirements.txt
 
 ```bash
 ./netdev selftest                            # 离线端到端自检（打模拟器）
-./.venv/bin/python tests/test_pi_heal_and_cmdcache.py   # 24 项
+./.venv/bin/python tests/test_ai_toolchain_and_cache.py # 57 项
 ./.venv/bin/python tests/test_ui_lifecycle.py           # 27 项
 ```
 
@@ -124,7 +124,7 @@ fix(ui): 服务没在跑时 doctor 不再谎报 ready
 
 1. 在 `PROFILES` 里加一个条目（命令表、正则、登录/回显特征）
 2. 在 `_VENDOR_HINTS` 加 banner 识别特征词（`display version` 回显用）
-3. 在 `tests/test_pi_heal_and_cmdcache.py` 加一条 banner 识别断言
+3. 在 `tests/test_ai_toolchain_and_cache.py` 的「平台自动识别」组里加一条 banner 断言
 4. **不要**在采集逻辑里写 `if vendor == "xxx"` —— 那样新厂商永远加不进去
 
 ## 报告问题

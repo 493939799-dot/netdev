@@ -74,50 +74,6 @@ class Handler(paramiko.ServerInterface):
         return True
 
 
-def shell_loop(chan):
-    st = SHARED
-    buf = ""
-
-    def w(s):
-        chan.sendall(s.replace("\n", "\r\n").encode())
-
-    time.sleep(0.2)
-    w("\r\n  Huawei Versatile Routing Platform\r\n")
-    w(st.prompt)
-
-    while True:
-        try:
-            data = chan.recv(1024)
-        except Exception:
-            break
-        if not data:
-            break
-        for ch in data.decode("utf-8", "replace"):
-            if ch in "\r\n":
-                w("\r\n")
-                cmd = buf.strip()
-                buf = ""
-                if cmd:
-                    out = handle(st, cmd)
-                    if out:
-                        w(out if out.endswith("\n") else out + "\n")
-                w(st.prompt)
-            elif ch in "\x7f\x08":
-                if buf:
-                    buf = buf[:-1]
-                    w("\b \b")
-            elif ch == "\x03":
-                buf = ""
-                w("^C\r\n" + st.prompt)
-            else:
-                buf += ch
-                w(ch)          # 设备回显
-    try:
-        chan.close()
-    except Exception:
-        pass
-
-
 def handle(st: State, cmd: str) -> str:
     c = cmd.strip()
     low = c.lower()
@@ -275,12 +231,30 @@ def serve(port: int):
             st = SHARED
             chan.sendall("\r\n  Huawei Versatile Routing Platform\r\n".encode())
             buf = ""
+            esc = 0          # ANSI 转义序列吞字节预算（0 = 不在序列里）
             chan.sendall(st.prompt.encode())
             while True:
                 d = chan.recv(1024)
                 if not d:
                     break
                 for ch in d.decode("utf-8", "replace"):
+                    # ★ 先把转义序列整段吞掉，别让它落进命令缓冲。
+                    #   为什么：终端会对设备的查询自动回一段能力应答
+                    #   （`\x1b[?1;2c`、`0;276;0c` 之类），这些字节会从窗格
+                    #   漏进设备输入流。真机的行编辑器不会把它们当命令字符，
+                    #   模拟器若不吞，命令就变成 `[1;2cdisplay clock` → 永远
+                    #   "Unrecognized command"（2026-10-03 实测踩到）。
+                    #   netdev 侧另有一道保险：下发前发 C-u 清行。
+                    if esc:
+                        esc -= 1
+                        if esc == 15 and ch in "[O(":
+                            continue             # 引导符本身不算终结字节
+                        if "@" <= ch <= "~":     # 终结字节 → 序列结束
+                            esc = 0
+                        continue
+                    if ch == "\x1b":
+                        esc = 16                 # 上限 16 字符，畸形序列也别吞掉整条命令
+                        continue
                     if ch in "\r\n":
                         chan.sendall(b"\r\n")
                         cmd = buf.strip(); buf = ""
@@ -298,6 +272,25 @@ def serve(port: int):
                             buf = buf[:-1]; chan.sendall(b"\b \b")
                     elif ch == "\x03":
                         buf = ""; chan.sendall(b"^C\r\n" + st.prompt.encode())
+                    elif ch == "\x15":
+                        # ★ Ctrl-U = 清空当前行 —— 真机 VRP 的行编辑器就是这么处理的。
+                        #
+                        # 为什么模拟器**必须**认这一条（2026-10-03 实测踩到）：
+                        #   netdev 的同屏下发（_session_run）在发命令前会先发一个
+                        #   C-u 清行，用来清掉残留的终端能力应答碎片
+                        #   （`;2c` / `0;276;0c` 这种会漏进输入流的东西）。
+                        #   真机把 C-u 当"清行"吃掉；模拟器原本把它当普通字符并进 buf，
+                        #   命令于是变成 `"\x15display clock"` → 匹配不上 →
+                        #   永远回 "Unrecognized command found at '^' position."。
+                        #   而且**只在同屏窗格存在时才出现**（没窗格时 netdev 走直连、
+                        #   不发 C-u），所以极容易被误判成"netdev 的命令透传坏了"。
+                        for _ in buf:
+                            chan.sendall(b"\b \b")
+                        buf = ""
+                    elif ch < " ":
+                        # 其余控制字符：真机行编辑器会忽略，不并入命令。
+                        # 宁可忽略也别污染 buf —— 一个字节就能让整条命令失配。
+                        pass
                     elif ch == "?":
                         chan.sendall(("\r\n" + _help_for(buf)).replace("\n", "\r\n").encode())
                         chan.sendall(("\r\n" + st.prompt + buf).encode())

@@ -64,8 +64,8 @@ jobs:
       - name: 从模板生成设备清单（全新克隆里没有，自检要用自带的模拟器）
         run: cp config/devices.toml.example config/devices.toml
 
-      - name: 回归 · pi 残留锁自愈 + 命令学习缓存 + 平台识别（24 项）
-        run: ./.venv/bin/python tests/test_pi_heal_and_cmdcache.py
+      - name: 回归 · AI 工具链一致性 + 采集缓存 + 宿主 shim 剥离 + MCP 握手（57 项）
+        run: ./.venv/bin/python tests/test_ai_toolchain_and_cache.py
 
       - name: 回归 · 写操作人审闸门（19 项，安全关键）
         run: ./.venv/bin/python tests/test_approval_gates.py

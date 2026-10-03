@@ -466,7 +466,7 @@ td.ops{white-space:nowrap}
   <span class="badge off" id="bBackend" title="后端连通状态">后端: 检测中…</span>
   <span class="badge"><span class="dot"></span>在线 <b id="nOn">0</b> / 共 <b id="nAll">0</b></span>
   <span class="spacer"></span>
-  <span class="badge" id="bAgent" title="AI 后端（自动探测本机可用的 agent）">AI: 检测中…</span>
+  <span class="badge" id="bAgent" title="AI 助手（直连 API）">AI: 检测中…</span>
   <span class="badge" id="bSet" title="设置：主题 / 终端 / AI 后端">⚙ 设置</span>
   <span class="badge" id="bClock" title="当前时间">--:--:--</span>
 </header>
@@ -611,7 +611,8 @@ td.ops{white-space:nowrap}
       <div id="uiMsg" style="white-space:pre-wrap"></div>
       <div class="uiopts" id="uiOpts"></div>
       <div class="m" style="margin-top:9px;font-size:10.5px">
-        这是 pi 的 dialog 通道：AI 发出后<b>阻塞等待</b>，只有界面里的人能回答。
+        AI 发起的询问：发出后<b>阻塞等待</b>，只有界面里的人能回答。
+        （直连后端目前不产生此类请求，此弹窗保留为兼容；设备审批走的是另一个弹窗。）
       </div>
     </div>
   </div>
@@ -622,20 +623,22 @@ td.ops{white-space:nowrap}
   <div class="dlg green" style="width:min(660px,94vw)">
     <div class="dlg-bar">⚙ 设置</div>
     <div class="dlg-body">
-      <div class="sg">AI 助手</div>
+      <div class="sg">AI 助手（直连 API —— 唯一后端）</div>
       <label class="sf"><span>后端</span>
-        <select id="sAiBackend"><option value="">检测中…</option></select></label>
+        <select id="sAiBackend"><option value="direct">直连 API</option>
+          <option value="off">关闭 AI</option></select>
+        <span class="m" style="font-size:10px">pi / WorkBuddy 的 RPC 通道已下线</span></label>
       <label class="sf"><span>模型</span>
-        <input id="sAiModel" type="text" placeholder="留空 = 用 pi 当前默认；也可填 provider/id"></label>
+        <input id="sAiModel" type="text" placeholder="留空 = 用下方「直连 API Key」里配置的模型"></label>
       <label class="sf"><span>工具权限</span>
         <select id="sAiTools">
-          <option value="read">read — 只看文件，不碰设备（最安全）</option>
-          <option value="read+netdev">read + mcp__netdev — 推荐（写操作走 netdev 人审）</option>
-          <option value="full">full — 完整能力，含 bash（不推荐）</option>
+          <option value="read">read — 不给任何工具，纯对话（最安全）</option>
+          <option value="read+netdev">read + netdev 工具 — 推荐（写操作走 netdev 人审）</option>
+          <option value="full">full — 同 read + netdev（兼容旧配置）</option>
         </select></label>
       <label class="sf"><span>审批超时</span><input id="sAskTimeout" type="number" min="10" max="600"> 秒</label>
-      <label class="sf"><span>接入检测</span>
-        <button class="mono" id="btnProbe">🔍 检测可接入的后端</button>
+      <label class="sf"><span>可用性检测</span>
+        <button class="mono" id="btnProbe">🔍 检测直连是否可用</button>
         <span class="m" id="probeMsg" style="font-size:10px"></span></label>
       <div id="agentProbe"></div>
 
@@ -921,11 +924,13 @@ function audit(kind, dev, detail){
 /* ═══════ 设置（存 localStorage；主题/字号/开关立即生效） ═══════ */
 const DEFAULTS = {
   theme:'green', termFontSize:12, crt:true, rain:true,
-  aiBackend:'auto',            // auto = 用 /api/agents 探测到的推荐后端
+  aiBackend:'direct',          // 只有 direct 一个后端；off = 用户显式关闭 AI
   aiModel:'', aiTools:'read+netdev', askTimeout:60,
   refreshMs:8000, soundOnAsk:false
 };
 const S = Object.assign({}, DEFAULTS, (()=>{ try{ return JSON.parse(localStorage.getItem('netdev-ui-set')||'{}'); }catch(e){ return {}; } })());
+// 旧版本可能存过 'auto' / 'pi' / 'wb'（那两条 RPC 通道已下线）→ 一律归一到 'direct'
+if(!['direct','off'].includes(S.aiBackend)) S.aiBackend = 'direct';
 const saveSet = ()=>{ try{ localStorage.setItem('netdev-ui-set', JSON.stringify(S)); }catch(e){} };
   function xtermTheme(){
     // 浅色主题用 macOS Terminal.app 的 "Basic" 16 色；深色主题沿用原来的霓虹表。
@@ -1863,22 +1868,22 @@ async function aiNewSession(){
   const dev = CURDEV || '';
   const name = sessNameFor(dev);
   const p = say('系统','<span class="m">正在新建会话 <b>'+esc(name)+'</b>（首次约需数秒）…</span>','ai');
-  // ★ 2026-09-30 修：把设置里选的后端传给服务端。此前漏传 → 永远默认 pi，
-  //   用户在设置里选 WorkBuddy 不生效（审计里能看到 wb ready 却仍走 pi 的假象）。
+  // backend 只有一个值（direct）；仍旧传下去是为了让服务端能回一条「旧值已下线」的提示
   const backend = (S.aiBackend && S.aiBackend !== 'auto') ? S.aiBackend : '';
   let r; try{ r = await api('/api/ai/open',{backend, model:S.aiModel||'', tools:S.aiTools||'read+netdev'}); }
-  catch(e){ p.querySelector('.bd').innerHTML='<span class="bad">后端不可达</span>'; return null; }
+  catch(e){ p.querySelector('.bd').innerHTML='<span class="bad">界面服务不可达</span>'; return null; }
   if(r.__err__||r.error){
     p.querySelector('.bd').innerHTML='<span class="bad">启动失败：'+esc(r.__err__||r.error)+'</span>'
       + (r.hint?'<br><span class="m">'+esc(r.hint)+'</span>':'')
-      + (r.hint?' <button class="sub-btn" onclick="repairPiLocks()">尝试修复</button>':'');
+      + ' <button class="sub-btn" onclick="openSettingsForKey()">去配 API Key</button>';
     return null; }
   AI_SESS.push({name, aid: r.aid, es: null, device: dev});   // ★ 会话焊死设备
   AI_CUR = AI_SESS.length - 1;
   AID = r.aid;
-  p.querySelector('.bd').innerHTML=`<b>${esc(name)}</b> · 后端 ${esc(aiBackendLabel(r.backend))} · 模型 ${esc(r.model)} · pid ${r.pid}`
+  p.querySelector('.bd').innerHTML=`<b>${esc(name)}</b> · 后端 ${esc(aiBackendLabel(r.backend))} · 模型 ${esc(r.model)}`
+    +` · 服务商 ${esc(r.provider||'-')}`
     +` · 工具 <b>${esc(r.tools||'?')}</b> · ${r.ready?'<span class="k">就绪</span>':'<span class="w">初始化中</span>'}`
-    +((r.healed&&r.healed.length)?` · <span class="w">已自动修复残留锁 ${r.healed.length} 个</span>`:'');
+    +(r.notice?`<br><span class="w">${esc(r.notice)}</span>`:'');
   audit('INFO','-',`AI 会话新建 name=${name} aid=${AID}`);
   AIES = new EventSource(`/api/ai/stream?aid=${encodeURIComponent(AID)}`);
   AIES.addEventListener('ev', e=>{ try{ onAiEvent(JSON.parse(new TextDecoder().decode(b64d(e.data)))); }catch(err){} });
@@ -1917,19 +1922,19 @@ async function aiOpen(){
 }
 async function aiOpenLegacy(){
   const p=say('系统','<span class="m">正在启动 AI 后端（首次约需数秒）…</span>','ai');
-  // ★ 2026-09-30 修：同 aiNewSession，把设置里选的后端传给服务端（此前漏传 → 永远 pi）
   const backend = (S.aiBackend && S.aiBackend !== 'auto') ? S.aiBackend : '';
   let r; try{ r=await api('/api/ai/open',{backend, model:S.aiModel||'', tools:S.aiTools||'read+netdev'}); }
-  catch(e){ p.querySelector('.bd').innerHTML='<span class="bad">后端不可达</span>'; return null; }
+  catch(e){ p.querySelector('.bd').innerHTML='<span class="bad">界面服务不可达</span>'; return null; }
   if(r.__err__||r.error){
     p.querySelector('.bd').innerHTML='<span class="bad">启动失败：'+esc(r.__err__||r.error)+'</span>'
       + (r.hint?'<br><span class="m">'+esc(r.hint)+'</span>':'')
-      + (r.hint?' <button class="sub-btn" onclick="repairPiLocks()">尝试修复</button>':'');
+      + ' <button class="sub-btn" onclick="openSettingsForKey()">去配 API Key</button>';
     return null; }
   AID=r.aid;
-  p.querySelector('.bd').innerHTML=`后端 <b>${esc(aiBackendLabel(r.backend))}</b> · 模型 ${esc(r.model)} · pid ${r.pid}`
+  p.querySelector('.bd').innerHTML=`后端 <b>${esc(aiBackendLabel(r.backend))}</b> · 模型 ${esc(r.model)}`
+    +` · 服务商 ${esc(r.provider||'-')}`
     +` · 工具 <b>${esc(r.tools||'?')}</b> · ${r.ready?'<span class="k">就绪</span>':'<span class="w">初始化中</span>'}`
-    +((r.healed&&r.healed.length)?` · <span class="w">已自动修复残留锁 ${r.healed.length} 个</span>`:'');
+    +(r.notice?`<br><span class="w">${esc(r.notice)}</span>`:'');
   audit('INFO','-',`AI 会话已开 aid=${AID} backend=${r.backend}`);
   AIES = new EventSource(`/api/ai/stream?aid=${encodeURIComponent(AID)}`);
   AIES.addEventListener('ev', e=>{
@@ -2655,10 +2660,9 @@ function bindSet(){
     if(key==='theme'){ applyTheme(); audit('INFO','-','主题 → '+$(id).selectedOptions[0].textContent); }
     if(key==='refreshMs'){ applyRefresh(); audit('INFO','-','设备刷新间隔 → '+S.refreshMs+'ms'); }
     if(key==='aiBackend'){
-      // ★ 即时性：切换后端当下就刷新顶栏徽章 + 面板标题，不等 F5。
-      //   loadAgents 按用户刚选的 S.aiBackend 更新（等效"不刷新页面的局部刷新"）。
+      // ★ 即时性：切换当下就刷新顶栏徽章 + 面板标题，不等 F5。
       loadAgents();
-      say('系统',`AI 后端已切到 <b>${esc(aiBackendLabel(S.aiBackend))}</b> — 对【新建会话】生效，已开的会话不变。`,'ai');
+      say('系统',`AI 助手已切到 <b>${esc(aiBackendLabel(S.aiBackend))}</b> — 对【新建会话】生效，已开的会话不变。`,'ai');
       audit('INFO','-',`AI 后端 → ${aiBackendLabel(S.aiBackend)}（新建会话后生效）`);
     }
     if(key.startsWith('ai') && key!=='aiBackend') audit('INFO','-',`AI 设置：${key}=${S[key]}（新建会话后生效）`);
@@ -2677,7 +2681,7 @@ function bindSet(){
 let AGENTS=[];
 /* 后端 id → 中文显示名（面板标题 / 徽章共用），未知回退原值 */
 function aiBackendLabel(id){
-  const m = {pi:'pi RPC', wb:'WorkBuddy', direct:'直连 API', auto:'AI 助手', off:'关闭'};
+  const m = {direct:'直连 API', auto:'直连 API', off:'关闭'};
   return (id && m[id]) || (id || 'AI 助手');
 }
 /* 刷新 AI 面板标题里的后端名（后端切换后要跟着变，别再死写 "pi RPC"） */
@@ -2685,91 +2689,80 @@ function refreshAiSub(){
   const el=$('aiSub'); if(!el) return;
   el.textContent = aiBackendLabel(S.aiBackend) + ' · 工具白名单';
 }
+/* 后端探测：本版本只剩「直连 API」。这里三种态：可用 / 未配 Key / 用户已关闭。
+   注意：直连凭据既可能在 config/direct.json，也可能来自环境变量；
+   界面上 ⚙ 设置里的「直连 API Key」就是写 config/direct.json。 */
 async function loadAgents(){
   let r; try{ r = await api('/api/agents'); }catch(e){ return; }
   AGENTS = r.agents||[];
   const sel=$('sAiBackend'), b=$('bAgent');
-  const avail = AGENTS.filter(a=>a.available);
-  sel.innerHTML = AGENTS.map(a=>
-      `<option value="${a.id}"${a.available?'':' disabled'}>${a.name}${a.available?'':'（未安装）'} — ${a.mode}</option>`).join('')
+  if(!sel || !b) return;
+  const d = AGENTS.find(a=>a.id==='direct') || {available:false, auth_note:''};
+  sel.innerHTML =
+      `<option value="direct"${d.available?'':' disabled'}>直连 API`
+      + `${d.available?'':'（未配 Key）'}</option>`
     + `<option value="off">关闭 AI</option>`;
-  if(!avail.length){
-    b.textContent='AI: 无可用 agent'; b.className='badge on';
-    b.title = AGENTS.map(a=>`${a.name}：${a.hint}`).join('\n');
-    audit('WARN','-','本机没探测到可用 agent（'+AGENTS.map(a=>a.name).join(' / ')+'）');
-    return;
-  }
   if(S.aiBackend==='off'){
-    // 用户显式关闭了 AI：不参与下面的 pick（否则会被"回退到 pi"静默覆盖成开启）
     sel.value='off';
     b.textContent='AI: 关闭'; b.className='badge';
-    b.title='AI 助手已关闭（⚙ 设置里重新选一个后端即可开启）';
+    b.title='AI 助手已关闭（⚙ 设置里选回「直连 API」即可开启）';
     refreshAiSub();
     return;
   }
-  // 自然对接优先级：用户已选且仍可用 > pi（已实测）> 探测推荐 > 第一个可用
-  const pick = avail.find(a=>a.id===S.aiBackend) || avail.find(a=>a.id==='pi')
-            || avail.find(a=>a.id===r.recommended) || avail[0];
-  if(S.aiBackend !== pick.id){ S.aiBackend = pick.id; saveSet(); }
-  sel.value = pick.id;
-  refreshAiSub();                            // ★ 面板标题跟着后端名走
-  b.textContent = 'AI: ' + pick.name + (pick.tested?'':' *');
-  b.className = 'badge';
-  b.title = `${pick.name}\n路径: ${pick.path||'-'}\n模式: ${pick.mode}`
-          + (pick.version?`\n版本: ${pick.version}`:'')
-          + (pick.tested?'\n状态: 已实测可用':'\n状态: 按官方接口接入，本机未实测（*）');
-  audit('INFO','-',`AI 后端自动对接 → ${pick.name}（${pick.mode}）`);
+  S.aiBackend='direct'; sel.value='direct';
+  refreshAiSub();
+  if(!d.available){
+    b.textContent='AI: 未配置 Key'; b.className='badge on';
+    b.title='直连 API 还没配 Key —— 打开 ⚙ 设置，在「直连 API Key」里粘贴 Key 并保存即可'
+          + (d.auth_note?`\n${d.auth_note}`:'');
+    audit('WARN','-','AI 助手未启用：直连 API 缺 API Key（⚙ 设置 → 直连 API Key）');
+    return;
+  }
+  b.textContent='AI: 直连 API'; b.className='badge';
+  b.title = '直连 API（唯一后端）'
+          + (d.provider?`\n服务商: ${d.provider}`:'')
+          + (d.base_url?`\n接口: ${d.base_url}`:'')
+          + (d.model?`\n模型: ${d.model}`:'')
+          + (d.auth_note?`\n${d.auth_note}`:'');
+  audit('INFO','-','AI 后端：直连 API（'+ (d.base_url||'-') +'）');
 }
 
 /* ═══════ AI 后端深度检测（按钮触发） ═══════ */
 const VD = {ready:['✓ 可接入','ready'],'no-auth':['⚠ 未登录','no-auth'],
             broken:['✗ 起不来','broken'],missing:['✗ 未安装','missing']};
 function renderProbe(r){
-  const box=$('agentProbe');
+  const box=$('agentProbe'); if(!box) return;
   box.innerHTML = (r.agents||[]).map(a=>{
     const [t,cls] = VD[a.verdict] || ['?',''];
     let dt;
-    if(a.deep && a.deep.detail)            dt = a.deep.detail;
-    else if(a.stale_locks && a.stale_locks.length) dt = '检出崩溃残留锁：'+a.stale_locks.join('、');
-    else if(a.available && !a.authed)      dt = '装了但未见凭证（'+(a.auth_note||'')+'）';
-    else if(!a.available)                  dt = a.hint || '';
-    else                                   dt = a.path || '';
-    if(a.healed && a.healed.length)        dt += `　已自动修复 ${a.healed.length} 个残留锁`;
-    // 残留锁是可一键修的具体故障 → 直接给按钮，别让用户去翻终端
-    const fixBtn = (a.id==='pi' && a.stale_locks && a.stale_locks.length)
-      ? ` <button class="sub-btn" data-repair="pi" title="${esc(a.fix||'')}">修复残留锁</button>` : '';
+    if(a.deep && a.deep.detail)       dt = a.deep.detail;
+    else if(!a.available)             dt = a.auth_note || a.hint || '';
+    else if(a.available && !a.authed) dt = '还没配 Key（'+(a.auth_note||'')+'）';
+    else                              dt = a.auth_note || a.base_url || '';
     return `<div class="pa"><span class="nm">${esc(a.name)}</span>`
          + `<span class="vd ${cls}">${t}</span>`
-         + `<span class="dt" title="${esc(dt)}">${a.version?esc(a.version)+' · ':''}${esc(dt)}</span>${fixBtn}</div>`;
+         + `<span class="dt" title="${esc(dt)}">${esc(dt)}</span></div>`;
   }).join('') + `<div class="m" style="margin-top:5px;font-size:10px">${esc(r.note||'')}</div>`;
-  box.querySelectorAll('[data-repair]').forEach(b=>b.onclick=()=>repairPiLocks());
   audit('INFO','-','AI 后端检测：'+(r.agents||[]).map(a=>`${a.name}=${a.verdict}`).join(' '));
 }
-/* 一键修复：把 ~/.pi/agent 下崩溃残留的 *.json.lock 移入隔离区（只搬不删） */
-async function repairPiLocks(){
-  const msg=$('probeMsg');
-  msg.textContent='修复中…（移入 ~/.quarantine-pi-locks/，可原样还原）';
-  let r; try{ r = await api('/api/pi/repair',{verify:1}); }catch(e){ msg.textContent='修复失败：后端未响应'; return; }
-  if(r.__err__ || !r.ok){ msg.textContent='修复失败：'+(r.__err__||r.error||r.note||'未知'); return; }
-  const v=r.verify?(r.verify.ok?' · pi 已可拉起':' · pi 仍起不来：'+r.verify.detail):'';
-  msg.textContent = (r.moved && r.moved.length)
-    ? `✓ 已隔离 ${r.moved.length} 个残留锁（${r.moved.join('、')}）${v}`
-    : `无需修复${v}`;
-  audit('INFO','-','pi 残留锁修复：'+((r.moved||[]).join('、')||'无需处理')+v);
-  await probeAgents();          // 复检，让结论刷新
+/* 打开设置面板并聚焦到「直连 API Key」——从报错处一键跳到该填的地方 */
+function openSettingsForKey(){
+  try{ syncForm(); loadDirect(); }catch(e){}
+  const m=$('modalSet'); if(m) m.classList.add('show');
+  setTimeout(()=>{ const k=$('sDKey'); if(k) k.focus(); }, 120);
 }
 async function probeAgents(){
   const msg=$('probeMsg');
-  msg.textContent='检测中…（会真的拉起一次 RPC 进程，不发 prompt、不耗额度）';
+  msg.textContent='检测中…（会真发一条最小 prompt 验证连通，消耗极少量额度）';
   $('btnProbe').disabled=true;
   let r;
   try{ r = await api('/api/agents?deep=1'); }
-  catch(e){ msg.textContent='检测失败：后端未响应'; $('btnProbe').disabled=false; return; }
+  catch(e){ msg.textContent='检测失败：界面服务未响应'; $('btnProbe').disabled=false; return; }
   renderProbe(r); msg.textContent=''; $('btnProbe').disabled=false;
   await loadAgents();               // 让下拉与顶栏徽章跟着刷新
   const rec=(r.agents||[]).find(a=>a.id===r.recommended);
   if(rec) audit('INFO','-','检测结论：可接入 → '+rec.name);
-  else audit('WARN','-','检测结论：没有 ready 的后端（'+(r.agents||[]).map(a=>a.name+'='+a.verdict).join(' ')+'）');
+  else audit('WARN','-','检测结论：直连 API 还不能用 —— 去 ⚙ 设置里填 API Key');
 }
 
 /* ═══════ 直连 API Key 配置（direct 后端：界面内填 Key，客户不用碰终端） ═══════ */

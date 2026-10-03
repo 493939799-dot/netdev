@@ -38,8 +38,9 @@
 
 ### 2. AI 拿不到的能力
 
-- Bash / Write / Edit 等通用工具**硬移除**，AI 只能调 `netdev_*` 这 13 个只读工具
-  + 显式放行的写操作。
+- Bash / Write / Edit 等通用工具**硬移除**，AI 只能调 `netdev_*` 这 13 个工具
+  （只读用 `netdev_run` 等，写操作只能经 `netdev_apply` / `netdev_save` 显式发起）。
+- 内置 AI 助手走**直连 API**，用的就是这同一套工具；它没有任何能绕开 CLI 的能力。
 - 写操作必须过**四道闸门**：黑名单分类 → 人工审批 → 强制备份 → 逐行下发并校验。
 - 审批是 **fail-closed**：审批通道不可达时拒绝执行，不是放行。
 - 审批代码 `lib/approval.py` 带 **sha256 基线篡改检测**，`netdev doctor` 会报

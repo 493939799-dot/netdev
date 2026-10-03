@@ -56,7 +56,7 @@
 - **三通道接入**：串口 Console / SSH / Telnet
 - **人机同屏**：基于 tmux，人工与 AI 共享同一窗格
 - **四道写闸门**：黑名单分类 → 人工审批弹窗 → 强制备份 → 逐行下发并校验
-- **AI 三后端可切换**：pi agent（RPC）/ WorkBuddy agent（headless）/ 直连 OpenAI 兼容 API（自带 Key），也可整体关闭 AI
+- **AI 助手走直连**：直连 OpenAI 兼容 API（DeepSeek / OpenAI / OpenRouter / 任意兼容网关），一把 Key 即用，零额外 CLI 依赖；也可整体关闭 AI
 - **备份与恢复**：配置快照、差异对比、回收区机制
 - **网页服务一键管理**：`netdev ui`（没有就起、有就报状态），后台守护、关终端不掉
 - **本地体检**：`./netdev doctor` 一键自检
@@ -91,31 +91,59 @@
 
 **命令是学一次、一直用的。** 某条指标命令不被设备接受时，系统会自动逐条试候选并把命中结果**落盘记住**（`config/cmd-cache.json`），下次采集直接用它、不再重复探测。悬停监控副标题可看到「已学到 N 条命令」。
 
-## AI 后端：怎么选、起不来怎么办
+## AI 助手：只需要一把 API Key
 
-界面 → 设置 → 「AI 后端」。三个后端都可用时优先 `pi`；只想最省事可用 WorkBuddy（随桌面版安装，免登录）；完全不想装外部 CLI 就用「直连 API Key」，在设置面板里填 Key 即可（写入 `config/direct.json`，权限 600，已在 `.gitignore` 中排除）。
+AI 助手**只有一个后端：直连 OpenAI 兼容 API**。不依赖本机装任何 AI CLI，没有常驻进程，
+没有凭据文件要维护 —— 一把 Key 就能用。
 
-**`pi` 起不来时先看这里。** 典型症状是界面能建会话但一发消息就报
-`No API key found for the selected model`，而 `~/.pi/agent/auth.json` 明明在。真因链：
+配置路径（三处任选，优先级从上到下）：
 
-1. pi 的 `settings.json` 若声明了 `packages`（如 `npm:pi-web-access`），每次启动都会执行
-   `npm install <pkg> --prefix ~/.pi/agent/npm`；
-2. 国内直连 `registry.npmjs.org` 会 502/超时 → pi 启动过程崩溃；
-3. pi 用 proper-lockfile 做配置锁，锁就是**一个空目录** `~/.pi/agent/*.json.lock`；
-   崩溃时清理没跑到 → **锁目录永久残留**；
-4. 之后每次启动都是 `EEXIST: mkdir '…/settings.json.lock'` → 读不到 `settings.json`
-   → **pi 静默回退到内置默认 provider（google）** → 报出上面那个离真因很远的错。
+1. 界面 → **设置 → 「直连 API Key」**：选服务商、粘贴 Key、点「保存并启用」
+   （写入 `config/direct.json`，权限 600，已在 `.gitignore` 中排除）；
+2. 环境变量：`NETDEV_DIRECT_API_KEY` + `NETDEV_DIRECT_BASE_URL`
+   （可选 `NETDEV_DIRECT_MODEL` / `NETDEV_DIRECT_PROVIDER`）；
+3. 手写 `config/direct.json`：`{"provider","api_key","base_url","model"}`。
 
-netdev 对此有两层处理：
+配好后顶栏徽章会显示 **AI: 直连 API**。想看连通性就点设置里的「可用性检测」
+（会真发一条最小 prompt）；也可以 `POST /api/direct/test`。
 
-- **自动自愈**：打开 AI 会话前会把「陈旧、空、且无人持有」的锁目录移入
-  `~/.quarantine-pi-locks/<时间戳>/`（**只搬不删，可原样还原**），并在会话信息里提示已修复几个。
-- **一键修复**：「设置 → AI 后端检测（深度）」里，检出残留锁会直接给出「修复残留锁」按钮；
-  也可以走 `POST /api/pi/repair`。检测时还会用 `pi auth check --no-refresh` **真问一次凭据**，
-  不再用「auth.json 存在就算登录了」这种乐观判据。
+**AI 手里的工具就是 netdev 自己的那 13 个**（`netdev_list` / `netdev_run` /
+`netdev_apply` / `netdev_save` / `netdev_backup` / `netdev_diff` / `netdev_ping` /
+`netdev_serial_run` / `netdev_watch_tail` / `netdev_connect_info` /
+`netdev_screen_list` / `netdev_screen_read` / `netdev_screen_send`）。
+它们全部转调 netdev CLI，**写操作的四道闸门一行不改** —— AI 绕不过去。
+设置里的「工具权限」可以再收一档：`read` = 不给任何工具，纯对话。
 
-若自愈后仍失败，通常是第 1 步的 npm 走不通 —— 给 npm 配国内镜像，或从 `settings.json` 的
-`packages` 里去掉用不到的那项。这两步都不影响 netdev 本身，也可以直接改用 WorkBuddy / 直连 API。
+### 连不上 / 报错时先看这里
+
+| 现象 | 真因 | 怎么办 |
+| --- | --- | --- |
+| `直连未配置：…` | 没配 Key，或 Key 写在环境变量里但优先级判断没生效 | 设置面板填 Key 并保存；保存后若提示"环境变量优先"，就 `unset NETDEV_DIRECT_API_KEY` |
+| `HTTP 401` / `Authentication` | Key 错、已撤销、或服务商选错 | 重新粘贴；确认「接口地址」与 Key 属于同一家 |
+| `HTTP 404` | 模型名不存在（或地址少/多了 `/v1`） | 点「保存并启用」旁的模型输入框，从 datalist 里选**账户实时可用**的型号 |
+| 模型回应变慢/超时 | 网络或代理 | 直连走标准 HTTPS；如果本机有代理，注意直连域名要在代理放行列表里 |
+| 报 "工具用不了" / 模型说没有工具 | `netdev_mcp.py` 起不来 → 工具表为空 | `python3 tests/test_ai_toolchain_and_cache.py`，第 [4][5] 组会直接指出哪个文件坏在哪一行 |
+
+> **DeepSeek 的型号名有个坑**：`deepseek-chat` / `deepseek-reasoner` 这些"文档名"会
+> 返回 **200**，但被服务端**静默映射**到 `deepseek-flash` —— 配置里写 A、实际跑 B，
+> 排查时会被完全误导。所以界面里的模型候选是从 `/models` 拉的**账户实时型号**
+> （如 `deepseek-flash` / `deepseek-v4-pro`），照着选即可。
+
+### 为什么不再支持 pi / WorkBuddy 当引擎
+
+2026-10-03 之前的版本可以借 pi agent（RPC）或 WorkBuddy agent（headless）当 AI 引擎。
+两条路都拆掉了 —— 不是功能取舍，是它们各自带着一整类**与 netdev 无关的故障面**：
+
+- **pi**：配置/凭据锁用 proper-lockfile（空目录当锁），崩溃就残留，且**宿主注入的 Node
+  shim 会把 `EEXIST` 改写成别的错误码**，导致它的"陈旧锁自愈"分支被整段跳过 —— 锁永不
+  过期；启动时还会跑 `npm install`，国内网络不通就崩。更关键的是：`pi 0.85.1`**根本不
+  支持 MCP**，netdev 的 13 个工具其实一个都传不进去。
+- **WorkBuddy**：内部服务端口冲突会**静默挂死**；凭据是宿主加密信封，第三方进程解不开；
+  `--tools` 是全局白名单，会把 MCP 工具一起掐掉（得改用 `--disallowedTools`，且工具名
+  必须逐个 `argv` 元素传，逗号串会静默失效）。
+
+而直连后端把这些问题一次性消灭：零第三方 CLI、零凭据文件、零常驻进程，
+护栏仍然完全复用 netdev 自己的工具层。
 
 ## 网页服务：起不来怎么办
 
@@ -231,9 +259,9 @@ uv pip install -r requirements.txt
 ```bash
 ./netdev selftest                                       # 端到端自检（打本机模拟器，不需要真设备）
 ./netdev doctor                                         # 环境 / 服务 / 串口 / 命令清单 / 日志
-python3 tests/test_pi_heal_and_cmdcache.py             # 回归：pi 残留锁自愈 + 命令学习缓存 + 平台识别（24 项）
+python3 tests/test_ai_toolchain_and_cache.py           # 回归：AI 工具链一致性 + MCP 握手 + 采集缓存 + 平台识别（57 项）
 python3 tests/test_approval_gates.py                   # 回归：写操作人审闸门（19 项，安全关键）
-python3 tests/test_mock_cmd.py                         # 回归：netdev mock 模拟器命令（12 项）
+python3 tests/test_mock_cmd.py                         # 回归：netdev mock 模拟器命令 + 行编辑语义（21 项）
 python3 tests/test_ui_lifecycle.py                     # 回归：网页服务起停 / 幂等 / 真脱离进程组（27 项）
 ```
 

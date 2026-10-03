@@ -46,7 +46,7 @@ and type into it; you watch it happen and can take over at any moment.
 - **Vendor auto-detection** — sends `display version`, recognizes Huawei / H3C / Ruijie / Cisco / Maipu from the banner. You don't fill in a platform code
 - **Metrics that admit ignorance** — an unparsed metric shows `—`. It never invents a `0`
 - **Learn once, use forever** — a metric command the device rejects is probed once, then cached to `config/cmd-cache.json`
-- **Three AI backends, switchable** — `pi` agent (RPC) / WorkBuddy agent (headless) / direct OpenAI-compatible API (bring your own key). Or turn AI off entirely
+- **AI over a direct connection** — talks straight to any OpenAI-compatible API (DeepSeek / OpenAI / OpenRouter / your own gateway). One API key, no extra CLI, no background process. AI can also be switched off entirely
 - **Snapshots** — semantic diff (not raw line-by-line), restore-after-review, recycle bin for deletes
 - **Self-check** — `./netdev doctor` tells you what's wrong on this machine
 - **A web UI you can start with one command** — `netdev ui`
@@ -109,7 +109,15 @@ or the double-clickable launcher window — does not take it down.
 
 ## Using it with an AI
 
-Point any MCP-capable agent at the bundled server:
+The built-in assistant has **exactly one backend: a direct OpenAI-compatible API**.
+No AI CLI to install, no daemon, no credential file to babysit — just a key.
+
+Configure it in **Settings → "Direct API key"** (saved to `config/direct.json`,
+mode 600, gitignored), or via `NETDEV_DIRECT_API_KEY` + `NETDEV_DIRECT_BASE_URL`.
+The badge in the top bar then reads **AI: direct**.
+
+If you'd rather drive it from your own agent, point any MCP-capable agent at the
+bundled server:
 
 ```bash
 ./netdev-mcp        # stdio / JSON-RPC MCP server
@@ -117,6 +125,8 @@ Point any MCP-capable agent at the bundled server:
 
 It exposes **13 `netdev_*` tools**, every one of which shells out to the same CLI
 a human would use. Generic tools like Bash / Write / Edit are **not** exposed.
+The built-in assistant uses that exact same 13-tool set, so write operations go
+through the same four guardrails either way.
 
 To let an agent read the shared conventions:
 
@@ -133,10 +143,10 @@ no network, no credentials. That's deliberate: a project you can't test without
 hardware won't get contributions.
 
 ```bash
-./netdev selftest                                       # end-to-end, against the simulator
-./.venv/bin/python tests/test_pi_heal_and_cmdcache.py   # 24 checks
-./.venv/bin/python tests/test_approval_gates.py         # 19 checks (security-critical)
-./.venv/bin/python tests/test_ui_lifecycle.py           # 27 checks
+./netdev selftest                                          # end-to-end, against the simulator
+./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 57 checks
+./.venv/bin/python tests/test_approval_gates.py            # 19 checks (security-critical)
+./.venv/bin/python tests/test_ui_lifecycle.py              # 27 checks
 ```
 
 CI runs all four on every push.

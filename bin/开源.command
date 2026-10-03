@@ -227,7 +227,7 @@ feat: netdev 设备工具台 —— 首个公开版本
 
 - 三种接入（串口 Console / SSH / Telnet）+ 厂商平台自动识别
 - 写操作四道闸门：黑名单 → 人工审批 → 强制备份 → 逐行下发校验，失败即停
-- AI 三后端可切换：pi agent / WorkBuddy agent / 直连 API
+- AI 助手走直连 OpenAI 兼容 API：一把 API Key 即用，零额外 CLI 依赖
 - 全部测试离线可跑（仓库自带本机模拟器），CI 每次 push 都跑
 - 网页服务一条命令管理：netdev ui（没有就起、有就报状态）
 MSG

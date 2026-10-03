@@ -85,7 +85,12 @@ def netdev_json(args: list[str], timeout: int = 20):
     if not cli.exists():
         return None
     try:
-        r = subprocess.run([str(cli), *args], capture_output=True, text=True, timeout=timeout)
+        # ★ 用干净环境：剥掉宿主注入的 Node / Shell shim（见 _strip_host_shim）。
+        #   shim 会在 PATH 里塞 brokered-bin / safe-bin 包装器，把 mkdir / rm
+        #   换成受管版本 —— netdev CLI 自己要建 pid、快照、回收区目录，
+        #   被换成受管版本后错误码与语义都不可依赖（实测踩过，见文件头注释）。
+        r = subprocess.run([str(cli), *args], capture_output=True, text=True,
+                           timeout=timeout, env=_env_with_node())
         out = (r.stdout or "").strip()
         if not out:
             return None
@@ -100,7 +105,9 @@ def raw_netdev(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
     #   让它审批走「网页弹窗」（/api/ask）而不是 macOS 原生 osascript 弹窗。
     #   之前漏了这里 —— 界面里点「下发配置」时 approval 读到空的
     #   NETDEV_APPROVAL_URL，就会回退到系统弹窗（用户 2026-09-30 反馈）。
-    env = dict(os.environ)
+    # ★ 2026-10-03：改用 _env_with_node()（= os.environ 先剥宿主 shim 再补 PATH），
+    #   别再把带 shim 的原始环境原样传给 netdev CLI。
+    env = _env_with_node()
     if UI_BASE:
         env["NETDEV_APPROVAL_URL"] = UI_BASE
     try:
@@ -113,67 +120,24 @@ def raw_netdev(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
         return 1, "", f"{type(e).__name__}: {e}"
 
 
-def _which(name: str) -> str | None:
-    """在几个常见位置找可执行文件（本机 PATH 常被 shim 动过，不能只靠 which）。"""
-    p = shutil.which(name)
-    if p:
-        return p
-    for d in (str(HOME / ".npm-global/bin"), "/usr/local/bin", "/opt/homebrew/bin",
-              str(HOME / "homebrew/bin"), str(HOME / ".local/bin")):
-        c = pathlib.Path(d) / name
-        if c.exists():
-            return str(c)
-    return None
-
-
-def _ver(cmd: str) -> str:
-    try:
-        r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=8)
-        line = ((r.stdout or "").strip().splitlines() or [""])[0]
-        return line[:48]
-    except Exception:
-        return ""
-
-
-def _file_ok(p: pathlib.Path) -> bool:
-    """只看存在与大小 —— 凭证文件绝不读取内容。"""
-    try:
-        return p.is_file() and p.stat().st_size > 2
-    except Exception:
-        return False
-
-
 # ══════════════════════════════════════════════════════════════════════════
-# ★ 2026-10-03：**必须剥掉宿主注入的 Node 语言 shim** —— 这是「AI 助手突然
-#   不好用」的**真根因**，也是本项目踩过的最隐蔽的一个坑。
+# ★ 宿主注入的 Node / Shell shim —— UI 拉起的**任何**子进程都先剥掉
 #
-# 现象：界面里 AI 助手稳定报
-#     Credential store read failed for deepseek:
-#     EEXIST: file already exists, mkdir '/Users/mac/.pi/agent/auth.json.lock'
-#   而此刻 ~/.pi/agent 下**根本没有活着的 pi**，锁也早就是死锁（mtime 静置
-#   十几分钟零刷新）。手工把锁清掉，pi 一起来又 EEXIST，看着像"清不动"。
-#
-# 真因：宿主（WorkBuddy）给**每一个 Node 进程**注入
-#     NODE_OPTIONS=--require=/Applications/WorkBuddy.app/…/cli/vendor/shim/node-language-shim.cjs
+# 背景（2026-10-03 实测，本项目踩过的最隐蔽的一个坑）：
+#   宿主（WorkBuddy 桌面版）会给每一个 Node 进程注入
+#     NODE_OPTIONS=--require=…/cli/vendor/shim/node-language-shim.cjs
 #   该 shim 接管了 fs，把 mkdir 撞名的 EEXIST **改写**成
 #     code = "CODEBUDDY_BROKER_DENY"（message 文本里仍写着 "EEXIST: …"）
-#   pi 的配置/凭据锁用的是 proper-lockfile 4.1.2，它的**陈旧锁自愈分支**
-#   判据是（lib/lockfile.js:47）：
-#       if (err.code !== 'EEXIST') { return callback(err); }   ← 只有 EEXIST 才往下走
-#   code 被换成 BROKER_DENY ⇒ 这个分支被整个跳过 ⇒ 原始错误直接抛给上层。
-#   后果：**崩溃残留的锁永远不会过期**，pi 每次启动必挂，且报错点离真因极远。
-#
-# 实测（同一台机器、同一个 proper-lockfile，只改锁目录 mtime）：
-#     带 NODE_OPTIONS：mtime = 现在 / -3s / -10s / -29s / -35s / 未来
-#                      → **全部** CODEBUDDY_BROKER_DENY，无一自愈
-#     剥掉 NODE_OPTIONS：-29s → ELOCKED（正常，pi 自己会重试）
-#                        -35s → 直接清掉旧锁并**成功获取**
-#   即：剥掉 shim 后，proper-lockfile 的 30 秒陈旧判据完全恢复。
+#   凡是用 proper-lockfile 这类「看 err.code 决定重试 / 自愈」的库，
+#   都会因为 code 被换掉而**整段跳过自愈分支** —— 崩溃残留的锁永不过期，
+#   且报错点离真因极远。同一套 shim 还会在 PATH 里塞 brokered-bin /
+#   safe-bin 命令包装器，把 rm / mkdir / rmdir 换成受管版本。
 #
 # 边界（刻意做窄）：只剔除**指向宿主 shim 的那一条 token / 那几个目录**，
 #   用户自己设的 NODE_OPTIONS 内容原样保留；PATH 里
 #   `~/.workbuddy/binaries/...` 这类**含 workbuddy 字样但属于运行时**的路径
-#   **绝不误伤**（用 `/cli/vendor/shim/` 这种精确特征匹配，不拿 "workbuddy" 当关键词）。
+#   **绝不误伤**（用 `/cli/vendor/shim/` 这种精确特征匹配，不拿 "workbuddy"
+#   当关键词）。
 # ══════════════════════════════════════════════════════════════════════════
 _SHIM_TOKENS = ("node-language-shim", "node-brokered-fs-shim", "node-safe-delete-shim",
                 "/cli/vendor/shim/", "shell-runtime-bash-env")
@@ -185,7 +149,7 @@ def _is_shim_token(tok: str) -> bool:
 
 
 def _strip_host_shim(env: dict) -> dict:
-    """剥掉宿主注入的 Node / Shell shim，让 Node 的错误码恢复内核语义。
+    """剥掉宿主注入的 Node / Shell shim，让子进程回到内核语义。
 
     只动三个键：NODE_OPTIONS、PATH、BASH_ENV。全部按**精确特征**匹配，
     命中才剔除；不命中一律原样保留。
@@ -213,10 +177,9 @@ def _strip_host_shim(env: dict) -> dict:
 
 
 def _env_with_node() -> dict:
-    """给子进程一个能找到 node 的 PATH（本机 node 在 /usr/local/bin）。
+    """给子进程一个「干净 + 能找到 node」的环境。
 
-    ★ 2026-10-03：在「补 PATH」之前**先剥掉宿主注入的 Node shim**。
-      见上方长注释 —— 不剥的话 pi 的锁永远不自愈，AI 助手必挂。
+    ★ 在「补 PATH」之前**先剥掉宿主注入的 shim**（见上方长注释）。
       这一步对「用户自己双击启动的 UI」是空操作（那种场景下环境本来就干净），
       对「从宿主里拉起的 UI」才是救命的那一刀。
     """
@@ -226,347 +189,55 @@ def _env_with_node() -> dict:
     return env
 
 
-def _rpc_startable(cmd: str, args: list[str], wait: float = 4.0) -> tuple[bool, str]:
-    """把 agent 的 RPC 进程真的拉起来一次，看 wait 秒内是否存活。
-    不发任何 prompt ⇒ 不消耗额度。"""
-    try:
-        p = subprocess.Popen([cmd, *args], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.PIPE, env=_env_with_node(), cwd=str(HOME),
-                             start_new_session=True)
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-    time.sleep(wait)
-    alive = p.poll() is None
-    why = ""
-    if not alive:
-        try:
-            why = (p.stderr.read() or b"").decode("utf-8", "replace").strip()[:140]
-        except Exception:
-            pass
-        why = why or f"进程已退出（code={p.returncode}）"
-    try:
-        p.terminate()
-        time.sleep(0.2)
-        p.kill()
-    except Exception:
-        pass
-    return alive, why
-
-
 # ══════════════════════════════════════════════════════════════════════════
-#  pi 启动自愈（2026-10-01 实测踩到，必须固化成产品能力）
+#  可接入的 AI 后端 —— 只剩「直连 OpenAI 兼容 API」一条路（2026-10-03）
 #
-#  事故链（真机复现，非猜测）：
-#    1) pi 的 settings.json 里若声明了 packages（如 npm:pi-web-access），
-#       每次启动都会执行 `npm install <pkg> --prefix ~/.pi/agent/npm --legacy-peer-deps`；
-#    2) 国内访问 registry.npmjs.org 会 502/超时（实测 70s 后 E502）；
-#    3) pi 用 proper-lockfile 做配置锁 —— 锁就是一个空目录（mkdir 原子锁）
-#       `~/.pi/agent/{settings,auth,models-store}.json.lock`；
-#       崩溃时 signal-exit 的清理没跑到 ⇒ **锁目录永久残留**；
-#    4) 之后每次启动都是 `EEXIST: mkdir '.../settings.json.lock'`
-#       ⇒ settings.json 读不了 ⇒ pi 静默回退内置默认 provider（google）
-#       ⇒ 报 "No API key found for the selected model"（报错点离真因十万八千里）；
-#    5) netdev 侧的表现是「AI 三后端里 pi 起不来」，而 auth.json 明明在。
-#
-#  所以这里做两件事：**能探测出来** + **能自愈**（移入隔离区，不物理删除）。
+#  为什么砍掉另外两条：pi agent（RPC）与 WorkBuddy agent（headless）都是
+#  「借别人的 CLI 当引擎」，各自带着一整套与 netdev 无关的故障面 ——
+#    · pi：凭据 / 配置锁（proper-lockfile）残留、启动时跑 npm install、
+#          0.85.1 根本没有 MCP 支持（netdev 的 13 个工具其实传不进去）；
+#    · wb：内部服务端口冲突会**静默挂死**、凭据是宿主加密信封解不开、
+#          --tools 白名单会把 MCP 工具一起掐掉…
+#  直连后端只需要一把 API Key：零常驻进程、零第三方 CLI、零凭据文件依赖。
+#  而且 netdev 的 13 个设备工具与全部护栏**一行不改**地复用
+#  （见 DirectSession：import netdev_mcp，复用 HANDLERS + envelope）。
 # ══════════════════════════════════════════════════════════════════════════
-PI_DIR = HOME / ".pi/agent"
-PI_LOCK_NAMES = ("settings.json.lock", "auth.json.lock", "models-store.json.lock")
-PI_LOCK_STALE_SEC = 60          # 正在持有的锁会被 proper-lockfile 持续 utimes 刷新
-
-
-def _pi_lock_dirs() -> list[pathlib.Path]:
-    """所有「空目录形态」的 pi 锁（不看年龄）。"""
-    out = []
-    for name in PI_LOCK_NAMES:
-        p = PI_DIR / name
-        try:
-            if p.is_dir() and not any(p.iterdir()):
-                out.append(p)
-        except Exception:
-            pass
-    return out
-
-
-def _pi_stale_locks() -> list[pathlib.Path]:
-    """列出「崩溃残留」的 pi 锁目录。
-
-    三条同时满足才算（避免误删正在使用的锁）：
-      1) 是**目录** —— proper-lockfile 用 mkdir 当原子锁；
-      2) 是**空的** —— 真锁目录里不放任何东西；
-      3) mtime 距今 > PI_LOCK_STALE_SEC —— 活锁的 mtime 会被持续刷新。
-    """
-    out = []
-    now = time.time()
-    for name in PI_LOCK_NAMES:
-        p = PI_DIR / name
-        try:
-            if not p.is_dir():
-                continue
-            if any(p.iterdir()):          # 非空 → 不是锁目录，别碰
-                continue
-            if now - p.stat().st_mtime < PI_LOCK_STALE_SEC:
-                continue                  # 太新 → 可能是正在持有的锁
-            out.append(p)
-        except Exception:
-            continue
-    return out
-
-
-def _pi_heal_specific(name: str) -> bool:
-    """把**指定的**那个锁目录移入隔离区（不看出身时间）。
-
-    为什么不用 `pi_heal_locks()`：它要求 mtime > PI_LOCK_STALE_SEC（60s）才算陈旧。
-    而这里是从 pi 自己的报错里拿到的锁名 —— 我们就是刚才那个写锁的进程，
-    它已经崩了，锁一定是死的，不需要再等 60 秒来"确认它没在动"。
-    仍然只搬不删。
-    """
-    if not name:
-        return False
-    p = PI_DIR / name
-    try:
-        if not p.is_dir():
-            return False
-    except Exception:
-        return False
-    q = HOME / ".quarantine-pi-locks" / time.strftime('%Y%m%d_%H%M%S')
-    try:
-        q.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(p), str(q / p.name))
-        return True
-    except Exception:
-        return False
-
-
-def _pi_lock_error(ev: dict) -> bool:
-    """这个事件是不是「pi 锁残留」导致的失败。"""
-    if not isinstance(ev, dict) or ev.get("success") is not False:
-        return False
-    err = str(ev.get("error") or "")
-    return ("file already exists" in err) and (".lock" in err)
-
-
-def _pi_lock_name_from_error(ev: dict) -> str:
-    """从报错里把锁文件名抠出来，如 `…/auth.json.lock` → `auth.json.lock`。"""
-    err = str(ev.get("error") or "")
-    m = re.search(r"([A-Za-z0-9_.-]+\.lock)", err)
-    return m.group(1) if m else ""
-
-
-def _pi_procs_alive() -> list[int]:
-    """本机是否还有**别的** pi 进程在跑（只读探测，绝不拉起任何进程）。
-
-    为什么要它：`pi_heal_locks(force=True)` 原来不看年龄，见空锁就搬。万一用户
-    自己正在终端里跑 pi（真有人这么用），那个锁是**活的**，搬走会砸掉她的会话。
-    有活 pi 时自动降级为「只搬 mtime > 60s 的陈旧锁」。
-    探测失败一律返回空（宁可保守地认为"没人"，因为开新会话前我们已经关掉了自己的旧会话）。
-    """
-    out: list[int] = []
-    for exe, args in (("/usr/bin/pgrep", ["-f", "pi-coding-agent"]),
-                      ("/usr/bin/pgrep", ["-f", "earendil"])):
-        try:
-            if not pathlib.Path(exe).exists():
-                continue
-            r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=5)
-            for ln in (r.stdout or "").split():
-                if ln.isdigit():
-                    pid = int(ln)
-                    if pid != os.getpid() and pid not in out:
-                        out.append(pid)
-        except Exception:
-            continue
-    return out
-
-
-def pi_heal_locks(dry: bool = False, force: bool = False) -> dict:
-    """把崩溃残留的 pi 锁目录移入隔离区。**只移动、不删除**，可原样还原。
-
-    force=True 时不看 mtime，**只要是空目录就搬**。
-    为什么需要它（2026-10-03 实测）：pi 0.85.1 **自己每次退出都漏锁** ——
-    连 `pi --version` 都会留下 settings.json.lock。原判据要求 mtime > 60 秒
-    才算陈旧，而 pi 刚留下的锁只有几秒，**正好被这个条件挡掉**，
-    于是清了也白清，pi 起来照样 EEXIST。
-    正在**开新会话**时调用是安全的：此刻没有属于我们的活 pi，旧锁必然是死的。
-
-    ★ 2026-10-03 加固：force 现在**先看有没有别的 pi 活着**，有就自动降级成
-      非 force（只搬陈旧锁），避免误搬用户自己终端的活锁。
-      `degraded` 字段如实报告是否降级过。
-    """
-    other = _pi_procs_alive() if force else []
-    degraded = bool(force and other)
-    stale = _pi_stale_locks() if degraded or not force else _pi_lock_dirs()
-    base = {"ok": True, "found": len(stale), "moved": [], "quarantine": None,
-            "degraded": degraded, "other_pi": other}
-    if not stale:
-        return base
-    if dry:
-        base["would_move"] = [p.name for p in stale]
-        return base
-    # 隔离区放在 ~/.pi/agent **之外** —— 别往 pi 自己会扫描的配置目录里塞东西
-    q = HOME / ".quarantine-pi-locks" / time.strftime('%Y%m%d_%H%M%S')
-    moved = []
-    try:
-        q.mkdir(parents=True, exist_ok=True)
-        for p in stale:
-            try:
-                shutil.move(str(p), str(q / p.name))
-                moved.append(p.name)
-            except Exception:
-                pass
-    except Exception as e:
-        base.update({"ok": False, "moved": moved, "quarantine": str(q),
-                     "error": f"{type(e).__name__}: {e}"})
-        return base
-    base.update({"moved": moved, "quarantine": str(q)})
-    return base
-
-
-def _pi_settings_defaults() -> tuple[str, str]:
-    """直接读 pi 的 settings.json，取 defaultProvider/defaultModel。
-
-    为什么 netdev 要自己读：settings.json 一旦因锁残留读取失败，pi 会**静默**回退到
-    内置默认 provider（google）。netdev 显式把 provider/model 传下去，等于堵死这条
-    「配置没生效但表面看不出来」的降级路径。读不到就返回空串（不改变原行为）。
-    """
-    try:
-        d = json.loads((PI_DIR / "settings.json").read_text(encoding="utf-8"))
-        if not isinstance(d, dict):
-            return "", ""
-        return str(d.get("defaultProvider") or "").strip(), str(d.get("defaultModel") or "").strip()
-    except Exception:
-        return "", ""
-
-
-def _pi_first_provider() -> str:
-    """从 auth.json 里取出第一个 provider 名（**只读键名，不读任何 Key 内容**）。
-
-    用途：settings.json 读不到时，`pi auth check` 还得有个 provider 可问。
-    取不出来就返回空串，调用方自己兜底。
-    """
-    try:
-        d = json.loads((PI_DIR / "auth.json").read_text(encoding="utf-8"))
-        if isinstance(d, dict):
-            for k in d:
-                if isinstance(k, str) and k.strip():
-                    return k.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _pi_auth_ready(provider: str = "") -> tuple[bool, str]:
-    """用 pi 自己的 `auth check` 判「这个 provider 到底有没有可用凭据」。
-
-    浅探测的 `auth.json 存在` 太乐观 —— 实测文件在、内容对，pi 依然因锁读不到，
-    照样报 "No API key found"。所以这里真的问 pi 一次（`--no-refresh` 纯离线，不耗额度）。
-    """
-    pi = _which("pi")
-    if not pi:
-        return False, "未安装 pi"
-    prov = provider or _pi_first_provider()
-    if not prov:
-        return False, "settings.json 与 auth.json 都没给出 provider（无法判定凭据）"
-    args = [pi, "auth", "check", "--no-refresh", "--json", "--provider", prov]
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=15, env=_env_with_node())
-        raw = (r.stdout or "").strip()
-        d = json.loads(raw) if raw.startswith("{") else {}
-        st = str(d.get("status") or "").strip()
-        if st == "ready":
-            return True, f"凭据就绪（{d.get('provider', prov)} · {d.get('authType', 'api_key')}）"
-        why = d.get("reason") or (r.stderr or raw or "无输出")
-        return False, f"凭据不可用（provider={prov}）：{str(why)[:120]}"
-    except Exception as e:
-        return False, f"auth check 失败：{type(e).__name__}: {e}"
-
-
 def probe_agents(deep: bool = False) -> dict:
-    """探测本机可用的 AI agent 后端 —— 目标是“装上就能用，不用手配”。
+    """探测 AI 后端可用性 —— 现在只报告「直连凭据配好了没有」。
 
-    浅探测：本机有没有这个 CLI（快）
-    深探测：真的把它拉起来一次 + 看凭证在不在（仍不消耗额度）
-    verdict：ready 能接入 / no-auth 装了没登录 / broken 起不来 / missing 没装
+    保留本函数的返回形状（agents / recommended / deep / note），
+    是为了让 /api/agents 与界面上的探测面板继续工作，前端不必重写。
     """
-    out = []
-    pia = HOME / ".pi/agent"
-
-    # ── pi agent ──
-    pi = _which("pi")
-    prov, mdl = _pi_settings_defaults()
-    stale = _pi_stale_locks()
-    item = {"id": "pi", "name": "pi agent", "available": bool(pi), "path": pi,
-            "version": _ver(pi) if pi else "", "mode": "RPC · JSONL 双向", "tested": True,
-            "hint": "npm i -g @earendil-works/pi-coding-agent",
-            "authed": _file_ok(pia / "auth.json") or _file_ok(pia / "provider-keys.json"),
-            "default_provider": prov or "（pi 内置默认）",
-            "default_model": mdl or "（pi 内置默认）",
-            "auth_note": "~/.pi/agent/auth.json 或 provider-keys.json"}
-    # 崩溃残留的锁目录：**这不只是提示，是 pi 起不来的头号真因**，必须显式报出来
-    if stale:
-        item["stale_locks"] = [p.name for p in stale]
-        item["fix"] = (f"检测到 {len(stale)} 个崩溃残留的锁目录（{', '.join(p.name for p in stale)}）；"
-                       "打开 AI 会话时会自动移入 ~/.quarantine-pi-locks/ 修复，也可手删。"
-                       "残留锁会让 pi 读不到 settings.json，"
-                       "进而静默回退默认 provider 并报『No API key found』。")
-        item["authed"] = False        # 有残留锁时不能谎报 ready
-    if pi and deep:
-        # 深探测前先自愈（否则锁残留必然误判成 broken）
-        heal = pi_heal_locks()
-        if heal.get("moved"):
-            item["healed"] = heal["moved"]
-            item["stale_locks"] = []   # 已修好 → 清掉「待修复」标记，免得界面还催你修
-        ok, why = _rpc_startable(pi, ["--mode", "rpc", "--no-session"])
-        item["deep"] = {"ok": ok, "detail": "RPC 进程启动正常（未发 prompt）" if ok else why}
-        if ok:
-            aok, anote = _pi_auth_ready(prov)
-            item["authed"] = aok
-            item["auth_note"] = anote
-    out.append(item)
-
-    # ── 直连 API Key（自实现 agent loop，复用 netdev_mcp 工具与护栏）──
+    cfg = _direct_cfg()
     d_ok, d_note = _direct_cfg_state()
     keys = [k for k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY",
                         "GEMINI_API_KEY", "OPENROUTER_API_KEY") if os.environ.get(k)]
-    out.append({"id": "direct", "name": "直连 API Key", "available": d_ok, "path": None,
-                "version": "", "mode": "自实现 agent loop（直连 OpenAI 兼容 API）",
-                "tested": False, "env_keys": keys, "authed": d_ok,
-                "auth_note": d_note,
-                "hint": "设 NETDEV_DIRECT_API_KEY + NETDEV_DIRECT_BASE_URL，"
-                        "或写 config/direct.json"})
-
-    # ── WorkBuddy agent（桌面版自带 codebuddy CLI，2026-09-29 加）──
-    wbb = _wb_bin()
-    wb_ok, wb_note = _wb_token_state()
-    item = {"id": "wb", "name": "WorkBuddy agent", "available": bool(wbb), "path": wbb,
-            "version": _ver(wbb) if wbb else "",
-            "mode": "headless · -p --output-format stream-json", "tested": False,
-            "hint": "随 WorkBuddy 桌面版安装；走 custom-token 免登录直连，无需 /login",
-            "authed": wb_ok, "auth_note": wb_note}
-    if wbb and deep:
-        ok, why = _wb_deep_probe(wbb)
+    item = {"id": "direct", "name": "直连 API", "available": d_ok, "path": None,
+            "version": "", "mode": "自实现 agent loop（直连 OpenAI 兼容 API）",
+            "tested": True, "env_keys": keys, "authed": d_ok, "auth_note": d_note,
+            "provider": cfg.get("provider") or "",
+            "base_url": cfg.get("base_url") or "",
+            "model": cfg.get("model") or "",
+            "hint": "在界面 ⚙ 设置里粘贴 API Key；或设 NETDEV_DIRECT_API_KEY + "
+                    "NETDEV_DIRECT_BASE_URL；或写 config/direct.json"}
+    if deep and d_ok:
+        ok, why = _direct_probe()
         item["deep"] = {"ok": ok, "detail": why}
-    out.append(item)
 
-    # ── 判定 verdict ──
-    for a in out:
-        if not a["available"]:
-            a["verdict"] = "missing"
-        elif a.get("authed"):
-            a["verdict"] = "ready"
-        else:
-            a["verdict"] = "no-auth"
-        if deep and a.get("deep") and not a["deep"].get("ok"):
-            a["verdict"] = "broken"
+    if not item["available"]:
+        item["verdict"] = "missing"
+    elif item.get("authed"):
+        item["verdict"] = "ready"
+    else:
+        item["verdict"] = "no-auth"
+    if deep and item.get("deep") and not item["deep"].get("ok"):
+        item["verdict"] = "broken"
 
-    rank = {"ready": 0, "no-auth": 1, "broken": 2, "missing": 3}
-    rec = ""
-    for a in sorted(out, key=lambda x: rank[x["verdict"]]):
-        if a["verdict"] == "ready":
-            rec = a["id"]
-            break
-    return {"agents": out, "recommended": rec, "deep": deep,
-            "note": "ready=能接入 / no-auth=装了但未见凭证 / broken=起不来 / missing=未安装；"
-                    "深探测不会发送任何 prompt，因此不消耗额度"}
+    return {"agents": [item],
+            "recommended": "direct" if item["verdict"] == "ready" else "",
+            "deep": deep,
+            "note": "ready=能接入 / no-auth=没配 Key / broken=连不通 / missing=未安装；"
+                    "深探测会真发一条最小 prompt（消耗极少量额度）"}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -772,28 +443,21 @@ SESS_LOCK = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  AI 会话：一个 pi RPC 子进程  ↔  一个浏览器 AI 面板
+#  AI 会话：一个直连会话  ↔  一个浏览器 AI 面板
 #    要点：
-#      · pi 以 --mode rpc 常驻，JSONL 双向（ stdin 发命令 / stdout 收事件）
-#      · dialog 类 UI 请求（select/confirm/input/editor）是阻塞的，
-#        只有界面里的人能回答 ⇒ 人机分离的审批通道，AI 答不了
-#      · 本轮不限制 pi 的工具集（有完整权限）—— 收紧需要 pi 扩展，见 README
+#      · 后端是**进程内**的 agent loop（DirectSession）—— 无子进程、无 RPC、
+#        无本机 CLI 依赖、无凭据锁；
+#      · 设备能力只来自 netdev_mcp 的 13 个工具，全部转调 netdev CLI ——
+#        黑名单 / 人审 / 先备份 / 逐条校验 / 同屏可见原样生效；
+#      · 网页审批通道（ASK_PENDING）仍由 netdev 的 approval 回调驱动。
 # ══════════════════════════════════════════════════════════════════════════
-PI_BIN = _which("pi")
 
-# 工具白名单（只作用于界面启动的那个 pi 子进程）——
-#   关键：netdev 的 MCP 工具在 pi 里是一个命名空间代理 `mcp__netdev`（参数 {tool,args}），
-#         不是 netdev_list 这种独立名字——写成独立名字会被当成不存在的工具全部过滤掉。
-#   read        : 只看不碰设备（最安全）
-#   read+netdev : 多给 mcp__netdev（写操作会走 netdev 自身的闸门/人审）
-#   full        : 不加限制（= 你终端里那个 pi 的完整能力，仅供对比）
-# 共通点：不给 bash / edit / write / nyaterm ⇒ AI 没有 shell，绕不过 netdev。
-_ND = "mcp__netdev"
-TOOLSETS = {
-    "read": "read,ls,grep,find",
-    "read+netdev": "read,ls,grep,find," + _ND,
-    "full": "",
-}
+# 工具权限档位（direct 后端）——
+#   read        : 不给任何工具，纯对话（最安全）
+#   read+netdev : 给 13 个 netdev 工具（写操作会走 netdev 自身的闸门 / 人审）
+#   full        : 同 read+netdev（保留档位名以兼容旧配置；direct 没有 shell 面）
+TOOLSETS = ("read", "read+netdev", "full")
+NETDEV_TOOLSETS = {"read+netdev", "full"}
 
 
 def self_win(sess) -> str:
@@ -856,8 +520,8 @@ def cleanup_term_sessions(dev: str = "", keep_sid: str = "") -> dict:
 #   为什么要这个：原来 AI 是"一个通用助手，恰好有 netdev 工具"——
 #   它不知道自己正在调试一台真实设备、不知道操作会显示在人眼前、
 #   不知道写操作要先说计划。用户反馈过"它自己就干完了""我看不到它在干什么"。
-#   这里用 --append-system-prompt 把"设备调试助手"的行为准则刻进人设。
-#   （选择 append 而不是 replace：保留 pi 原有的通用规范与安全约定）
+#   这里把"设备调试助手"的行为准则作为 system message 刻进人设
+#   （DirectSession._turn 里作为第一条 system 消息下发）。
 DEBUG_SYSTEM_PROMPT = """你是【网络设备调试助手】，正在协助一位网络工程师调试真实设备。
 
 关键前提（务必时刻记住）：
@@ -904,793 +568,39 @@ DEBUG_SYSTEM_PROMPT = """你是【网络设备调试助手】，正在协助一�
   判断设备现状的唯一依据是【刚刚查到的回显】，不是你的记忆。
 
 ★ 实时查询禁止翻留档（务必执行）：
-本机 logs/ 目录下有设备的【历史回显留档】（*.log 文件）。这些是"过去某个时刻
-抓到的快照"，不是"设备现在"的状态。因此：
+项目 logs/ 目录下有设备的【历史回显留档】（*.log 文件），那是"过去某个时刻抓到的
+快照"，不是"设备现在"的状态。因此：
 · 凡是问【现在】的时间、状态、配置、接口、路由、vlan、流量等，
   一律用 netdev_run 实时查设备（如 display clock / display current-configuration），
-  【禁止】用 Read/Glob/Grep 去翻 logs/ 下的留档来回答"现在是什么"。
-· Read/Glob/Grep 只允许用于：看你自己落盘的工具结果摘要、读项目文档/配置模板，
-  不允许用来代替"实时查设备"。
+  【不要】拿留档、也不要拿上文记忆来回答"现在是什么"。
+· 你手上【没有】任何文件读写工具 —— 设备数据的唯一合法来源就是 netdev_* 工具。
+  想引用"某份落盘结果"，只能用 netdev_screen_read / netdev_watch_tail 这类
+  设备通道工具，或请在座的工程师帮你贴出来。
 """
 
 
-class AiSession:
-    def __init__(self, aid: str, model: str = "", cwd: str | None = None, tools: str = "read+netdev"):
-        self.aid = aid
-        self.model = (model or "").strip()
-        self.tools_key = tools if tools in TOOLSETS else "read+netdev"
-        self.tools = TOOLSETS[self.tools_key]
-        self.cwd = cwd or str(ROOT)
-        self.proc: subprocess.Popen | None = None
-        self.subs: set[queue.Queue] = set()
-        self.lock = threading.Lock()
-        self.alive = False
-        self.last_active = time.time()
-        self.ready = threading.Event()      # 收到首个事件 = pi 已完成初始化
-        self.log: list[dict] = []          # 事件回放（新订阅者补发，限量）
-        self.stderr_tail = ""
-        self.heal: dict = {}               # 启动时的锁自愈结果（供界面显示）
-        self._last_prompt: str = ""        # 最近一次 prompt，锁自愈后要原样重发
-        self._retry_left: int = 0          # 自动重试次数上限（防死循环）
-
-    # ── 起进程 ──
-    def start(self) -> None:
-        if not PI_BIN:
-            raise RuntimeError("找不到 pi（npm i -g @earendil-works/pi-coding-agent）")
-        # ★ 开箱即用：先自愈崩溃残留的锁目录。
-        #   不清的话 pi 必然 `EEXIST: mkdir 'settings.json.lock'` → 读不到 settings.json
-        #   → 静默回退内置默认 provider → 报 "No API key found"（真因被藏起来）。
-        self.heal = pi_heal_locks(force=True)
-        cmd = [PI_BIN, "--mode", "rpc", "--no-session"]
-        if self.tools:                       # 白名单：只给这一子进程，不影响用户自己的 pi
-            cmd += ["--tools", self.tools]
-        # ★ 人设：把它变成"设备调试助手"，而不是通用助手（见上方 DEBUG_SYSTEM_PROMPT）
-        try:
-            cmd += ["--append-system-prompt", DEBUG_SYSTEM_PROMPT]
-        except Exception:
-            pass
-        if self.model:
-            cmd += ["--model", self.model]
-        else:
-            # ★ 显式把 pi settings.json 里的默认 provider/model 传下去。
-            #   不传的话，settings.json 一旦读取失败，pi 会静默用 google，
-            #   用户看到的是 "No API key found for the selected model"，完全指不到根因。
-            _prov, _mdl = _pi_settings_defaults()
-            if _mdl:
-                cmd += ["--model", (_prov + "/" + _mdl) if _prov else _mdl]
-        env = _env_with_node()
-        env.pop("PI_OFFLINE", None)
-        if UI_BASE:      # 把「网页审批通道」地址交给子进程（它拉起的 MCP 也会继承）
-            env["NETDEV_APPROVAL_URL"] = UI_BASE
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE,
-                                     text=True, bufsize=1, cwd=self.cwd, env=env)
-        self.alive = True
-        threading.Thread(target=self._reader, daemon=True).start()
-        threading.Thread(target=self._err_reader, daemon=True).start()
-
-    def _reader(self) -> None:
-        try:
-            for line in self.proc.stdout:               # 严格按 \n 分行
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    ev = {"type": "raw", "text": line[:400]}
-                self.ready.set()
-                with self.lock:
-                    self.log.append(ev)
-                    if len(self.log) > 600:
-                        del self.log[:200]
-                    for q in list(self.subs):
-                        try:
-                            q.put_nowait(ev)
-                        except queue.Full:
-                            pass
-            # ★ 2026-10-03：pi 崩溃残留锁的**自愈点前移到出错的那一刻**。
-            #   原来只在"开会话/探测"时清一次锁，可 pi 偏偏是**启动时**建锁、
-            #   崩溃时又不清理 —— 等下一轮自愈时，用户已经撞上错误了。
-            #   现在：读到 "file already exists: …*.lock" 就地清掉那个锁并重发一次。
-            if _pi_lock_error(ev):
-                name = _pi_lock_name_from_error(ev)
-                healed = _pi_heal_specific(name)
-                with self.lock:
-                    retry = self._retry_left > 0 and bool(self._last_prompt)
-                    if retry:
-                        self._retry_left -= 1
-                    else:
-                        retry = False
-                if healed and retry:
-                    self.prompt(self._last_prompt)
-        except Exception:
-            pass
-        self.alive = False
-        with self.lock:
-            for q in list(self.subs):
-                try:
-                    q.put_nowait(None)
-                except queue.Full:
-                    pass
-
-    def _err_reader(self) -> None:
-        try:
-            for line in self.proc.stderr:
-                self.stderr_tail = (self.stderr_tail + line)[-800:]
-        except Exception:
-            pass
-
-    # ── 发命令（stdin）──
-    def _write(self, obj: dict) -> bool:
-        if not (self.proc and self.proc.poll() is None):
-            return False
-        try:
-            self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
-            self.last_active = time.time()
-            return True
-        except Exception:
-            return False
-
-    def prompt(self, text: str) -> bool:
-        # ── 2026-10-03：进程已经死掉时的自愈与重发 ──
-        #   实测的真因链：pi 启动时会跑 `npm install`，网络不通就崩；
-        #   崩的时候 proper-lockfile 的空目录锁留着不清理 → 下次启动 EEXIST。
-        #   于是：开会话时清一次锁（新锁是 pi 起来之后才建的，清不到）→
-        #   pi 立刻又崩 → 用户打字时进程早就死了，prompt 静默失败 →
-        #   界面把**日志里的旧报错**重放出来，看起来像"又坏了"。
-        #   所以真正的自愈点是**发送时发现进程已死**：清锁 → 重起 → 重发。
-        if not (self.proc and self.proc.poll() is None):
-            healed = pi_heal_locks()
-            self.start()
-            self.ready.clear()
-            if not self.ready.wait(timeout=20):
-                return False
-            if not (self.proc and self.proc.poll() is None):
-                return False
-        # pi 冷启动要几秒（node + 配置 + MCP）；太早写 stdin 会被丢弃 ⇒ 等它就绪
-        self.ready.wait(timeout=15)
-        # 记下来：万一 pi 回一个「锁残留」的错误，reader 要能原样重发一次
-        self._last_prompt = text
-        self._retry_left = 1          # 每个会话最多自动重试 1 次，防死循环
-        return self._write({"type": "prompt", "message": text})
-
-    def abort(self) -> bool:
-        return self._write({"type": "abort"})
-
-    def compact(self, instructions: str = "") -> bool:
-        """手动压缩上下文（抗长对话污染 —— pi 会把旧消息压成结构化摘要）。"""
-        msg = {"type": "compact"}
-        if instructions:
-            msg["customInstructions"] = instructions
-        return self._write(msg)
-
-    def stats(self) -> bool:
-        """问 pi 当前会话的 token 用量。"""
-        return self._write({"type": "get_session_stats"})
-
-    def respond_ui(self, req_id: str, value=None, cancelled: bool = False) -> bool:
-        """回应 dialog 类 UI 请求（审批通道）。"""
-        msg = {"type": "extension_ui_response", "id": req_id}
-        if cancelled:
-            msg["cancelled"] = True
-        else:
-            msg["value"] = value
-        return self._write(msg)
-
-    def subscribe(self):
-        q: queue.Queue = queue.Queue(maxsize=3000)
-        self.last_active = time.time()
-        with self.lock:
-            self.subs.add(q)
-            replay = list(self.log[-120:])
-        return q, replay
-
-    def unsubscribe(self, q) -> None:
-        with self.lock:
-            self.subs.discard(q)
-
-    def close(self) -> None:
-        self.alive = False
-        # 先把这个 client 从 tmux 摘掉（不然它会以"最小尺寸"拖着窗格）
-        try:
-            if self.master is not None:
-                tty = os.ttyname(self.master)
-                subprocess.run([TMUX, "detach-client", "-t", tty],
-                               capture_output=True, timeout=6)
-        except Exception:
-            pass
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
-            try:
-                self.proc.wait(timeout=3)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-
-
-AI_SESSIONS: dict[str, AiSession] = {}
+AI_SESSIONS: dict = {}
 AI_LOCK = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  WorkBuddy agent 后端（2026-09-29 加；同日二次修订：打通免登录直连）
-#    形态：WorkBuddy 桌面版自带的 codebuddy CLI，headless 调用
-#         （-p --output-format stream-json），每轮一个短进程，
-#         用 --session-id / --resume 维持多轮上下文。
+#  Direct 后端 —— 自实现 agent loop，直连 OpenAI 兼容 API（唯一后端）
 #
-#  ── 六个硬坑（均本机实测，不写在这里必再踩）────────────────────────────
-#   ① CLI 启动时要绑一个内部服务端口，缺省读共享配置 cell.server.port
-#      （本机 = 54805，被 WorkBuddy 桌面 App 的引擎长期占用）。
-#      冲突时【静默挂死】：无任何输出、无退出，连 `codebuddy ps` 也挂。
-#      解法：必须用 SERVER__PORT 环境变量指定一个空闲端口。
-#   ② CLI 的交互式 TUI 在桌面版里被裁掉了 —— dist/ 只有
-#      codebuddy-lite-wb.mjs 与 codebuddy-headless.js，没有 dist/codebuddy。
-#      所以【终端里根本没有 /login 这条命令可用】，别再让人去终端登录。
-#   ③ 桌面 App 写出的 auth/workbuddy-desktop.info 里 accessToken 是
-#      $wbEncrypted 信封；而独立启动的 CLI 走 standalone 凭据保护模式，
-#      【解不开】⇒ 永远报 "Authentication required"。解密钥匙由宿主进程
-#      经 CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET 反向推给子进程，
-#      第三方 UI 拿不到，也不再尝试。
-#   ④ ★正解：走 CLI 内置的 custom-token 通道
-#      （CustomTokenAuthenticationStorage，优先级最高，无信封、无钥匙串）：
-#        CODEBUDDY_AUTH_TOKEN      = <裸 JWT>
-#        ACC_PRODUCT_CONFIG_PATH   = <产品配置副本，authentication.type=custom-token>
-#      实测 `apiKeySource` 正常、stream-json 正常出结果、netdev 工具可调。
-#   ⑤ --tools 是【全局白名单】，会把 MCP 工具一起掐掉（netdev 直接不可见）。
-#      要保留 netdev MCP，必须改用 --disallowedTools —— 它是硬移除，
-#      被拉黑的工具从模型的工具目录里彻底消失（实测连 ToolSearch 都搜不到）。
-#   ⑤b ★ --disallowedTools 【不按逗号拆分】：传 "Bash,Write,Edit" 这种逗号串
-#      会被当成【一个】工具名，整条限制静默失效（实测模型照样看得到 Bash）。
-#      必须每个工具名各占一个 argv 元素（见 WB_DENY_LIST 与 _wb_argv 的 *展开）。
-#      这个坑极隐蔽：不实测根本发现不了，因为它不报错、只是不生效。
-#   ⑤c 不传 --mcp-config 时，CLI 会把机器上【其它】MCP 配置也读进来
-#      （实测会冒出 mcp__sheetagent__* / mcp__weixinpay__* 等）。
-#      所以无论哪个档位都要显式传 --mcp-config + --strict-mcp-config；
-#      read 档位传一个空 mcpServers，把 MCP 面彻底关干净。
-#   ⑥ MCP 工具默认 defer_loading=true，要经 DeferExecuteTool 调用，而后者
-#      在非交互模式下需审批 ⇒ 必被拒。解法：mcp 配置里 defer_loading=false
-#      （server 级 + tool 级都要写，见 _wb_mcp_file）。
-#
-#    安全边界（对齐 pi 的 read+netdev 白名单）：
-#    · --disallowedTools 硬移除一切非只读内建工具（含 Bash/Write/Edit/Agent/
-#      WebFetch/Skill/ToolSearch…），只留 Read/Glob/Grep ⇒ AI 没有 shell，
-#      绕不过 netdev；
-#    · 设备能力只经 --mcp-config + --strict-mcp-config 注入 netdev 一个 MCP，
-#      它最终仍转调 netdev CLI —— 黑名单 / 人审 / 备份等护栏原样生效。
-#
-#    凭据来源（三级优先，见 _wb_token）：
-#      NETDEV_WB_TOKEN 环境变量  >  config/workbuddy.token 文件  >  自动匹配
-#      （读 ~/.wb-switch/accounts.json，取 uid 与桌面 App 当前登录账号一致那条）
-# ══════════════════════════════════════════════════════════════════════════
-WB_APP_CLI = ("/Applications/WorkBuddy.app/Contents/Resources"
-              "/app.asar.unpacked/cli/bin/codebuddy")
-WB_PRODUCT_BASE = ("/Applications/WorkBuddy.app/Contents/Resources"
-                   "/app.asar.unpacked/cli/product.json")
-WB_AUTH_INFO = ("Library/Application Support/CodeBuddyExtension"
-                "/Data/Public/auth/workbuddy-desktop.info")
-WB_ACCOUNTS = ".wb-switch/accounts.json"
-WB_ENDPOINT = "https://www.workbuddy.cn"
-
-WB_READONLY_TOOLS = ("Read", "Glob", "Grep")   # 只读内建工具（对标 pi 的 read）
-# 内建工具全集（取自 CLI init 事件的 tools 字段，2026-09-29 实测）
-WB_BUILTIN_CATALOG = (
-    "Agent", "Write", "Edit", "Bash", "PowerShell", "NotebookEdit",
-    "EnterPlanMode", "ExitPlanMode",
-    "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TaskStop", "TaskOutput",
-    "WebFetch", "WebSearch", "Skill", "AskUserQuestion", "StructuredOutput",
-    "ToolSearch", "DeferExecuteTool", "SendMessage", "TeamCreate", "TeamDelete",
-    "ImageGen", "VideoGen", "WeChatReply", "WeComReply",
-    "ListMcpResources", "ReadMcpResource", "MessageColleague", "SpeakInChannel",
-)
-# ★ 坑⑤⑤b：只读工具之外全部硬移除，且【必须是 list】—— 逗号串会被当单个名字
-WB_DENY_LIST = [t for t in WB_BUILTIN_CATALOG if t not in WB_READONLY_TOOLS]
-WB_TOOLSETS = {                                # 键与 TOOLSETS 对齐
-    "read": "none",                            # 只给只读内建，不挂 MCP
-    "read+netdev": "netdev",                   # 只读内建 + netdev MCP（默认）
-    "full": "none",                            # 不再提供"放开内建工具"的档位
-}
-# netdev MCP 的 13 个工具名（用于逐个关掉延迟加载，见坑⑥）
-WB_ND_TOOLS = (
-    "netdev_apply", "netdev_backup", "netdev_connect_info", "netdev_diff",
-    "netdev_list", "netdev_ping", "netdev_run", "netdev_save",
-    "netdev_screen_list", "netdev_screen_read", "netdev_screen_send",
-    "netdev_serial_run", "netdev_watch_tail",
-)
-
-
-def _wb_bin() -> str:
-    """找 WorkBuddy 的 codebuddy CLI：环境变量 > 桌面 App 内置 > PATH。"""
-    cands = [os.environ.get("NETDEV_WB_BIN") or "", WB_APP_CLI]
-    cands += [shutil.which(n) or "" for n in ("cbc", "codebuddy")]
-    for c in cands:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return ""
-
-
-def _wb_free_port() -> int:
-    """拿一个当前空闲的本地端口（给 CLI 内部服务绑，见坑①）。"""
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-# ── 凭据：三级优先取裸 JWT（见坑③④）────────────────────────────────────
-def _wb_desktop_uid() -> str:
-    """桌面 App 当前登录账号的 uid。
-
-    注意：`account.uid` 不在 CLI 的 AUTH_CREDENTIAL_FIELDS 里 ⇒ 是明文，
-    可以直接读，不需要解任何 $wbEncrypted 信封。
-    """
-    try:
-        d = json.loads((HOME / WB_AUTH_INFO).read_text(encoding="utf-8"))
-        return str(((d.get("account") or {}).get("uid")) or "")
-    except Exception:
-        return ""
-
-
-def _wb_token() -> tuple[str, str]:
-    """取裸 JWT，返回 (token, 来源说明)。"""
-    t = (os.environ.get("NETDEV_WB_TOKEN") or "").strip()
-    if t:
-        return t, "环境变量 NETDEV_WB_TOKEN"
-    f = ROOT / "config" / "workbuddy.token"
-    try:
-        t = f.read_text(encoding="utf-8").strip()
-        if t:
-            return t, f"文件 {f}"
-    except Exception:
-        pass
-    try:
-        acts = json.loads((HOME / WB_ACCOUNTS).read_text(encoding="utf-8"))
-        if isinstance(acts, dict):              # 兼容 {"accounts":[...]} 形态
-            acts = acts.get("accounts") or []
-        if not isinstance(acts, list):
-            return "", ""
-        uid = _wb_desktop_uid()
-        pick = next((a for a in acts
-                     if a.get("access_token") and uid and str(a.get("uid") or "") == uid), None)
-        src = f"与桌面 App 同账号 {uid[:8]}…"
-        if not pick:
-            pick = next((a for a in acts if a.get("access_token")), None)
-            src = "账号库首条（未匹配上桌面账号）"
-        if pick:
-            return str(pick["access_token"]).strip(), f"{WB_ACCOUNTS} · {src}"
-    except Exception:
-        pass
-    return "", ""
-
-
-def _wb_jwt_exp(tok: str) -> int:
-    """从 JWT 里读 exp（只解码不验签，用于提示是否过期）。"""
-    try:
-        import base64
-        p = tok.split(".")[1]
-        p += "=" * (-len(p) % 4)
-        return int(json.loads(base64.urlsafe_b64decode(p)).get("exp") or 0)
-    except Exception:
-        return 0
-
-
-def _wb_token_state() -> tuple[bool, str]:
-    """凭据可用性 + 人话说明（给界面看）。"""
-    tok, src = _wb_token()
-    if not tok:
-        return False, ("拿不到 WorkBuddy 凭据：请先让桌面版登录，"
-                       f"或把裸 token 写到 {ROOT / 'config' / 'workbuddy.token'}")
-    exp = _wb_jwt_exp(tok)
-    if exp:
-        import datetime
-        d = datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d")
-        if exp < time.time():
-            return False, f"凭据已于 {d} 过期（来源：{src}）—— 重新登录桌面版即可刷新"
-        return True, f"凭据有效至 {d}（来源：{src}）"
-    return True, f"已注入凭据（来源：{src}）"
-
-
-def _wb_product_cfg(tok: str) -> pathlib.Path:
-    """生成 custom-token 形态的产品配置（★ 坑④）。
-
-    基底用 App 内稳定路径的 product.json（不依赖 /var/folders 里会消失的 spill）。
-    authentication.id 特意改成 netdev-wb ⇒ 对应 auth/netdev-wb.info，
-    绝不碰桌面端自己的 workbuddy-desktop.info。
-    """
-    p = ROOT / "config" / "workbuddy-product.json"
-    try:
-        if p.is_file() and (time.time() - p.stat().st_mtime) < 60:
-            return p                          # 一分钟内已生成过，避免每轮重写
-        cfg = json.loads(pathlib.Path(WB_PRODUCT_BASE).read_text(encoding="utf-8"))
-        cfg["authentication"] = {
-            "id": "netdev-wb",
-            "type": "custom-token",
-            "label": "WorkBuddy custom token",
-            "attributes": {"token": tok},
-        }
-        cfg["endpoint"] = WB_ENDPOINT
-        p.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-        try:
-            os.chmod(p, 0o600)                # 里面含 token，收紧权限
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return p
-
-
-def _wb_mcp_file(use_netdev: bool = True) -> pathlib.Path:
-    """--mcp-config 用的文件（★ 坑⑥ + 坑⑤c）。
-
-    use_netdev=True  → 只注入 netdev，并关掉延迟加载；
-    use_netdev=False → 写成空 mcpServers，配合 --strict-mcp-config
-                       把环境里其它 MCP 一并挡掉。
-    """
-    # 两个档位必须用不同文件：argv 是「按轮现拼」的，共用一个路径会被并发会话互相覆盖
-    p = ROOT / "config" / ("codebuddy-mcp.json" if use_netdev else "codebuddy-mcp-empty.json")
-    servers: dict = {}
-    if use_netdev:
-        servers["netdev"] = {
-            "command": str(ROOT / "netdev-mcp"),
-            "defer_loading": False,
-            # ★ 显式带上网页审批地址：codebuddy 拉 MCP 子进程时可能不继承
-            #   全部环境（与 pi 同理），审批会静默回退到 macOS 原生弹窗。
-            "env": {"NETDEV_APPROVAL_URL": UI_BASE or "http://127.0.0.1:8898"},
-            "tools": {t: {"defer_loading": False} for t in WB_ND_TOOLS},
-        }
-    try:
-        p.write_text(json.dumps({"mcpServers": servers},
-                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except Exception:
-        pass
-    return p
-
-
-# 从 UI 进程继承下来会把 CLI 带偏的变量前缀
-# （实测最要命的是 SERVER__PORT=54805，直接静默挂死）
-_WB_SCRUB = ("CODEBUDDY", "WORKBUDDY", "ACC_PRODUCT", "SERVER__")
-
-
-def _wb_env() -> dict:
-    """给 CLI 一个【干净】环境。
-
-    UI 服务器本身可能是从某个 WorkBuddy 会话里拉起来的，env 里带着一整套
-    宿主变量（SERVER__PORT / CODEBUDDY_MCP_CONFIG / ACC_PRODUCT_CONFIG_PATH
-    / CODEBUDDY_CREDENTIALS_IN_MEMORY …），不清掉一定会互相打架。
-    """
-    env = {k: v for k, v in os.environ.items()
-           if not k.upper().startswith(_WB_SCRUB)}
-    env["PATH"] = ":".join([str(HOME / ".npm-global/bin"), "/usr/local/bin",
-                            "/opt/homebrew/bin", env.get("PATH", "/usr/bin:/bin")])
-    env["SERVER__PORT"] = str(_wb_free_port())       # ★ 坑①：不设必挂
-    env["SERVER__HOST"] = "127.0.0.1"
-    env.setdefault("CODEBUDDY_DISABLE_IDE", "1")
-    env.setdefault("CODEBUDDY_DISABLE_CRON", "1")
-    # 关掉 CLI 的自动记忆：它默认会想往 ~/.codebuddy/projects/*/memory 落盘，
-    # 而 Write 已被拉黑 ⇒ 白烧轮次（实测浪费一整轮）。
-    env.setdefault("CODEBUDDY_DISABLE_AUTO_MEMORY", "1")
-    tok, _src = _wb_token()
-    if tok:                                          # ★ 坑④：custom-token 通道
-        env["CODEBUDDY_AUTH_TOKEN"] = tok
-        env["ACC_PRODUCT_CONFIG_PATH"] = str(_wb_product_cfg(tok))
-    if UI_BASE:      # netdev 的网页审批通道跟着 MCP 一起继承下去
-        env["NETDEV_APPROVAL_URL"] = UI_BASE
-    return env
-
-
-def _wb_argv(tools_key: str, model: str, session_id: str, fresh: bool) -> list:
-    """拼一轮 headless 调用的 argv。fresh=True 新会话，否则 resume。
-
-    两个反直觉点，都踩过：
-    · 这里【不能】用 --tools 去限制内建工具，否则 MCP 工具会被一起掐掉（★ 坑⑤）；
-      改用 --disallowedTools，且每个工具名必须是独立 argv 元素（★ 坑⑤b）。
-    · 每个档位都要显式传 --mcp-config + --strict-mcp-config，
-      否则机器上其它 MCP 会被读进来（★ 坑⑤c）。
-    """
-    use_nd = WB_TOOLSETS.get(tools_key, "netdev") == "netdev"
-    argv = [_wb_bin(), "-p", "--output-format", "stream-json"]
-    argv += ["--session-id" if fresh else "--resume", session_id]
-    argv += ["--disallowedTools", *WB_DENY_LIST]          # ★ 展开，不能逗号串
-    argv += ["--mcp-config", str(_wb_mcp_file(use_nd)), "--strict-mcp-config"]
-    argv += ["--append-system-prompt", DEBUG_SYSTEM_PROMPT]
-    if model:
-        argv += ["--model", model]
-    return argv
-
-
-def _wb_authed() -> bool:
-    """是否拿到可用凭据（不消耗额度）。"""
-    return _wb_token_state()[0]
-
-
-def _wb_deep_probe(cmd: str) -> tuple[bool, str]:
-    """深探测：真跑一轮最小 prompt（会消耗极少量额度）。"""
-    try:
-        r = subprocess.run(
-            [cmd, "-p", "--max-turns", "1", "--output-format", "stream-json",
-             "--disallowedTools", *WB_DENY_LIST,
-             "--mcp-config", str(_wb_mcp_file(False)), "--strict-mcp-config",
-             "连接测试：只回复两个字：在线"],
-            capture_output=True, text=True, timeout=120,
-            env=_wb_env(), cwd=str(ROOT), input="")
-        txt = (r.stdout or "") + (r.stderr or "")
-        for ln in txt.splitlines():
-            ln = ln.strip()
-            if not ln.startswith("{"):
-                continue
-            try:
-                ev = json.loads(ln)
-            except Exception:
-                continue
-            if ev.get("type") == "result":
-                if ev.get("is_error"):
-                    return False, str(ev.get("result") or ev.get("subtype") or "未知错误")[:160]
-                return True, "headless 直连正常（custom-token 已生效）"
-        blob = txt.strip()
-        if "Authentication" in blob:
-            return False, "凭据被拒：token 可能已失效，重新登录桌面版后重试"
-        if "EADDRINUSE" in blob:
-            return False, "端口被占（SERVER__PORT 没生效？）"
-        tail = [x for x in blob.splitlines() if x.strip()]
-        return False, (tail[-1] if tail else "无任何输出（可能网络受限）")[:140]
-    except subprocess.TimeoutExpired:
-        return False, "120 秒无响应（可能网络受限或代理拦截）"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-class WbSession:
-    """WorkBuddy agent 会话：headless 每轮短进程 + session 复用。
-
-    对外接口与 AiSession 一致（prompt/abort/subscribe/close/...）；
-    codebuddy 的 stream-json 事件在这里翻译成前端已认识的 pi 形状
-    （message_start / message_update / toolcall_start / tool_execution_end /
-    agent_end / error）—— 前端零改动即可渲染。
-    """
-
-    def __init__(self, aid: str, model: str = "", cwd: str | None = None,
-                 tools: str = "read+netdev"):
-        self.aid = aid
-        self.model = (model or "").strip()
-        self.tools_key = tools if tools in TOOLSETS else "read+netdev"
-        self.cwd = cwd or str(ROOT)
-        self.proc: subprocess.Popen | None = None
-        self.subs: set[queue.Queue] = set()
-        self.lock = threading.Lock()
-        self.alive = True
-        self.last_active = time.time()
-        self.ready = threading.Event()
-        self.ready.set()                     # 每轮按需拉起，无需预热
-        self.log: list[dict] = []            # 事件回放（新订阅者补发，限量）
-        self.stderr_tail = ""
-        self.cbc_sid = ""                    # codebuddy 会话 id
-        self.cbc_ready = False               # 上一轮是否完整落袋（决定 resume 还是新开）
-        self._last_tool = "tool"
-        self._turn_text = ""                 # 本轮已输出的正文（用于识别登录类报错）
-
-    # ── 事件出口（扇出 + 回放，与 AiSession 一致）──
-    def _emit(self, ev: dict) -> None:
-        with self.lock:
-            self.log.append(ev)
-            if len(self.log) > 600:
-                del self.log[:200]
-            for q in list(self.subs):
-                try:
-                    q.put_nowait(ev)
-                except queue.Full:
-                    pass
-
-    def _emit_text(self, text: str) -> None:
-        if not (text or "").strip():
-            return
-        self._turn_text += text
-        self._emit({"type": "message_start"})
-        self._emit({"type": "message_update",
-                    "assistantMessageEvent": {"type": "text_delta", "delta": text}})
-        self._emit({"type": "message_end"})
-
-    # ── 对外接口 ──
-    def prompt(self, text: str) -> bool:
-        if not self.alive:
-            return False
-        # 上一轮还挂着 → 视为隐式中止后重开（界面 busy 时发不了，这里是兜底）
-        self.abort()
-        threading.Thread(target=self._turn, args=(text,), daemon=True).start()
-        self.last_active = time.time()
-        return True
-
-    def abort(self) -> bool:
-        p = self.proc
-        if p and p.poll() is None:
-            try:
-                p.terminate()
-                return True
-            except Exception:
-                return False
-        return False
-
-    def compact(self, instructions: str = "") -> bool:
-        return False                     # 该后端暂不支持（前端会原样提示）
-
-    def stats(self) -> bool:
-        return False
-
-    def respond_ui(self, req_id: str, value=None, cancelled: bool = False) -> bool:
-        return False                     # codebuddy headless 无 dialog 通道
-
-    def subscribe(self):
-        q: queue.Queue = queue.Queue(maxsize=3000)
-        self.last_active = time.time()
-        with self.lock:
-            self.subs.add(q)
-            replay = list(self.log[-120:])
-        return q, replay
-
-    def unsubscribe(self, q) -> None:
-        with self.lock:
-            self.subs.discard(q)
-
-    def close(self) -> None:
-        self.alive = False
-        self.abort()
-        with self.lock:
-            for q in list(self.subs):
-                try:
-                    q.put_nowait(None)
-                except queue.Full:
-                    pass
-
-    # ── 一轮对话 ──
-    def _turn(self, text: str) -> None:
-        self._turn_text = ""
-        fresh = (not self.cbc_sid) or (not self.cbc_ready)
-        if fresh:
-            self.cbc_sid = secrets.token_hex(16)
-            self.cbc_ready = False
-        argv = _wb_argv(self.tools_key, self.model, self.cbc_sid, fresh)
-        try:
-            self.proc = subprocess.Popen(
-                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, bufsize=1,
-                cwd=self.cwd, env=_wb_env())
-        except Exception as e:
-            self._emit({"type": "error",
-                        "error": f"WorkBuddy CLI 启动失败：{type(e).__name__}: {e}"})
-            self._emit({"type": "agent_end"})
-            self.proc = None
-            return
-        try:
-            self.proc.stdin.write(text)
-            self.proc.stdin.close()
-        except Exception:
-            pass
-
-        saw_activity = False
-        raw_tail: list[str] = []
-        try:
-            for line in self.proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    raw_tail.append(line[:200])
-                    raw_tail[:] = raw_tail[-4:]
-                    continue
-                if self._translate(ev):
-                    saw_activity = True
-        except Exception as e:
-            self._emit({"type": "error",
-                        "error": f"WorkBuddy 事件流中断：{type(e).__name__}: {e}"})
-        finally:
-            try:
-                if self.proc and self.proc.poll() is None:
-                    self.proc.wait(timeout=10)
-            except Exception:
-                pass
-            try:
-                if self.proc:
-                    self.stderr_tail = (self.stderr_tail
-                                        + (self.proc.stderr.read() or ""))[-800:]
-            except Exception:
-                pass
-            if not saw_activity:
-                blob = "".join(raw_tail) + (self.stderr_tail or "")
-                if "Authentication" in blob:
-                    self._emit({"type": "error", "error":
-                                "WorkBuddy 凭据被拒 —— 走的是 custom-token 通道，"
-                                "token 可能已过期。重新登录桌面版即可刷新；"
-                                f"也可手写 {ROOT / 'config' / 'workbuddy.token'} 覆盖"})
-                elif blob.strip():
-                    self._emit({"type": "error", "error":
-                                "WorkBuddy 无有效输出：" + blob.strip()[:220]})
-                else:
-                    self._emit({"type": "error", "error":
-                                "WorkBuddy 无任何输出（可点设置里的「检测可接入的后端」排查）"})
-            self._emit({"type": "agent_end"})
-            self.last_active = time.time()
-            self.proc = None
-
-    def _translate(self, ev: dict) -> bool:
-        """codebuddy stream-json → 前端的 pi 形状事件。返回是否为有效活动。"""
-        t = ev.get("type", "")
-        if t == "assistant":
-            blocks = (ev.get("message") or {}).get("content") or []
-            if isinstance(blocks, str):
-                blocks = [{"type": "text", "text": blocks}]
-            for b in blocks:
-                if not isinstance(b, dict):
-                    continue
-                bt = b.get("type", "")
-                if bt == "text" and b.get("text"):
-                    self._emit_text(b["text"])
-                elif bt == "thinking" and b.get("thinking"):
-                    self._emit({"type": "message_update",
-                                "assistantMessageEvent": {
-                                    "type": "thinking_delta",
-                                    "delta": b["thinking"]}})
-                elif bt == "tool_use":
-                    self._last_tool = b.get("name") or "tool"
-                    self._emit({"type": "toolcall_start",
-                                "toolName": self._last_tool,
-                                "args": b.get("input") or {}})
-            return True
-        if t == "user":
-            blocks = (ev.get("message") or {}).get("content") or []
-            if isinstance(blocks, dict):
-                blocks = [blocks]
-            for b in blocks:
-                if isinstance(b, dict) and b.get("type") == "tool_result":
-                    self._emit({"type": "tool_execution_end",
-                                "toolName": self._last_tool,
-                                "isError": bool(b.get("is_error"))})
-            return True
-        if t == "result":
-            sid = ev.get("session_id")
-            if sid:
-                self.cbc_sid = str(sid)
-                self.cbc_ready = True
-            if ev.get("subtype") not in ("success", "success_during_malformed"):
-                msg = str(ev.get("error") or ev.get("result") or "")
-                blob = msg + self._turn_text + (self.stderr_tail or "")
-                if "Authentication" in blob:
-                    self._emit({"type": "error", "error":
-                                "WorkBuddy 凭据被拒 —— custom-token 已失效，"
-                                "重新登录桌面版刷新；或写 "
-                                f"{ROOT / 'config' / 'workbuddy.token'} 覆盖"})
-                else:
-                    self._emit({"type": "error", "error":
-                                (msg or "WorkBuddy 本轮未正常完成")[:400]})
-            return True
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Direct 后端（2026-09-30 加）—— 自实现 agent loop，直连 OpenAI 兼容 API
-#
-#  为什么要有它：pi / WorkBuddy 都依赖本机装某个 CLI（pi 要 npm 装、
-#  wb 要桌面版内置 codebuddy），新机器上还要折腾认证。direct 只需要一把
-#  API Key（环境变量或一个配置文件），一个标准库 HTTP 客户端直连
-#  DeepSeek / OpenAI / 任意 OpenAI 兼容网关 —— 零新依赖、零常驻进程。
+#  为什么是它：pi / WorkBuddy 那两条「借别人 CLI 当引擎」的路都要求本机先装
+#  一个与 netdev 无关的 CLI，各自带着一整套额外故障面（凭据锁、内部服务端口、
+#  宿主注入的 shim、认证信封…），2026-10-03 已整体拆除。
+#  direct 只需要一把 API Key（环境变量或一个配置文件），一个标准库 HTTP 客户端
+#  直连 DeepSeek / OpenAI / 任意 OpenAI 兼容网关 —— 零新依赖、零常驻进程。
 #
 #  护栏唯一性（最重要的一条设计约束）：
 #     direct **不重新实现任何设备操作**。它 import netdev_mcp，复用
 #     netdev_mcp.HANDLERS（13 个工具函数）+ netdev_mcp.envelope（身份信封）。
 #     那些 t_* 函数最终全部转调 netdev CLI —— 黑名单 / 人审 / 先备份 /
-#     逐条校验 / 同屏可见，一行不重写，与 pi、wb 走的是同一条护栏路径。
+#     逐条校验 / 同屏可见，一行不重写。
 #
-#  事件契约：与 AiSession / WbSession 完全一致
+#  事件契约（前端 onAiEvent 渲染的唯一形状）：
 #     message_start / message_update / toolcall_start / tool_execution_end /
-#     agent_end / error —— 前端 onAiEvent 零改动即可渲染。
+#     agent_end / error
 # ══════════════════════════════════════════════════════════════════════════
 
 # ── 凭据与端点：provider 表 + 三级优先取 key ─────────────────────────────
@@ -1728,7 +638,8 @@ def _direct_cfg() -> dict:
       1. 环境变量（NETDEV_DIRECT_PROVIDER / NETDEV_DIRECT_BASE_URL /
          NETDEV_DIRECT_API_KEY / NETDEV_DIRECT_MODEL，或各 provider 自己的 *_API_KEY）
       2. config/direct.json（形如 {"provider":"deepseek","api_key":"...","base_url":"...","model":"..."}）
-      3. 探测：本机已装的 pi / wb 的凭据（deepseek 兜底）
+         —— 也就是界面 ⚙ 设置里「保存并启用」写下的那份
+      3. provider 表里该 provider 自己的默认 base_url / model
     """
     provider = (os.environ.get("NETDEV_DIRECT_PROVIDER") or "").strip().lower()
     base_url = (os.environ.get("NETDEV_DIRECT_BASE_URL") or "").strip()
@@ -1815,7 +726,7 @@ def _direct_models() -> list[str]:
 def _direct_probe() -> tuple[bool, str]:
     """深探测：真发一条最小 prompt（非流式，消耗极少额度），量延迟。
 
-    对标 _wb_deep_probe —— 界面上点「测试连通」就是它。
+    界面上点「测试连通」就是它。
     """
     cfg = _direct_cfg()
     if not cfg["ok"]:
@@ -1858,7 +769,9 @@ def _direct_tool_schema() -> list[dict]:
 class DirectSession:
     """Direct 会话：裸 agent loop，直连 OpenAI 兼容端点。
 
-    对外接口与 AiSession / WbSession 一致（prompt/abort/subscribe/close/...）。
+    对外接口（prompt / abort / compact / stats / subscribe / close）与前端
+    事件契约（message_start / message_update / toolcall_start /
+    tool_execution_end / agent_end / error）是这个项目的**唯一** AI 契约。
     多轮上下文保存在 self.messages 里（本进程内存，不落盘）。
     """
 
@@ -1872,7 +785,7 @@ class DirectSession:
         self.model = (model or cfg.get("model") or "").strip()
         self.tools_key = tools if tools in TOOLSETS else "read+netdev"
         # read 档位：不挂任何工具（只对话）；read+netdev / full 才给 netdev 工具
-        self.use_netdev = self.tools_key in ("read+netdev", "full")
+        self.use_netdev = self.tools_key in NETDEV_TOOLSETS
         self.cwd = cwd or str(ROOT)
         self.subs: set[queue.Queue] = set()
         self.lock = threading.Lock()
@@ -1886,7 +799,7 @@ class DirectSession:
         self._in_msg = False                 # 当前是否开着 message_start（一段回复一个气泡）
         self._tool_schemas = _direct_tool_schema() if self.use_netdev else []
 
-    # ── 事件出口（与 AiSession / WbSession 一致）──
+    # ── 事件出口（前端 onAiEvent 消费的唯一形状）──
     def _emit(self, ev: dict) -> None:
         with self.lock:
             self.log.append(ev)
@@ -1899,7 +812,7 @@ class DirectSession:
                     pass
 
     def _close_msg(self) -> None:
-        """收口当前文本段（一段回复 = 一个 message_start ... message_end，与 pi 一致）。"""
+        """收口当前文本段（一段回复 = 一个 message_start … message_end）。"""
         if getattr(self, "_in_msg", False):
             self._emit({"type": "message_end"})
             self._in_msg = False
@@ -1909,7 +822,8 @@ class DirectSession:
     #   原样塞回上下文会①冲垮上下文②烧 token③噪音淹没关键结论（实测 netdev_run
     #   动辄 8000 字符）。这里把「大文本字段」摘出来落盘，只回填摘要，
     #   让模型拿到「元信息 + 关键行 + 全文路径」，需要细节再按路径取。
-    #   注意：只作用 direct 后端，不动 netdev_mcp（pi/wb 走 MCP 契约不变）。
+    #   注意：这层处理只发生在 direct 的进程内调用路径上，netdev_mcp 本身不动
+    #   —— 它的 MCP 服务端契约（netdev-mcp 供外部 MCP 客户端用）保持原样。
     _BIG_TEXT_FIELDS = ("output", "screen", "diff", "lines", "raw", "results")
     _KEYWORD = re.compile(r"(?i)(error|fail|down|unrecognized|invalid|denied|refused|"
                           r"timeout|warning|mismatch|not found|no such|exceed)")
@@ -2039,7 +953,7 @@ class DirectSession:
             return
         delta = choices[0].get("delta") or {}
         if delta.get("content"):
-            if not self._in_msg:              # ★ 一段回复只开一次气泡（与 pi 事件形状一致）
+            if not self._in_msg:              # ★ 一段回复只开一次气泡
                 self._emit({"type": "message_start"})
                 self._in_msg = True
             self._turn_text.append(delta["content"])
@@ -2071,7 +985,7 @@ class DirectSession:
             self._emit({"type": "agent_end"})
             return
 
-        # 系统人设：设备调试助手（与 pi / wb 同一套）
+        # 系统人设：设备调试助手（见文件头 DEBUG_SYSTEM_PROMPT）
         msgs = [{"role": "system", "content": DEBUG_SYSTEM_PROMPT}] + self.messages
 
         try:
@@ -2741,9 +1655,14 @@ def ai_suggest_pattern(dev_name: str, key: str, raw: str, cmd: str,
     安全设计：AI 的输出会经过 lib/learned.validate() 自检 ——
     要求"它给的正则必须能在同一段回显上取出它自己声称的那个值"。
     自检不过直接否决，不让它进档案。
+
+    ★ 2026-10-03：改走**直连后端**（原来起一个 pi RPC 子进程 + 手工拼 JSONL）。
+      这样「AI 学习回显解析规则」不再依赖本机装 pi，与 AI 助手共用同一条
+      凭据链路（config/direct.json 或环境变量）。timeout 参数保留只为兼容调用方。
     """
-    if not PI_BIN:
-        return {"error": "找不到 pi，无法使用 AI 学习功能"}
+    cfg = _direct_cfg()
+    if not cfg["ok"]:
+        return {"error": "直连 AI 未配置：" + cfg["note"]}
     label = _METRIC_LABEL.get(key, key)
     prompt = (
         "你是网络设备回显解析助手。下面是某设备执行命令 `" + cmd + "` 的原始回显。\n"
@@ -2760,45 +1679,16 @@ def ai_suggest_pattern(dev_name: str, key: str, raw: str, cmd: str,
         "\n===== 原始回显结束 ====="
     )
     try:
-        proc = subprocess.Popen([PI_BIN, "--mode", "rpc", "--no-session"],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, bufsize=1,
-                                cwd=str(HOME), env=_env_with_node())
+        s = DirectSession("__learn__", model="", tools="read")
+        resp = s._chat([{"role": "user", "content": prompt}], stream=False)
+        body_raw = resp.read().decode("utf-8", "replace")
+        if resp.status != 200:
+            return {"error": f"直连 API 返回 {resp.status}: {body_raw[:200]}"}
+        body = json.loads(body_raw)
+        out_text = (((body.get("choices") or [{}])[0]).get("message") or {}) \
+            .get("content") or ""
     except Exception as e:
-        return {"error": f"起 pi 失败：{e}"}
-
-    out_text, kinds = "", []
-    try:
-        proc.stdin.write(json.dumps({"type": "prompt", "message": prompt}) + "\n")
-        proc.stdin.flush()
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            kinds.append(ev.get("type"))
-            d = (ev.get("assistantMessageEvent") or {})
-            if d.get("type") == "text_delta" and d.get("delta"):
-                out_text += d["delta"]
-            if ev.get("type") == "extension_ui_request":
-                # 通知类：不需要回应；dialog 类在采集这种无头场景下直接忽略
-                continue
-            if ev.get("type") in ("agent_end", "agent_settled"):
-                break
-    except Exception as e:
-        return {"error": f"与 pi 通信失败：{e}"}
-    finally:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        return {"error": f"直连请求失败：{type(e).__name__}: {e}"}
 
     # 从 AI 的回复里抠出 JSON
     m = re.search(r'\{[^{}]*"value"\s*:\s*([^,}]+)[^{}]*\}', out_text or "", re.S)
@@ -2808,8 +1698,7 @@ def ai_suggest_pattern(dev_name: str, key: str, raw: str, cmd: str,
         obj = json.loads(m.group(0))
     except Exception:
         return {"error": "AI 的 JSON 解析失败", "raw_reply": m.group(0)[:300]}
-    return {"value": obj.get("value"), "pattern": (obj.get("pattern") or "").strip(),
-            "events": len(kinds)}
+    return {"value": obj.get("value"), "pattern": (obj.get("pattern") or "").strip()}
 
 
 def metric_one(dev_name: str, key: str) -> dict:
@@ -3187,8 +2076,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._api_ask(b)
         if u.path == "/api/ask/respond":
             return self._api_ask_respond(b)
-        if u.path == "/api/pi/repair":
-            return self._api_pi_repair(b)
         if u.path == "/api/conn/rm":
             return self._api_conn_rm(b)
         if u.path == "/api/portlock/free":
@@ -3431,102 +2318,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rc, out, err = raw_netdev(["run", dev, cmd])
         return self._json({"rc": rc, "stdout": out, "stderr": err})
 
-    # ══ AI 会话（pi RPC / WorkBuddy headless / direct 直连）══
+    # ══ AI 会话（直连 OpenAI 兼容 API —— 唯一后端）══
     def _api_ai_open(self, b: dict):
-        backend = (b.get("backend") or "pi").strip().lower()
-        if backend == "wb":
-            return self._ai_open_wb(b)
-        if backend == "direct":
-            return self._ai_open_direct(b)
-        if not PI_BIN:
-            return self._json({"error": "找不到 pi。装法：npm i -g @earendil-works/pi-coding-agent"}, 400)
-        aid = secrets.token_urlsafe(9)
-        # ★ 2026-10-03：**开新会话前先把旧会话全关掉**。
-        #   pi 的凭据存储用的是**全局单锁**（~/.pi/agent/*.lock，proper-lockfile 的
-        #   mkdir 原子锁）。原来每点一次"新建会话"就多一个 pi 进程，而且从不回收 ——
-        #   实测开了 5 个会话就有 5 个 pi 同时活着，互相 EEXIST 抢锁，
-        #   表现为"AI 助手突然不好用了"，而界面重放的是日志里的旧报错，看着像坏了。
-        #   界面只有一个 AI 面板，本来也只需要一个会话。
+        """开一个 AI 会话。**只有直连后端**（2026-10-03 起）。
+
+        旧版本支持 backend=pi|wb，那两条「借别人的 CLI 当引擎」的通道已被
+        整体拆除（原因见文件头「可接入的 AI 后端」注释块）。这里对旧值做
+        优雅降级：任何 backend 都按 direct 处理，并回一条 notice 说明，
+        免得旧前端 / 旧配置直接报错。
+        """
+        old = (b.get("backend") or "").strip().lower()
+        cfg = _direct_cfg()
+        if not cfg["ok"]:
+            return self._json({"error": cfg["note"],
+                               "hint": "在界面 ⚙ 设置里粘贴 API Key 即可启用 AI 助手"}, 400)
+        # 界面上只有一个 AI 面板 ⇒ 开新会话前先收掉旧的，别让线程一路堆积
         with AI_LOCK:
-            old = list(AI_SESSIONS.values())
+            old_sessions = list(AI_SESSIONS.values())
             AI_SESSIONS.clear()
-        for o in old:
+        for o in old_sessions:
             try:
                 o.close()
             except Exception:
                 pass
-        if old:
-            # 等它们真正退出，否则新会话可能又撞上还没释放的锁
-            for _ in range(15):
-                time.sleep(0.2)
-                if not any(getattr(o, "alive", False) for o in old):
-                    break
-        s = AiSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
-                      tools=b.get("tools") or "read+netdev")
-        try:
-            s.start()
-        except Exception as e:
-            return self._json({"error": f"启动 agent 失败：{e}"}, 500)
-        with AI_LOCK:
-            AI_SESSIONS[aid] = s
-        # 等它把 MCP / 模型等初始化完。
-        # ★ 注意：pi 的 RPC 是**惰性**的 —— 不发 prompt 就不吐任何 stdout 事件，
-        #   所以「等不到事件」不等于「起不来」。判据改成「进程还活着 = 就绪」，
-        #   否则健康会话也会被永远显示成"初始化中"。
-        #   同时**一旦进程死掉就立刻返回**，不必把 12 秒等满 —— 失败要快。
-        t0 = time.time()
-        while time.time() - t0 < 6:
-            if s.ready.is_set() or (s.proc and s.proc.poll() is not None):
-                break
-            time.sleep(0.25)
-        ready = s.ready.is_set()
-        alive = bool(s.proc and s.proc.poll() is None)
-        if not ready and alive:
-            ready = True
-        resp = {"aid": aid, "backend": "pi", "model": s.model or "（pi 默认）",
-                "cwd": s.cwd, "pid": s.proc.pid, "ready": bool(ready), "alive": alive,
-                "tools": s.tools_key,
-                "tool_list": s.tools.split(",") if s.tools else None}
-        if s.heal.get("moved"):
-            resp["healed"] = s.heal["moved"]        # 启动时顺手修掉的残留锁（界面可提示）
-        if not alive:
-            resp["ready"] = False
-            resp["error"] = ("pi 进程已退出：" + ((s.stderr_tail or "").strip()[:400] or "无 stderr 输出"))
-            resp["hint"] = ("常见真因：~/.pi/agent 下有崩溃残留的 *.json.lock 目录 → "
-                            "已尝试自动修复；若仍失败，请检查 settings.json 里的 packages "
-                            "能否连通（国内建议 npm 走镜像），或改用 WorkBuddy / 直连 API 后端。")
-        return self._json(resp)
-
-    def _ai_open_wb(self, b: dict):
-        """WorkBuddy 后端：按需拉起，无常驻进程可等。"""
-        if not _wb_bin():
-            return self._json({"error": "找不到 WorkBuddy 的 codebuddy CLI"
-                                "（NETDEV_WB_BIN / 桌面 App 内置 / PATH 三处都没命中）"}, 400)
-        aid = secrets.token_urlsafe(9)
-        s = WbSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
-                      tools=b.get("tools") or "read+netdev")
-        with AI_LOCK:
-            AI_SESSIONS[aid] = s
-        return self._json({"aid": aid, "backend": "wb",
-                           "model": s.model or "（WorkBuddy 默认）",
-                           "cwd": s.cwd, "pid": "按需拉起", "ready": True,
-                           "tools": s.tools_key, "tool_list": None})
-
-    def _ai_open_direct(self, b: dict):
-        """Direct 后端：直连 OpenAI 兼容 API，无需本机 CLI。"""
-        cfg = _direct_cfg()
-        if not cfg["ok"]:
-            return self._json({"error": cfg["note"]}, 400)
         aid = secrets.token_urlsafe(9)
         s = DirectSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
                           tools=b.get("tools") or "read+netdev")
         with AI_LOCK:
             AI_SESSIONS[aid] = s
-        tool_list = [t["function"]["name"] for t in s._tool_schemas] if s._tool_schemas else None
-        return self._json({"aid": aid, "backend": "direct",
-                           "model": s.model or "（provider 默认）",
-                           "cwd": s.cwd, "pid": "无（HTTP 直连）", "ready": True,
-                           "tools": s.tools_key, "tool_list": tool_list})
+        tool_list = ([t["function"]["name"] for t in s._tool_schemas]
+                     if s._tool_schemas else None)
+        resp = {"aid": aid, "backend": "direct",
+                "model": s.model or (cfg.get("model") or "（provider 默认）"),
+                "provider": cfg.get("provider") or "",
+                "cwd": s.cwd, "pid": "无（HTTP 直连）", "ready": True,
+                "tools": s.tools_key, "tool_list": tool_list}
+        if old and old not in ("direct", "auto", "off"):
+            resp["notice"] = (f"后端「{old}」已下线（pi / WorkBuddy 的借用式 RPC 通道"
+                              "已整体拆除），本次会话自动使用直连 API。")
+        return self._json(resp)
 
     def _api_direct_cfg_get(self):
         """直连配置快照（key 脱敏）。"""
@@ -3592,16 +2422,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "缺少 message"}, 400)
         ok = s.prompt(text)
         if not ok:
-            # 写 stdin 失败 = 进程已经死了。把 stderr 尾巴带出去，别让用户对着
-            # 一个假死的面板干等（实测踩过：pi 因锁残留起不来，界面只显示"无响应"）。
-            dead = getattr(s, "proc", None) is not None and s.proc.poll() is not None
+            # 直连后端 prompt() 只在会话已关闭（alive=False）时返回 False。
+            # 把原因说清楚，别让用户对着一个假死的面板干等。
             return self._json({"ok": False, "accepted": False,
-                               "error": "agent 进程已退出，本条消息未送达" if dead else "发送失败（stdin 不可写）",
-                               "detail": (getattr(s, "stderr_tail", "") or "").strip()[:400]})
+                               "error": "AI 会话已关闭（请重新开一个会话）"})
         return self._json({"ok": ok, "accepted": ok})
 
     def _api_ai_respond(self, b: dict):
-        """界面里的人点了同意/拒绝 → 回传给 pi —— 审批通道的另一半。"""
+        """界面里的人点了同意/拒绝 —— 审批通道的另一半。
+
+        注意：审批对话走的是 netdev 自己的 approval 通道（/api/ask + ASK_PENDING），
+        与本端点的「AI dialog」不是一回事；直连后端没有 dialog 通道，固定返回 False。
+        """
         s = AI_SESSIONS.get(b.get("aid", ""))
         if not s:
             return self._json({"error": "AI 会话不存在"}, 404)
@@ -3609,22 +2441,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json({"ok": ok})
 
     def _api_ai_compact(self, b: dict):
-        """手动压缩 AI 上下文（长对话用）。"""
+        """手动压缩 AI 上下文（长对话用）。
+
+        直连后端是内存态上下文：把较早的消息折成一条摘要，只保留最近两条。
+        消息还不够多时返回 ok=False（没什么可压的）。
+        """
         aid = b.get("aid", "")
         s = AI_SESSIONS.get(aid)
         if not s:
             return self._json({"error": "AI 会话不存在"}, 404)
         ok = s.compact(str(b.get("instructions") or ""))
         return self._json({"ok": ok,
-                           "msg": "已请求压缩：pi 会把旧消息摘要掉，保留最近的工作上下文" if ok else "发送失败"})
+                           "msg": "已压缩：较早的消息折成一条摘要，保留最近的工作上下文"
+                                  if ok else "消息还不够多，暂时不需要压缩"})
 
     def _api_ai_stats(self, b: dict):
-        """看当前会话的上下文用量。"""
+        """看当前会话的上下文用量。
+
+        直连后端不向服务端要 token 统计（无对应接口），固定回 False；
+        保留端点是为了前端按钮不至于 404。
+        """
         s = AI_SESSIONS.get(b.get("aid", ""))
         if not s:
             return self._json({"error": "AI 会话不存在"}, 404)
-        s.stats()
-        return self._json({"ok": True, "msg": "已查询（结果会以事件形式回到会话流）"})
+        ok = s.stats()
+        return self._json({"ok": ok,
+                           "msg": "已查询（结果会以事件形式回到会话流）" if ok
+                                  else "直连后端不提供 token 统计"})
 
     def _api_ai_abort(self, b: dict):
         s = AI_SESSIONS.get(b.get("aid", ""))
@@ -4013,30 +2856,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         it["answered"] = True
         it["ev"].set()
         return self._json({"ok": True})
-
-    # ══ pi 启动自愈（真因见文件头「pi 启动自愈」注释块）══
-    def _api_pi_repair(self, b: dict):
-        """把崩溃残留的 pi 锁目录移入隔离区；可选顺带真起一次 pi 验证。
-
-        dry=1 时只报告不落手 —— 界面先展示「要动哪些」，用户点了才修。
-        """
-        dry = bool(b.get("dry"))
-        found = [p.name for p in _pi_stale_locks()]
-        if dry or not found:
-            return self._json({"ok": True, "dry": dry, "found": found,
-                               "moved": [], "verify": None,
-                               "note": "没有需要修复的残留锁" if not found else "以上为待修复项"})
-        r = pi_heal_locks()
-        verify = None
-        if b.get("verify"):
-            pi = _which("pi")
-            if pi:
-                ok, why = _rpc_startable(pi, ["--mode", "rpc", "--no-session"])
-                verify = {"ok": ok, "detail": "pi RPC 可拉起" if ok else why}
-        return self._json({"ok": bool(r.get("ok")), "dry": False, "found": found,
-                           "moved": r.get("moved", []), "quarantine": r.get("quarantine"),
-                           "verify": verify,
-                           "note": "已移入隔离区（可原样还原）；建议重开一次 AI 会话"})
 
     # ══ 写操作策略（三模式）══
     def _api_policy_get(self):

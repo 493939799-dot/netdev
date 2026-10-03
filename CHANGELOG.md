@@ -10,20 +10,47 @@
 
 ## [未发布]
 
-### 修复：AI 助手在宿主注入环境下必定起不来（真因：宿主注入的 Node shim）
+### 破坏性变更：AI 助手只剩「直连 API」一个后端
 
-**症状**：界面 AI 面板稳定报
+原来的 `pi agent（RPC）` 与 `WorkBuddy agent（headless）` 两个后端**已整体拆除**，
+只保留自实现的直连后端（直连 OpenAI 兼容 API）。旧配置里若还写着 `backend=pi|wb`，
+服务端会**优雅降级**为直连并回一条「该后端已下线」的提示，不会直接报错。
+
+**为什么要拆**：它们都是"借别人的 CLI 当引擎"，各自带着一整类与 netdev 无关的故障面 ——
+
+| 后端 | 它带进来的问题 |
+| --- | --- |
+| `pi` | 配置 / 凭据锁用 proper-lockfile（空目录当锁），崩溃即残留、而且**永不自愈**（真因见下一节）；启动时会跑 `npm install`，国内网络不通就崩；更关键的是 **`pi 0.85.1` 根本不支持 MCP**，netdev 的 13 个工具其实一个都传不进去（`mcp__netdev` 是宿主 IDE 的命名约定，pi 里不存在，被 `--tools` 白名单静默过滤） |
+| `WorkBuddy` | 内部服务端口冲突会**静默挂死**（无输出、无退出）；凭据是宿主加密信封，独立进程解不开；`--tools` 是全局白名单，会把 MCP 工具一起掐掉（得改用 `--disallowedTools`，且工具名必须逐个 `argv` 元素传 —— 逗号串会被当成一个名字，静默失效） |
+
+**用户可感知的变化**：
+
+- 设置面板的「后端」不再有 `pi` / `WorkBuddy` 可选，只剩 `直连 API` 与 `关闭 AI`；
+- 不再需要 `npm i -g @earendil-works/pi-coding-agent`，也不再依赖 WorkBuddy 桌面版；
+- 不用再管 `~/.pi/agent/*.json.lock` 残留锁 —— 那套自愈代码（`pi_heal_locks`、
+  `/api/pi/repair`、`bin/workbuddy-check.command`）已一并删除；
+- 「AI 提议解析规则」从"起一个 pi RPC 子进程 + 手工拼 JSONL"改成走直连，
+  与 AI 助手共用同一条凭据链路；
+- AI 面板标题、审计日志里的后端名统一显示「直连 API」。
+
+**刻意保持不变**：AI 手里的工具仍然是 `netdev_mcp` 那 13 个，全部转调 netdev CLI；
+写操作的四道闸门（黑名单 → 人工审批 → 强制备份 → 逐行校验）一行没动。
+护栏唯一性是这个项目最重要的一条设计约束 —— AI 换引擎可以，绕开闸门不行。
+
+### 修复：宿主注入的 Node / Shell shim（这才是"AI 莫名其妙不好用"的真根因）
+
+**症状**：AI 面板稳定报
 `Credential store read failed for deepseek: EEXIST: file already exists, mkdir '…/auth.json.lock'`，
-而此刻 `~/.pi/agent` 下根本没有活着的 pi，锁也早已是死锁。手工清锁、重启会话都没用，
-看着像"清不动"。
+而此刻 `~/.pi/agent` 下根本没有活着的 pi，锁也早已是死锁（mtime 静置十几分钟零刷新）。
+手工清锁、重启会话都没用，看着像"清不动"。
 
-**真因**：宿主（WorkBuddy/CodeBuddy 一类桌面 IDE）会给**每一个 Node 进程**注入
+**真因**：宿主（WorkBuddy / CodeBuddy 一类桌面 IDE）会给**每一个 Node 进程**注入
 `NODE_OPTIONS=--require=…/cli/vendor/shim/node-language-shim.cjs`。该 shim 接管了 `fs`，
 把 `mkdir` 撞名的 `EEXIST` **改写**成 `code="CODEBUDDY_BROKER_DENY"`（message 文本里
 仍写着 `EEXIST: …`，所以肉眼极难分辨）。
-pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分支**判据是
+`proper-lockfile` 的**陈旧锁自愈分支**判据是
 `if (err.code !== 'EEXIST') return callback(err);` —— code 被换掉之后，这个分支被整个
-跳过，**崩溃残留的锁永远不会过期**，pi 每次启动都必挂。
+跳过，**崩溃残留的锁永远不会过期**。
 
 实测对照（同一台机器、同一个 proper-lockfile 4.1.2，只改锁目录 mtime）：
 
@@ -32,9 +59,13 @@ pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分�
 | 现在 / 3s / 10s / 29s 前 | `CODEBUDDY_BROKER_DENY`，**全部不自愈** | `ELOCKED`（正常，会重试） |
 | 35s 前（超 30s 陈旧阈值） | `CODEBUDDY_BROKER_DENY`，**仍不自愈** | 清掉旧锁并**成功获取** |
 
-**改法**：`ui/server.py` 在把环境交给 pi 子进程之前，先剥掉宿主注入的
-`NODE_OPTIONS` / `PATH` 中的 shim 条目 / `BASH_ENV`（全部按精确特征匹配，
-`~/.workbuddy/binaries/**` 这类运行时路径**不会**被误伤；用户自己的环境**零改动**）。
+**改法**：`ui/server.py` 在把环境交给**任何**子进程之前，先剥掉宿主注入的
+`NODE_OPTIONS` / `PATH` 里的 shim 目录 / `BASH_ENV`（全部按精确特征匹配，
+`~/.workbuddy/binaries/**` 这类**属于运行时**的路径不会被误伤；用户自己的环境零改动）。
+现在 `netdev_json()` / `raw_netdev()`（界面所有 CLI 调用）也走这条干净环境 ——
+shim 的 `brokered-bin` / `safe-bin` 会把 `mkdir` / `rm` 换成受管版本，
+而 netdev CLI 自己要建 pid、快照、回收区目录，错误码语义不可依赖。
+
 这是"不做也能跑、但在宿主里必挂"的那一类修复，对**双击启动**的用户是空操作。
 
 ### 修复：`netdev selftest` 在端口被占时会给出**假红**
@@ -49,20 +80,72 @@ pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分�
   —— 固定等待是本项目反复踩过的坑（GitHub ARM 冷启动实测 32s）；
 - 起不来时把子进程输出打出来，不再吞掉。
 
-### 加固：锁自愈不再可能误搬**活锁**
+### 修复：模拟器不认 `C-u` / 不吞终端应答碎片（"回显是不是有问题"的真根因）
 
-`pi_heal_locks(force=True)` 原来不看年龄，见空锁目录就搬。若用户自己正在终端里跑 pi，
-那个锁是**活的**，搬走会砸掉她的会话。现在 force 会先探测本机有没有别的 pi 进程存活，
-有则自动降级为"只搬 mtime > 60s 的陈旧锁"，并在返回值里如实报告 `degraded`。
+**症状**：命令在**同屏窗格存在时**必报 `Unrecognized command found at '^' position.`；
+撤掉窗格、或把窗格重建一次就好了，之后开一次终端页又复发 —— 极像"netdev 的命令透传坏了"。
 
-### 测试
+**真因**：netdev 的同屏下发（`netdev_cli._session_run`）在发命令前会先发一个
+`C-u`(0x15) 清掉当前行 —— 目的正是清掉残留的终端能力应答碎片。
+真机 VRP 的行编辑器把 `C-u` 当"清行"；而 `tests/mock_vrp.py` 的模拟器把它当普通字符
+并进缓冲，命令于是变成 `"\x15display clock"` → 匹配不上 → 永远 `Unrecognized`。
+同一类污染源还有终端对设备查询自动回的能力应答（`\x1b[?1;2c` / `0;276;0c`），
+这些字节会从窗格漏进设备输入流（`netdev` 源码注释里早已指出这一点）。
 
-- 新增 `tests/test_pi_heal_and_cmdcache.py` 第 4 组共 11 项断言，把上述根因钉死：
-  shim 剥离、`~/.workbuddy/binaries/**` 不误伤、干净环境零改动、`_env_with_node` 端到端。
-  该文件总计 35 项。
-- 端到端实测（真实 HTTP + 真实 pi + 真实模型）：`/api/ai/open` → `/api/ai/send`
-  → 事件流拿到 assistant 回复；`/api/term/open` → `/api/term/input` 键入的命令
-  确实到达设备并回显。
+**注意它只在有窗格时出现**：没有窗格时 netdev 走直连、不发 `C-u`，
+所以这个 bug 最容易在排查时"自己消失"，被误判成偶发。
+
+**改法**（模拟器两处，`mock_vrp.py` / `mock_telnet.py` 同源）：
+
+- 认 `C-u`(0x15) 为清行；其余控制字符一律忽略，不并入命令缓冲；
+- 增 ANSI 转义序列吞噬：`ESC` 起算，上限 16 字符（畸形序列也不会吞掉整条命令），
+  引导符 `[` `O` `(` 不计入终结字节。
+
+**顺带清掉一处死代码**：`mock_vrp.py` 里有**两份** shell 循环，其中 `shell_loop()`
+从未被调用（真正跑的是 `serve()` 里内联的那份）—— 第一次修复改到了死掉的那一份，
+症状当然纹丝不动。已删除死代码，修复落到真正在跑的那份循环上。
+
+**新增回归**：`tests/test_mock_cmd.py` 第八组（12 → **21 项**），覆盖
+`C-u` 清行 / 退格修正 / `Ctrl-C` / **ANSI 碎片污染命令行** /
+**碎片 + `C-u` = netdev 同屏的真实下发路径**。
+
+### 修复：`netdev_mcp.py` 的 `IndentationError`（P0，一坏全坏）
+
+`t_serial()` 里有一段被多缩进 2 格，**整个文件语法都不成立** ——
+`python3 -m py_compile netdev_mcp.py` 直接以 `IndentationError` 退出。
+
+后果极隐蔽：它不是"某个工具坏了"，而是 **MCP 服务端一启动就秒崩**。
+MCP 客户端（以及按同一契约调用它的直连后端）拿不到工具表，于是模型手里
+**一个设备工具都没有**，表现出来却是"AI 在瞎编工具调用"。
+修好后实测握手正常（`initialize` 返回 `netdev 1.0.0`，`tools/list` 返回 13 个工具）。
+
+### 新增：守门测试，专治"一坏就全坏"的那类隐蔽故障
+
+`tests/test_pi_heal_and_cmdcache.py`（35 项）→ **`tests/test_ai_toolchain_and_cache.py`（57 项）**：
+
+- **全仓 `.py` 必须可编译**（用 `git ls-files` 量"真正会进仓的文件"，不靠读 `.gitignore` 猜）
+  —— 上面那个 IndentationError 的守门测试；
+- **`netdev_mcp` 服务端契约**：工具表 ↔ 处理器一一对应、无孤儿、**工具数必须等于 13**
+  （护栏面不能被悄悄改窄）、包装脚本可执行，并**真跑一次 MCP 握手**（`initialize` + `tools/list`）；
+- **AI 工具链一致性**：给模型的 schema 必须与 `netdev_mcp.TOOLS` 完全对齐、是 OpenAI 兼容形状、
+  不含 MCP 专属字段；`TOOLSETS` 只有三档；
+- **"已拆除"的守门断言**：`AiSession` / `WbSession` / `PI_BIN` / `_rpc_startable` /
+  `pi_heal_locks` 不得再出现在 `ui/server.py`；源码里不得再出现 `/api/pi/repair`、
+  `mcp__netdev`、`--disallowedTools`；
+- 保留原有三组：采集命令学习缓存、五家平台识别、宿主 shim 剥离（11 项）。
+
+端到端实测（真实 HTTP + 真实模型）：`/api/ai/open`（故意传旧值 `backend=pi` → 优雅降级为
+直连并回提示）→ `/api/ai/send` → 事件流拿到 assistant 回复，并**真的调到了 `netdev_list`**
+（读回真实设备清单）；`/api/term/open` → `/api/term/input` 键入的命令确实到达设备并回显；
+且**开着同屏窗格**下发 `netdev run mock-hw "display clock"` 仍被正确识别
+（这条原本必红，真因见上一节）。
+
+### 安全：清理已下线后端留下的凭据
+
+`config/workbuddy-product.json`（**含一条真实可用的 WorkBuddy JWT，1394 字符**）、
+`config/codebuddy-mcp.json`、`config/codebuddy-mcp-empty.json` 已移入
+`.chk/removed-workbuddy-backend-<时间戳>/`（只搬不删）。它们从未进过版本库，
+`.gitignore` 里的对应规则保留作为防御。
 
 ---
 
@@ -102,10 +185,10 @@ pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分�
 
 ### AI 协作
 
-- **三种后端可切换**：`pi` agent（常驻 RPC）/ WorkBuddy agent（headless）/
-  直连 OpenAI 兼容 API（自带 Key），也可整体关闭 AI。
+- **AI 助手直连 OpenAI 兼容 API**（DeepSeek / OpenAI / OpenRouter / 任意兼容网关）：
+  一把 API Key 即用，零额外 CLI 依赖、零常驻进程。也可整体关闭 AI。
 - MCP 暴露 13 个 `netdev_*` 工具，**全部转调 CLI**，自己不碰设备；
-  Bash / Write / Edit 等通用工具硬移除。
+  Bash / Write / Edit 等通用工具硬移除。内置 AI 助手用的就是同一套 13 个工具。
 - 网页终端左栏按钮：8 条散按钮收敛为 **3 个聚合入口**。
 
 ### 网页界面
@@ -140,7 +223,6 @@ pi 的配置/凭据锁用的是 `proper-lockfile`，它的**陈旧锁自愈分�
 
 ### 已知待办
 
-- 端到端跑通 AI 三后端的真实会话（pi 侧受环境限制，见下）
 - 更多厂商真机的监控采集验证
 - 英文文档与 `README.en.md` 的持续同步
 
