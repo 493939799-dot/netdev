@@ -75,7 +75,7 @@ def main() -> int:
             break
         time.sleep(0.2)
     check("stop 后端口关闭", not port_open(PORT))
-    check("stop 后 pid 文件已清理", not netdev_cli._mock_pid()[0])
+    check("stop 后 pid 文件已清理", not netdev_cli._mock_pid(PORT)[0])
 
     print("\n五、重复 stop 不报错")
     rc = netdev_cli.cmd_mock(ns("stop"))
@@ -83,13 +83,23 @@ def main() -> int:
 
     print("\n六、残留 pid 文件要被识别为「没在跑」")
     netdev_cli._mock_paths(PORT)[0].write_text("999999", encoding="utf-8")
-    pid, _ = netdev_cli._mock_pid()
+    pid, _ = netdev_cli._mock_pid(PORT)
     check("PID 文件指向死进程 → 视为没在跑", pid is None, f"pid={pid}")
     check("这种情况 status 返回 1", netdev_cli.cmd_mock(ns("status")) == 1)
     try:
         netdev_cli._mock_paths(PORT)[0].unlink()
     except Exception:
         pass
+
+    print("\n七、不同端口互不干扰")
+    other = PORT + 1
+    ns2 = lambda act: argparse.Namespace(action=act, port=other)
+    rc = netdev_cli.cmd_mock(ns2("start"))
+    check("另一个端口能独立起", rc == 0 and port_open(other), f"rc={rc}")
+    check("起第二个不影响第一个的 pid 文件", netdev_cli._mock_pid(PORT)[0] is None
+          and netdev_cli._mock_pid(other)[0] is not None)
+    netdev_cli.cmd_mock(ns2("stop"))
+    check("停第二个后第一个的记录仍在（互不影响）", netdev_cli._mock_pid(other)[0] is None)
 
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")

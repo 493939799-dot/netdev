@@ -2686,13 +2686,19 @@ MOCK_PID = None   # 运行时在 cmd_mock 里按需解析
 
 
 def _mock_paths(port: int):
+    """pid 文件名**必须带端口**（2026-10-03 修）。
+
+    原来固定叫 state/mock.pid，于是 `netdev mock stop -p 20391`
+    会把 20022 上那个正在跑的实例杀掉 —— 实测做回归测试时把自己起的
+    模拟器误杀了。端口不同就是不同的进程，不能共用一个 pid 文件。
+    """
     st = _P.state_dir()
-    return st / "mock.pid", st / f"mock-{port}.log"
+    return st / f"mock-{int(port)}.pid", st / f"mock-{int(port)}.log"
 
 
-def _mock_pid():
-    """返回 (pid, pidfile)；没在跑时 pid 为 None。"""
-    pidf, _ = _mock_paths(0)
+def _mock_pid(port: int):
+    """返回 (pid, pidfile)；没在跑时 pid 为 None（残留文件也返回 None）。"""
+    pidf, _ = _mock_paths(port)
     try:
         pid = int(pidf.read_text(encoding="utf-8").strip())
     except Exception:
@@ -2717,7 +2723,7 @@ def cmd_mock(a):
     if act == "restart":
         cmd_mock(argparse.Namespace(action="stop", port=port))
         act = "start"
-    pid, pidf = _mock_pid()
+    pid, pidf = _mock_pid(port)
     if act == "status":
         if pid:
             print(f"{C['grn']}✔{C['reset']} 模拟器在跑   PID {pid}   ssh://127.0.0.1:{port}")
