@@ -709,6 +709,24 @@ def test_ai_stop_button_dotmatrix():
     check("品牌点阵的对角错峰 delay 仍在（没被顺手清掉）",
           ".dots i:nth-child(9){animation-delay:.40s}" in html)
 
+    # ⑥ 去掉外框 + 与文本框上下居中（2026-10-04 用户要求）
+    btn = _rule(".ai-in button.icon-btn{")
+    check("★ 外框已去掉（border:0）", "border:0" in btn, btn)
+    check("★ 底色透明，但**控件本体保留**（是透明、不是删掉按钮）",
+          "background:transparent" in btn, btn)
+    check("★ 点击热区仍是 26px（7px 的点当点击目标太小，可用性优先）",
+          "width:26px" in btn, btn)
+    check("★ 与文本框上下居中（容器是 align-items:flex-end，这里单独 align-self:center）",
+          "align-self:center" in btn, btn)
+    check("容器仍是 align-items:flex-end 没被改（只动这一个按钮的对齐）",
+          "align-items:flex-end" in html)
+    hov = _rule(".ai-in button.icon-btn:hover{")
+    check("★ 悬停不会把方框刷回来（.ai-in button:hover 会刷底色，必须显式复位）",
+          "background:transparent" in hov and "border" not in hov, hov)
+    check("悬停改用放大柔光给反馈", ".ai-in button.icon-btn:hover .ai-stop-dot{box-shadow:0 0 10px" in html)
+    check("键盘焦点仍可见（无边框控件最容易把焦点样式一起弄丢）",
+          ".ai-in button.icon-btn:focus-visible{" in html and "outline:1px dashed" in html)
+
 
 # ======================================================================
 # 八、「活动状态 = 绿」这条界面约定（2026-10-04 用户确立）

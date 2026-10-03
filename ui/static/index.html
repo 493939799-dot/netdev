@@ -350,14 +350,29 @@ button.mono:hover{background:rgba(var(--g-rgb),.24);border-color:var(--g1);color
   display:inline-block;overflow:visible}
 .bi.wide{width:1.15em;height:1.15em}
 button .bi, .mono .bi{pointer-events:none}
-/* ★ 2026-10-04 用户要求：停止按钮的图标**整个换掉** —— 从 3×3 点阵换成
-   **一颗小圆点**，就是设备行「窗格在线」那一颗（7px 圆 + 6px 柔光）。
-   语义也跟设备行的点对齐：**不活动 = 主题主色实心点；活动 = 变绿 + 呼吸**。
-   忙闲由 aiBusy() 切 .busy 类。
-   （沿革：实心方块「■」→ 3×3 方点阵 → 3×3 圆点阵 → 现在这一颗点。） */
+/* ★ 2026-10-04 用户要求的停止按钮形态（两轮叠起来看）：
+   ① 图标**整个换掉** —— 从 3×3 点阵换成**一颗小圆点**，就是设备行「窗格在线」
+      那一颗（7px 圆 + 6px 柔光）。语义也跟设备行的点对齐：
+      **不活动 = 主题主色实心点；活动 = 变绿 + 呼吸**，忙闲由 aiBusy() 切 .busy。
+      （沿革：实心方块「■」→ 3×3 方点阵 → 3×3 圆点阵 → 现在这一颗点。）
+   ② **去掉外面的方框**，且与文本框上下居中。两条各自的理由：
+      · 去框：按钮本体仍在，只是不可见 —— 26px 的点击热区**必须保留**，
+        7px 的点当点击目标太小了（可用性 > 视觉）。所以是"透明"而不是"删掉按钮"。
+        顺带治好一个 2px 错位：文本框 = 24px 内容 + 2×1px 边框 = 26px，
+        按钮 = 26px + 2×1px 边框 = 28px，容器又是 align-items:flex-end
+        ⇒ 按钮顶边比文本框高 2px。去框后两者都是 26px。
+      · 居中：容器 .ai-in 是 align-items:flex-end（文本框长高时按钮贴底）。
+        这里单独 align-self:center —— 文本框最多长到 180px，点始终垂直居中。 */
 .ai-in button.icon-btn{width:26px;padding:0;display:flex;align-items:center;justify-content:center;
-  flex:0 0 auto;color:var(--g);border-color:var(--g1)}
-.ai-in button.icon-btn:hover{background:rgba(var(--g-rgb),.30);border-color:var(--g);color:var(--g)}
+  flex:0 0 auto;align-self:center;border:0;background:transparent;color:var(--g)}
+/* 悬停**不给方框**（那正是用户要去掉的东西），只让点自己"醒一下"：柔光放大。
+   注意 .ai-in button:hover 会把底色刷回来（那条是给文本框旁普通按钮的），
+   所以这里必须显式把 background / box-shadow 复位。 */
+.ai-in button.icon-btn:hover{background:transparent;box-shadow:none;color:var(--g)}
+.ai-in button.icon-btn:hover .ai-stop-dot{box-shadow:0 0 10px currentColor}
+/* 键盘 Tab 到它时必须看得见 —— 没边框的控件很容易把焦点样式一起弄丢。
+   只在 :focus-visible（键盘）出现，鼠标点不会留框。 */
+.ai-in button.icon-btn:focus-visible{outline:1px dashed var(--g1);outline-offset:1px}
 /* 尺寸与柔光**照抄设备行那颗点**（7px / 0 0 6px），两处才是同一种"材质"。
    颜色一律走 currentColor：按钮的 color 是主色，.busy 时被改成 --st-on，
    于是点本身的底色和柔光会一起变绿，不用写两遍。 */
