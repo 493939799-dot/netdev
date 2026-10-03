@@ -681,6 +681,69 @@ def test_ai_stop_button_dotmatrix():
           '[data-theme="ink"] .ai-in .dots.stop i' in html)
 
 
+# ======================================================================
+# 八、「活动状态 = 绿」这条界面约定（2026-10-04 用户确立）
+# ======================================================================
+def test_active_state_is_green():
+    """用户报障：设备行那个小圆点明明是"窗格在线"，在浅色主题下却是黑的。
+
+    真因不是漏了颜色，是**用错了色源**：那两处"在线"指示点都取 `var(--g)`
+    （主题主色）。深色主题里主色本身就是绿，看不出问题；可一到
+    `minimal`（--g 纯黑）/ `ink`（--g 近黑）主题，"在线"的黑点和"离线"的
+    `#3a3a3a` 深灰**几乎分不出来** —— 指示点等于白放。
+
+    约定：活动/在线一律用**语义色 `--st-on`**（就是「已接入」插头在用的那个绿），
+    不跟主题主色走。同一逻辑同时管：设备行圆点、顶栏"在线"点、AI 点阵的忙态。
+
+    守的都是"改了不报错、只有观感悄悄变"的地方，尤其是**最后一条**：
+    以后新增浅色主题若忘了定义 `--st-on`，会掉回 `:root` 里那个荧光绿
+    `#00ff41` —— 在白底上刺眼且对比度差，但**没有任何报错**。
+    """
+    print("\n[8] 「活动状态 = 绿」的界面约定")
+    html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+
+    def rule(sel: str) -> str:
+        i = html.index(sel)
+        return html[i:html.index("}", i)]
+
+    st_ok = rule(".st.ok{")
+    check("设备行「在线」点改用语义色 --st-on", "--st-on" in st_ok, st_ok)
+    check("设备行「在线」点不再取主题主色 --g", "var(--g)" not in st_ok, st_ok)
+
+    dot = rule(".dot{")
+    check("顶栏「在线」点同一条规则", "--st-on" in dot and "var(--g)" not in dot, dot)
+
+    busy = rule(".ai-in button.icon-btn.busy .dots i{")
+    check("AI 点阵忙态 = 绿", "color:var(--st-on)" in busy, busy)
+    idle = rule(".ai-in button.icon-btn .dots i{")
+    check("AI 点阵空闲态**不**上绿色（只有活动才绿）", "--st-on" not in idle, idle)
+
+    # 三个状态仍要能互相区分 —— 别为了"在线变绿"把另两个弄没了
+    for sel in (".st.off{", ".st.warn{"):
+        check(f"另两态仍独立定义：{sel[:-1]}", sel in html)
+    check("「离线」点保持中性灰（不抢在线的绿）",
+          "#3a3a3a" in rule(".st.off{"), rule(".st.off{"))
+
+    # ★ 浅色主题必须自带 --st-on，否则掉回 :root 的荧光绿（白底上刺眼、无报错）
+    for th in ("minimal", "ink"):
+        seg = html[html.index(f'[data-theme="{th}"]{{'):]
+        seg = seg[:seg.index("}")]
+        check(f"浅色主题 {th} 自带 --st-on（否则白底上是荧光绿）",
+              "--st-on" in seg, seg[:120])
+    # 注意：文件里有**两个** :root 块（基础变量一个、--st-* 语义色一个），
+    # 只 index 第一个会误判 —— 这条断言自己踩过一次，所以按"全部 :root 块"来找。
+    roots, p = [], 0
+    while True:
+        try:
+            i = html.index(":root{", p)
+        except ValueError:
+            break
+        roots.append(html[i:html.index("}", i)])
+        p = i + 1
+    check(":root 里定义了 --st-on（深色主题靠它兜底）",
+          any("--st-on:" in b for b in roots), f"共 {len(roots)} 个 :root 块")
+
+
 def main():
     print("=" * 66)
     print("netdev 回归测试：AI 工具链 + 采集缓存 + 宿主 shim 剥离")
@@ -693,6 +756,7 @@ def main():
     test_mcp_contract()
     test_ai_toolchain()
     test_ai_stop_button_dotmatrix()
+    test_active_state_is_green()
     print("\n" + "=" * 66)
     print(f"通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
     if FAIL:

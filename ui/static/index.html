@@ -171,8 +171,12 @@ button.mono:disabled{opacity:.45;cursor:wait}
   border-color:var(--g1);background:rgba(var(--g-rgb),.12);
   font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;
   text-shadow:0 0 7px rgba(var(--g-rgb),.75);padding:2px 10px}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--g);
-  box-shadow:0 0 6px var(--g);margin-right:5px;animation:pulse 2s infinite}
+/* 顶栏「在线」指示点 —— 与设备行那个圆点同一条规则：**活动 = 绿**，不跟主题主色走。
+   原来用 var(--g)，在浅色主题（minimal 黑 / ink 近黑）里"在线"和"离线"两个点
+   几乎同色，这个点就失去了指示意义（2026-10-04 用户指出设备行的同一个毛病）。
+   语义色统一用 --st-on —— 各主题都已定义好，且它就是「已接入」在用的那个绿。 */
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--st-on);
+  box-shadow:0 0 6px var(--st-on);margin-right:5px;animation:pulse 2s infinite}
 @keyframes pulse{50%{opacity:.35}}
 
 .stack{position:relative;z-index:10;height:calc(100vh - 39px);padding:9px;gap:9px;display:grid;
@@ -296,7 +300,11 @@ button.mono:hover{background:rgba(var(--g-rgb),.24);border-color:var(--g1);color
 .connrow .cx{margin-left:auto;color:var(--bad);cursor:pointer;opacity:.65}
 .connrow .cx:hover{opacity:1}
 .st{width:7px;height:7px;flex:0 0 7px;border-radius:50%;margin-top:5px}
-.st.ok{background:var(--g);box-shadow:0 0 6px var(--g)}
+/* ★ 2026-10-04 用户要求：**活动（窗格在线）= 绿**。
+   原来用的是主题主色 --g —— 在 minimal（纯黑）/ ink（近黑）这类浅色主题下，
+   "在线"的黑点和"离线"的 #3a3a3a 深灰几乎分不出来，指示点等于白放。
+   改用语义色 --st-on（「已接入」插头用的同一个绿，浅色主题下已按底色调深）。 */
+.st.ok{background:var(--st-on);box-shadow:0 0 6px var(--st-on)}
 .st.off{background:#3a3a3a}
 .st.warn{background:var(--warn);box-shadow:0 0 6px var(--warn)}
 
@@ -362,7 +370,10 @@ button .bi, .mono .bi{pointer-events:none}
    所以单独一个 keyframes，峰值/节奏/时长都不动，只改低谷值。 */
 @keyframes dotpulse-btn{0%,70%,100%{opacity:.38}35%{opacity:1}}
 .ai-in button.icon-btn .dots i{width:4px;height:4px;opacity:1;animation-name:none}
-.ai-in button.icon-btn.busy .dots i{animation-name:dotpulse-btn}
+/* 活动态 = 绿（与设备行/顶栏的"在线"圆点同一条规则，2026-10-04 用户要求）。
+   空闲时仍是主题主色（极简主题下就是黑），一跑起来才变绿 —— 这样"它在动"
+   这件事在浅色主题下也有颜色信号，光靠闪烁是不够的。 */
+.ai-in button.icon-btn.busy .dots i{animation-name:dotpulse-btn;color:var(--st-on)}
 
 table{width:100%;border-collapse:collapse;font-size:10.5px}
 th,td{border:1px solid var(--g4);padding:2px 5px;text-align:left}
