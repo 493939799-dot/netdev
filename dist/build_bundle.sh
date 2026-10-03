@@ -122,12 +122,17 @@ chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE/tools-menu.command"
 ok "安装器就绪（菜单取自 bin/设备工具台.command，仓库里只有这一份）"
 
 printf "${B}▶ 5/6 打包${X}\n"
-NAME="${TS}_netdev设备工具台_macOS_${ARCH}_安装包"
-mkdir -p "$STAGE/$NAME"
+NAME="${TS}_netdev设备工具台_macOS_${ARCH}_安装包"    # 本机存档文件名（带日期）
+# ★ tar 内顶层目录名 = GitHub 附件名，固定不变（2026-10-04 开箱即用验证发现：
+#   README 让用户 `cd netdev-macos-arm64-installer`，而 tar 顶层目录是带日期的
+#   中文名，每次发版都变 —— 用户照着 README 敲 cd 必失败。目录名固定后，
+#   README 的下载链接（releases/latest/download/固定名）与 cd 指引永远不用改。）
+BUNDLE_NAME="netdev-macos-arm64-installer"
+mkdir -p "$STAGE/$BUNDLE_NAME"
 for item in payload runtime config-template install.sh uninstall.sh README-安装说明.txt tools-menu.command VERSION; do
-  mv "$STAGE/$item" "$STAGE/$NAME/" 2>/dev/null || true
+  mv "$STAGE/$item" "$STAGE/$BUNDLE_NAME/" 2>/dev/null || true
 done
-( cd "$STAGE" && tar -czf "$OUT/$NAME.tar.gz" "$NAME" )
+( cd "$STAGE" && tar -czf "$OUT/$NAME.tar.gz" "$BUNDLE_NAME" )
 ok "$OUT/$NAME.tar.gz  （$(du -sh "$OUT/$NAME.tar.gz" | cut -f1)）"
 
 printf "${B}▶ 6/6 校验${X}\n"
@@ -135,4 +140,4 @@ printf "${B}▶ 6/6 校验${X}\n"
 ok "校验和：$(cut -c1-24 "$OUT/$NAME.tar.gz.sha256")…"
 echo "$NAME.tar.gz" > "$DIST/last_bundle.txt"
 printf "\n${B}完成${X}：把这个 .tar.gz（和 .sha256）拷到目标 Mac，然后：\n"
-printf "  tar -xzf %s.tar.gz && cd %s && bash install.sh --dry-run\n" "$NAME" "$NAME"
+printf "  tar -xzf %s.tar.gz && cd %s && bash install.sh --dry-run\n" "$NAME" "$BUNDLE_NAME"

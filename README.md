@@ -8,8 +8,7 @@
 ![Python: 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
 ![Channel access: Serial / SSH / Telnet](https://img.shields.io/badge/接入-serial%20%C2%B7%20SSH%20%C2%B7%20Telnet-orange)
 
-> ⚠️ 上面 4 个徽章里的 `493939799-dot/netdev` 是**占位符** —— 建仓后全局替换成你的
-> `账号/仓库名` 即可。CI 徽章在第一次成功跑起来后才会变绿。
+> CI 徽章在第一次成功跑起来后才会变绿。
 
 一个面向 macOS 的网络设备调试终端 + AI 协作工具。它把串口 Console、SSH、Telnet 统一收敛到同一套命令行接口，并通过 tmux 实现「人机同屏」——你和 AI 看到的是同一块屏幕。
 
