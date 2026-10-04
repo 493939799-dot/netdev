@@ -105,15 +105,17 @@ def fix_keys(data: bytes) -> bytes:
     return data
 
 
-# IP 橙色高亮（屏幕显示用；日志仍保留原始字节）
-sys.path.insert(0, os.path.expanduser("~/netops"))
+# IP 橙色高亮 + 输入回显著色（人=蓝/AI=紫/系统=灰；日志仍保留原始字节）
+# ★ 路径按【桥脚本所在仓】推导，不再写死 ~/netops —— 否则开发仓的桥
+#   会加载到安装副本的旧 lib，"改了不生效"还查不出原因（2026-10-04 踩）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from lib import colorize as _cz
-    _painter = _cz.BytePainter()
+    _echo = _cz.EchoPainter(device=DEVICE_NAME)
     _paint_on = _cz.enabled()
 except Exception:
     _cz = None
-    _painter = None
+    _echo = None
     _paint_on = False
 
 # ── 终端应答过滤：丢掉 xterm 等终端模拟器的自动应答 ──
@@ -418,7 +420,7 @@ def _self_check_and_fix():
          "   注：本自检只发了一个回车，未改动设备任何配置。\r\n" % (_tried, port)).encode())
 
 out(f"\r\n[串口已连接] {port} @ {baud}\r\n"
-    f"[人机同屏会话；退出 Ctrl+]  IP高亮={'开' if _paint_on else '关'}   退格适配={mode_note}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
+    f"[人机同屏会话；退出 Ctrl+]  IP高亮+输入着色={'开' if _paint_on else '关'}   退格适配={mode_note}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
 
 _self_check_and_fix()   # 接入自检：确认设备真的有回应
 
@@ -483,6 +485,8 @@ try:
                 _n = _tf.dropped_count(send)
                 send = _tf.strip(send)
             ser.write(send)
+            if _paint_on and _echo:
+                _echo.expect(send)                # 登记期待回显 → 输入着色
             _pending_since[0] = time.time()   # 发了东西 → 开始等回音（看门狗用）
             if log:
                 log.write(_input_for_log(data, "[输入] ").encode())
@@ -521,14 +525,14 @@ try:
                 _last_data[0] = time.time()
                 _pending_since[0] = 0.0        # 有回音 → 待决解除
                 maybe_autologin(data)
-                emit_screen(_painter.feed(data) if _paint_on else data)
+                emit_screen(_echo.feed(data) if _paint_on and _echo else data)
                 if log:
                     try:
                         log.write(data)          # 日志保留原始字节（留档用）
                     except (ValueError, OSError):
                         pass
-        elif _paint_on and _painter.pending() and time.time() - _last_data[0] > 0.15:
-            emit_screen(_painter.flush())        # 尾巴等超时就吐出来，不卡显示
+        elif _paint_on and _echo and _echo.pending() and time.time() - _last_data[0] > 0.15:
+            emit_screen(_echo.flush())          # 尾巴等超时就吐出来，不卡显示
 except Exception as e:
     import traceback
     out(f"\r\n[serial_bridge] 异常退出: {type(e).__name__}: {e}\r\n".encode())

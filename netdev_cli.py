@@ -2178,6 +2178,12 @@ def cmd_screen_send(a):
             return 3
     m = mirror.Mirror(dev["name"])
     text = a.text
+    # 发送前先记标记：桥在设备回显里认出这串字，把它染成 AI 紫 / 系统灰
+    # （人手敲的字没有标记 → 染蓝。着色失败不影响发送。）
+    try:
+        colorize.write_mark(text, src=getattr(a, "src", "ai"), device=dev["name"])
+    except Exception:
+        pass
     _tmux("send-keys", "-t", _tmux_target(dev["name"]), "-l", text)
     m.send(f"[同屏] {text}", gates.classify(text))
     if not a.no_enter:
@@ -3772,6 +3778,9 @@ def main(argv=None):
     ss.add_argument("--yes", action="store_true", help="确认直接发送写操作（默认会被拦下，建议改用 apply）")
     ss.add_argument("device"); ss.add_argument("text")
     ss.add_argument("--no-enter", dest="no_enter", action="store_true", default=False)
+    ss.add_argument("--src", default="ai", choices=["ai", "sys"],
+                    help="输入来源标记：ai=AI 助手（回显染紫）/ sys=系统代发（回显染灰）。"
+                         "默认 ai；界面监控/深体检代发探测命令时传 sys。")
     ss.add_argument("--wait", type=float, default=1.5, help="发完等几秒再读屏")
     ss.add_argument("--lines", type=int, default=40)
     ss.set_defaults(fn=cmd_screen_send)

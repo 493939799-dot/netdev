@@ -63,13 +63,15 @@ if _os2.environ.get("NETDEV_SSH_KEEPALIVE", "1") != "0":
 BACKSPACE = os.environ.get("NETDEV_BACKSPACE", "auto").lower()
 DEVICE_NAME = os.environ.get("NETDEV_DEVICE", "")
 
-# ── IP 高亮（与其它桥共用 lib/colorize）
+# ── IP 高亮 + 输入回显著色（与其它桥共用 lib/colorize；人=蓝/AI=紫/系统=灰）
+# ★ 路径按【桥脚本所在仓】推导，不写死 ~/netops（同 serial_bridge 注释）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from lib import colorize as _cz
-    _painter = _cz.BytePainter()
+    _echo = _cz.EchoPainter(device=DEVICE_NAME)
     _paint_on = _cz.enabled()
 except Exception:
-    _painter, _paint_on = None, False
+    _echo, _paint_on = None, False
 
 # ── 终端应答过滤：丢掉 xterm 等终端模拟器的自动应答 ──
 #    （不丢的话会被当成"用户输入"写进设备 → 屏幕被 "1;2c0;276;0c" 这类垃圾污染
@@ -235,7 +237,7 @@ def emit(b: bytes):
     if not b:
         return
     log_raw(b)
-    out(_painter.feed(b) if _paint_on else b)
+    out(_echo.feed(b) if _paint_on and _echo else b)
 
 
 # ── 起 ssh 子进程（给它一个 pty，ssh 才认为是交互终端）
@@ -295,8 +297,9 @@ class _PtyLike:                                       # noqa: F401  （保留给
 
 hdr = (f"\r\n[ssh 已接入] {' '.join(child_argv)}\r\n"
        f"[人机同屏会话；退出 Ctrl+]   退格适配={mode_note}   "
+       f"IP高亮+输入着色={'开' if _paint_on else '关'}   "
        f"自动登录={'开（'+PW_SRC+'）' if DEV_PW else '关（未找到凭据，请手工输密码）'}   "
-       f"IP高亮={'开' if _paint_on else '关'}   日志: {logfile or '未开启'}]\r\n\r\n")
+       f"日志: {logfile or '未开启'}]\r\n\r\n")
 out(hdr.encode())
 log_raw(f"\n===== {time.strftime('%F %T')} ssh {' '.join(child_argv)}\n".encode())
 
@@ -358,6 +361,8 @@ try:
                     _n = _tf.dropped_count(_d); _d = _tf.strip(_d)
                     if _n: log_raw(("[丢弃终端应答 %d 字节]\n" % _n).encode())
                 os.write(fd, _d)
+                if _paint_on and _echo:
+                    _echo.expect(_d)           # 登记期待回显 → 输入着色
             except OSError as e:
                 out(f"\r\n[ssh] 发送失败: {e}\r\n".encode())
                 break
@@ -373,6 +378,9 @@ try:
                 break
             emit(data)
             tail = (tail + data)[-256:]
+        elif _paint_on and _echo and _echo.pending():
+            emit(_echo.flush())        # ★ 空闲兜底：扣住的 IP 残片/回显收色要吐出来
+                                         #  （ssh 桥原来没有这条 → 大输出块尾的 IP 永远不染）
             # ── 自动登录：认出 ssh 的提示符就替你把密码填上（不打印密码）
             if injected < 3 and YN_PROMPT.search(tail):
                 os.write(fd, b"yes\r")

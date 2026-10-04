@@ -1987,7 +1987,7 @@ def _deepcheck_run_cmd(dev: str, window: str, via_screen: bool, cmd: str) -> str
     cli = str(ROOT / "netdev")
     if via_screen:
         try:
-            subprocess.run([cli, "screen-send", window, cmd, "--yes"],
+            subprocess.run([cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
                            capture_output=True, timeout=20)
         except Exception as e:
             return f"<err> 下发失败：{e}"
@@ -2166,7 +2166,7 @@ def collect_metrics(dev: str) -> dict:
         if via_screen:
             for key, cmd in work.items():
                 try:
-                    subprocess.run([cli, "screen-send", window, cmd, "--yes"],
+                    subprocess.run([cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
                                    capture_output=True, timeout=20)
                 except Exception:
                     pass
@@ -2213,7 +2213,7 @@ def collect_metrics(dev: str) -> dict:
                     continue
                 if via_screen:
                     try:
-                        subprocess.run([cli, "screen-send", window, cand, "--yes"],
+                        subprocess.run([cli, "screen-send", window, cand, "--yes", "--src", "sys"],
                                        capture_output=True, timeout=20)
                     except Exception:
                         pass
@@ -2421,7 +2421,7 @@ def interface_detail(dev_name: str) -> dict:
     def _send(cmd):
         cli = str(ROOT / "netdev")
         try:
-            subprocess.run([cli, "screen-send", win, cmd, "--yes"],
+            subprocess.run([cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
                            capture_output=True, timeout=20)
         except Exception:
             pass
@@ -2563,7 +2563,7 @@ def metric_one(dev_name: str, key: str) -> dict:
         pass
     # 2) 发命令（走同屏，屏幕可见）
     try:
-        subprocess.run([cli, "screen-send", win, cmd, "--yes"],
+        subprocess.run([cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
                        capture_output=True, timeout=30)
     except Exception as e:
         return {"error": f"下发失败：{e}"}

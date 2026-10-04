@@ -93,13 +93,15 @@ host = sys.argv[1]
 port = int(sys.argv[2]) if len(sys.argv) > 2 else 23
 logfile = sys.argv[3] if len(sys.argv) > 3 else None
 
-sys.path.insert(0, os.path.expanduser("~/netops"))
+# IP 橙色高亮 + 输入回显著色（人=蓝/AI=紫/系统=灰）
+# ★ 路径按【桥脚本所在仓】推导，不写死 ~/netops（同 serial_bridge 注释）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from lib import colorize as _cz
-    _painter = _cz.BytePainter()
+    _echo = _cz.EchoPainter(device=(_DEV or {}).get("name", ""))
     _paint_on = _cz.enabled()
 except Exception:
-    _painter, _paint_on = None, False
+    _echo, _paint_on = None, False
 
 # ── 终端应答过滤：丢掉 xterm 等终端模拟器的自动应答 ──
 #    （不丢的话会被当成"用户输入"写进设备 → 屏幕被 "1;2c0;276;0c" 这类垃圾污染
@@ -274,7 +276,7 @@ def fix_keys(data: bytes) -> bytes:
 
 
 screen(f"\r\n[telnet 已连接] {host}:{port}\r\n"
-       f"[人机同屏会话；退出 Ctrl+]   IP高亮={'开' if _paint_on else '关'}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
+       f"[人机同屏会话；退出 Ctrl+]   IP高亮+输入着色={'开' if _paint_on else '关'}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
 
 last_data = time.time()
 try:
@@ -359,6 +361,8 @@ try:
                     _n = _tf.dropped_count(_d); _d = _tf.strip(_d)
                     if _n: log_raw(("[丢弃终端应答 %d 字节]\n" % _n).encode())
                 sock.sendall(_d)
+                if _paint_on and _echo:
+                    _echo.expect(_d)           # 登记期待回显 → 输入着色
             except OSError as e:
                 screen(f"\r\n[telnet] 发送失败: {e}\r\n".encode())
                 break
@@ -378,11 +382,11 @@ try:
             if clean:
                 last_data = time.time()
                 log_raw(bytes(clean))
-                screen(_painter.feed(clean) if _paint_on else clean)
+                screen(_echo.feed(clean) if _paint_on and _echo else clean)
                 # 看到登录提示就自动填凭据（telnet 通道原来完全没有这一步）
                 maybe_autologin(bytes(clean), sock)
-        elif _paint_on and _painter and _painter.pending() and time.time() - last_data > 0.15:
-            screen(_painter.flush())
+        elif _paint_on and _echo and _echo.pending() and time.time() - last_data > 0.15:
+            screen(_echo.flush())
 except Exception as e:
     import traceback
     screen(f"\r\n[telnet] 异常: {type(e).__name__}: {e}\r\n".encode())
