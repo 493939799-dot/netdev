@@ -63,7 +63,7 @@ and type into it; you watch it happen and can take over at any moment.
 
 ### Prebuilt installer (recommended)
 
-**[⬇ Download netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)** (~37 MB)
+**[⬇ Download netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)** (~33 MB)
 
 ```bash
 tar -xzf netdev-macos-arm64-installer.tar.gz

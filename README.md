@@ -37,16 +37,16 @@
 
 **已接入设备** —— 点一下设备清单，同屏终端就开了；你在终端里敲的字，AI 读到的也是同一块屏。
 
-![已接入设备：设备清单 / 同屏终端 / AI 助手 / 监控 / 快照 / 审计护栏](docs/NETDEV-网络设备调试终端-已接入.png)
+![已接入设备：设备清单 / 同屏终端 / AI 助手 / 状态 / 快照 / 审计护栏](docs/NETDEV-网络设备调试终端-已接入.png)
 
 **刚打开、还没接设备** —— 顶栏那一排是「写策略 / 后端 / 在线数 / AI 后端」，
 出问题时先看它们，再看下面的审计栏。
 
 ![未接入设备：初始状态](docs/NETDEV-网络设备调试终端-未接入.png)
 
-> 「已接入」那张是一台真实的华为 AR 路由器（USB 串口接入）；「未接入」那张用的是
-> 仓库自带的**本机模拟器**（`mock-hw`，模拟华为 VRP），任何人都能一键复现，
-> 不需要真设备。两张图都做过脱敏：串口序列号、终端状态栏里的本机局域网 IP 已打马赛克。
+> 两张截图用的都是仓库自带的**本机模拟器**（`mock-hw`，模拟华为 VRP，含模拟的接口翻动 /
+> 配置漂移日志），任何人 `./netdev mock start` 就能一键复现，不需要真设备。
+> 接真实设备时长一个样：真机走 USB 串口 / SSH / Telnet 都行。
 
 ---
 
@@ -86,11 +86,11 @@
 
 ## 开箱即用：设备接入与监控
 
-**平台不用懂，系统自动识别。** 接入设备时「平台」字段默认「自动识别」——连接后系统会发一条 `display version`，按厂商 banner 自动判断（华为 / 华三 / 锐捷 / 思科 / 迈普），再据此选对监控命令与解析规则。留空即可，不用记 platform 代号。
+**平台不用懂，系统自动识别。** 接入设备时「平台」字段默认「自动识别」——连接后系统会发一条 `display version`，按厂商 banner 自动判断（华为 / 华三 / 锐捷 / 思科 / 迈普），再据此选对采集命令与解析规则。留空即可，不用记 platform 代号。
 
-监控采集全程**静默直连**（SSH/Telnet 独立短连接，不打断前台同屏操作），命令与解析按厂商档案分派；档案未命中的指标显示「—」（绝不编造 0）。接上陌生厂商设备若指标显示「—」，用监控面板的「AI 提议解析规则」现场校准一次即可，不必改代码。
+采集全程**静默直连**（SSH/Telnet 独立短连接，不打断前台同屏操作；串口被前台占用时才走同屏），命令与解析按厂商档案分派；档案未命中的指标显示「—」（绝不编造 0）。
 
-**命令是学一次、一直用的。** 某条指标命令不被设备接受时，系统会自动逐条试候选并把命中结果**落盘记住**（`config/cmd-cache.json`），下次采集直接用它、不再重复探测。悬停监控副标题可看到「已学到 N 条命令」。
+**命令是学一次、一直用的。** 某条指标命令不被设备接受时，系统会自动逐条试候选并把命中结果**落盘记住**（`config/cmd-cache.json`），下次采集直接用它、不再重复探测。点状态面板的 📚 可查看/清除学到的规则。
 
 **状态面板：设备体温 ≠ 用户没断网。** 采集按「三层指标观」组织——
 **体验型**（出口 ping / DNS / NAT 水位 / DHCP 余量）决定徽章语义，
@@ -100,6 +100,9 @@
 每条之间横线分割，说不上来的直接说、不编。
 点 🔍 深体检：AI 先规划一组**只读命令**（过写操作黑名单双重过滤，被拦的如实展示、绝不执行），
 静默逐条跑完，再基于真实回显出全面诊断 —— 适合「说不上哪里不对」的时候。
+
+![状态面板：AI 结构化诊断 —— 徽章 + 一句话总结 + 逐条「情况 → 建议」，条目间横线分割](docs/NETDEV-状态面板-AI诊断.png)
+
 完整设计：[docs/monitor-status-design.md](docs/monitor-status-design.md)。
 
 ## AI 助手：只需要一把 API Key
@@ -189,7 +192,7 @@ AI 助手**只有一个后端：直连 OpenAI 兼容 API**。不依赖本机装�
 
 ### 方式一：下载安装包（推荐）
 
-**[⬇ 下载 netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)**（约 37 MB）
+**[⬇ 下载 netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)**（约 33 MB）
 
 下载后，在终端里依次执行：
 
@@ -303,9 +306,10 @@ uv pip install -r requirements.txt
 ```bash
 ./netdev selftest                                       # 端到端自检（打本机模拟器，不需要真设备）
 ./netdev doctor                                         # 环境 / 服务 / 串口 / 命令清单 / 日志
-python3 tests/test_ai_toolchain_and_cache.py           # 回归：AI 工具链一致性 + MCP 握手 + 采集缓存 + 平台识别（57 项）
+python3 tests/test_ai_toolchain_and_cache.py           # 回归：AI 工具链一致性 + MCP 握手 + 采集缓存 + 平台识别（135 项）
 python3 tests/test_approval_gates.py                   # 回归：写操作人审闸门（19 项，安全关键）
 python3 tests/test_mock_cmd.py                         # 回归：netdev mock 模拟器命令 + 行编辑语义（21 项）
+python3 tests/test_monitor.py                          # 回归：状态面板三层指标 / 探针解析 / 深体检闸门（90 项）
 python3 tests/test_ui_lifecycle.py                     # 回归：网页服务起停 / 幂等 / 真脱离进程组（27 项）
 ```
 
