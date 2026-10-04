@@ -121,6 +121,23 @@ def handle(st: State, cmd: str) -> str:
         return ("\nMemory Using Percentage Is: 32%\n"
                 "System Total Memory Is: 261516 bytes\n"
                 "Total Memory Used Is: 83684 bytes\n")
+    if low.startswith("display nat session statistics"):
+        # 体验层：NAT 会话水位（供 _parse_nat 联调）
+        return ("\n Slot: 0\n Current total sessions: 128\n Session upper limit: 4096\n")
+    if low.startswith("display ip pool"):
+        # 体验层：DHCP 池余量（供 _parse_dhcp 联调，Used/Idle 求和口径）
+        return ("\n Pool-name        : vlan1\n Used             : 35        Idle: 165\n"
+                " Pool-name        : guest\n Used             : 12        Idle: 88\n")
+    if low.startswith("display arp all") or low == "display arp":
+        # 变化层：ARP 表项数（供 _parse_arp_count 联调）
+        return ("\nIP address      MAC address    Type  VLAN  Interface\n"
+                "192.168.1.10    a1b2-c3d4-e5f6 Dynamic 1   GE0/0/1\n"
+                "192.168.1.11    a1b2-c3d4-e5f7 Dynamic 1   GE0/0/1\n"
+                "192.168.1.1     a1b2-c3d4-e5f8 Static  --    Vlanif1\n Total:3\n")
+    if low.startswith("nslookup"):
+        # 体验层：DNS 解析探针（供 _parse_dns 联调）
+        return ("\nServer: [114.114.114.114]\nAddress: 114.114.114.114\n\n"
+                "Name: www.baidu.com\nAddress: 14.215.177.38\n")
     if low.startswith("display logbuffer") or low in ("show logging", "display logfile"):
         # 供监控面板的日志分类（_parse_logbuffer）联调：
         # 混入 GE0/0/2 链路翻动 + OSPF 邻居变化样本，全部带时间戳正文行。
@@ -134,6 +151,7 @@ def handle(st: State, cmd: str) -> str:
             "2026-10-03 22:41:10  MOCK-HW %%01IFNET/4/IF_STATE(l)[6]:Interface GE0/0/1 has turned into DOWN state.\n"
             "2026-10-03 22:41:15  MOCK-HW %%01IFNET/4/IF_STATE(l)[7]:Interface GE0/0/1 has turned into UP state.\n"
             "2026-10-03 18:02:44  MOCK-HW %%01AAA/6/AAA_SUCCESS(l)[8]:User admin login successfully.\n"
+            "2026-10-03 16:44:02  MOCK-HW %%01MSTP/6/TOPO_CHANGE(l)[10]:MSTP topology change detected, TC received on port GE0/0/4.\n"
             "2026-10-02 11:20:05  MOCK-HW %%01CONFIG/6/CONFIG_SAVE(l)[9]:The configuration is saved successfully.\n"
         )
     if low in ("display users",):

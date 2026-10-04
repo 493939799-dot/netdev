@@ -53,6 +53,10 @@ PROFILES: dict[str, dict] = {
             "cpu":   "display cpu-usage",
             "mem":   "display memory-usage",
             "brief": "display interface brief",
+            "nat":     "display nat session statistics",
+            "dhcp":    "display ip pool",
+            "arp":     "display arp all",
+            "optical": "display transceiver diagnosis",
         },
         "parse": {
             "cpu": [
@@ -76,6 +80,10 @@ PROFILES: dict[str, dict] = {
             "cpu":   "display cpu-usage",
             "mem":   "display memory",
             "brief": "display interface brief",
+            "nat":     "display nat statistics",
+            "dhcp":    "display dhcp server statistics",
+            "arp":     "display arp",
+            "optical": "display transceiver diagnosis",
         },
         "parse": {
             "cpu": [
@@ -100,6 +108,10 @@ PROFILES: dict[str, dict] = {
             "cpu":   "show cpu",
             "mem":   "show memory",
             "brief": "show interfaces status",
+            "nat":     "show ip nat statistics",
+            "dhcp":    "show ip dhcp binding",
+            "arp":     "show arp",
+            "optical": "show interfaces transceiver",
         },
         "parse": {
             "cpu": [
@@ -123,6 +135,10 @@ PROFILES: dict[str, dict] = {
             "cpu":   "show processes cpu | include CPU utilization",
             "mem":   "show memory statistics",
             "brief": "show ip interface brief",
+            "nat":     "show ip nat statistics",
+            "dhcp":    "show ip dhcp binding",
+            "arp":     "show ip arp",
+            "optical": "show interfaces transceiver",
         },
         "parse": {
             "cpu": [
@@ -147,6 +163,10 @@ PROFILES: dict[str, dict] = {
             "cpu":   "display cpu-usage",
             "mem":   "display memory-usage",
             "brief": "display interface brief",
+            "nat":     "display nat session statistics",
+            "dhcp":    "display ip pool",
+            "arp":     "display arp all",
+            "optical": "display transceiver diagnosis",
         },
         "parse": {
             "cpu": [
@@ -335,6 +355,29 @@ CANDIDATES: dict[str, list[str]] = {
         "show interfaces status",            # 锐捷
         "show ip interface brief",           # 思科
         "display ip interface brief",        # 华为三层口视角
+    ],
+    # ── 2026-10-04 状态面板三层指标（体验/变化层）。全部只读；
+    #    设备不支持时走候选探测 + 静默降级为「--」，绝不当 0 用。
+    "nat": [
+        "display nat session statistics",    # 华为 AR（会话统计）
+        "show ip nat statistics",            # 思科 / 锐捷
+        "display nat statistics",            # 华三
+        "display nat session all",           # 兜底（输出大，放最后）
+    ],
+    "dhcp": [
+        "display ip pool",                   # 华为 / 迈普 S
+        "show ip dhcp binding",              # 思科 / 锐捷
+        "display dhcp server statistics",    # 华三
+        "display dhcp server used",          # 华三兜底
+    ],
+    "arp": [
+        "display arp all",                   # 华为 / 华三 / 迈普
+        "show ip arp",                       # 思科
+        "show arp",                          # 锐捷
+    ],
+    "optical": [
+        "display transceiver diagnosis",     # 华为 / 华三
+        "show interfaces transceiver",       # 思科 / 锐捷
     ],
 }
 

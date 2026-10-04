@@ -47,6 +47,7 @@ and type into it; you watch it happen and can take over at any moment.
 - **Metrics that admit ignorance** — an unparsed metric shows `—`. It never invents a `0`
 - **Learn once, use forever** — a metric command the device rejects is probed once, then cached to `config/cmd-cache.json`
 - **AI over a direct connection** — talks straight to any OpenAI-compatible API (DeepSeek / OpenAI / OpenRouter / your own gateway). One API key, no extra CLI, no background process. AI can also be switched off entirely
+- **AI status panel** — ⟳ quick scan (13 metrics collected silently, then AI turns structured facts into findings → actions) and 🔍 deep check (the AI plans a set of **read-only** commands, runs them all quietly, and diagnoses from real output — for those "something feels off" moments). Design notes: [docs/monitor-status-design.md](docs/monitor-status-design.md)
 - **Snapshots** — semantic diff (not raw line-by-line), restore-after-review, recycle bin for deletes
 - **Self-check** — `./netdev doctor` tells you what's wrong on this machine
 - **A web UI you can start with one command** — `netdev ui`

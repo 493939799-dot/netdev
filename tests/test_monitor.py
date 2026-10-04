@@ -106,12 +106,14 @@ HIT_LOG = {"supported": True, "total": 4,
 
 def test_delta_and_colors():
     print("\n[2] 增量口径 + 判色阈值")
+
     # 首次采集
     delta, rows = S._mon_delta_and_rows(_metrics(crc=100, in_err=0), None, NO_LOG)
     keys = [r["key"] for r in rows]
-    check("固定输出 6 行（log 行恒在，不支持时也占位）",
-          keys == ["cpu", "ram", "err", "uti", "int", "log"], repr(keys))
-    err = rows[2]
+    check("固定 13 行事实清单（体验/资源/变化/日志）",
+          keys == ["wan", "dns", "nat", "dhcp", "cpu", "ram", "err", "uti",
+                   "int", "optical", "arp", "cfg", "log"], repr(keys))
+    err = [r for r in rows if r["key"] == "err"][0]
     check("首次采集不报「在涨」", "首次采集" in err["note"] and err["status"] == "ok", repr(err))
     # 正常增量
     delta, rows = S._mon_delta_and_rows(_metrics(crc=105, in_err=1), {"crc": 100, "in_err": 0}, NO_LOG)
@@ -156,6 +158,109 @@ def test_delta_and_colors():
     _, rows = S._mon_delta_and_rows(_metrics(), None, NO_LOG)
     logrow = [r for r in rows if r["key"] == "log"][0]
     check("日志不支持 → ok 且不影响其他行", logrow["status"] == "ok", repr(logrow))
+
+
+# ======================================================================
+# 七、三层指标观（体验/变化层解析 + 配置漂移 + 深体检闸门）
+# ======================================================================
+def test_three_layers():
+    print("\n[7] 三层指标：探针解析 / 配置漂移 / 深体检闸门")
+    # ping：华为逐包 time= 与思科 Success rate 两种口径
+    r = S._parse_ping("time=38 ms\ntime=40 ms\n 5 packet(s) transmitted, 0.00% packet loss")
+    check("ping 华为式：丢包 0 + 逐包平均", r == {"loss": 0.0, "avg_ms": 39.0}, repr(r))
+    r = S._parse_ping("Success rate is 80 percent (4/5)\nround-trip min/avg/max = 1/2/4 ms")
+    check("ping 思科式：丢包 20% + min/avg/max", r == {"loss": 20.0, "avg_ms": 2.0}, repr(r))
+    check("ping 坏回显 → None", S._parse_ping("") is None
+          and S._parse_ping("Error: Unrecognized command") is None)
+    # ★ 全超时兜底（2026-10-04 真机教训）：统计行没出来/没有时不能装「未采集」，
+    #   出口真不通是事实，得按 Request time out 估丢包
+    r = S._parse_ping("Request time out\nRequest time out\nRequest time out\nRequest time out")
+    check("ping 全超时（无统计行）→ 丢包 100%", r == {"loss": 100.0, "avg_ms": None}, repr(r))
+    r = S._parse_ping("Request time out\ntime=38 ms")
+    check("ping 半程截断：1 超时 1 成功 → 丢包 50%", r == {"loss": 50.0, "avg_ms": 38.0}, repr(r))
+    # DNS
+    r = S._parse_dns("Server: [114.114.114.114]\nAddress: 114.114.114.114\n\n"
+                     "Name: www.baidu.com\nAddress: 14.215.177.38")
+    check("DNS 解析成功取回答地址", r == {"ok": True, "addr": "14.215.177.38"}, repr(r))
+    r = S._parse_dns("*** Unknown host www.nonexist.com")
+    check("DNS 解析失败 → ok=False（是事实不是采不到）", r == {"ok": False}, repr(r))
+    # NAT
+    r = S._parse_nat("Current total sessions: 128\nSession upper limit: 4096")
+    check("NAT 会话：used/cap/pct", r == {"used": 128, "cap": 4096, "pct": 3}, repr(r))
+    r = S._parse_nat("Total active translations: 12")
+    check("NAT 只有条数时 pct=None（不装懂）", r == {"used": 12, "cap": None, "pct": None}, repr(r))
+    # DHCP（多池求和）
+    r = S._parse_dhcp("Used             : 35        Idle: 165\nUsed             : 12        Idle: 88")
+    check("DHCP 多池求和：used 47 / idle 253", r == {"used": 47, "idle": 253}, repr(r))
+    # ★ 华为真机格式（2026-10-04 AR111-S 实采）：每池把同一组数字印两遍
+    #   （Pool-name 明细块 + IP address Statistic 汇总块），直接求和会双倍记账
+    r = S._parse_dhcp(
+        "  Pool-name        : vlan448\n"
+        "  Address Statistic: Total       :253       Used        :0\n"
+        "                     Idle        :253       Expired     :0\n"
+        "  IP address Statistic\n"
+        "    Total       :253\n"
+        "    Used        :0          Idle        :253\n")
+    check("DHCP 华为池头双记账：按池取末值不翻倍", r == {"used": 0, "idle": 253}, repr(r))
+    # ★ 同屏通道切段（2026-10-04 真机教训：不切段 dhcp/arp 采到了也解析成 null）
+    fake_screen = ("<AR111-S>display ip pool\nPool-name: p1 Used:0 Idle:253\n"
+                   "<AR111-S>display arp all\nTotal:6\n"
+                   "<AR111-S>display transceiver diagnosis\nError:Too many parameters\n")
+    segs = S._split_screen_by_cmds(fake_screen,
+                                   ["display ip pool", "display arp all",
+                                    "display transceiver diagnosis"])
+    check("同屏切段：各命令拿到自己的回显段",
+          "Pool-name: p1" in segs.get("display ip pool", "")
+          and "Total:6" in segs.get("display arp all", "")
+          and "Error" in segs.get("display transceiver diagnosis", ""), repr(segs))
+    segs = S._split_screen_by_cmds(fake_screen, ["display ip pool", "display lldp neighbor"])
+    check("同屏切段：被顶出屏的命令跳过不误切",
+          "Total:6" in segs.get("display ip pool", "")
+          and "display lldp neighbor" not in segs, repr(segs))
+    # ★ 跨轮次残留（2026-10-04 真机教训）：滚动缓冲里上一轮回显还在，
+    #   必须锚定最新一轮 —— 否则切出跨轮巨段，混进旧 Error 被 _bad_echo 否决
+    two_rounds = ("<AR>display ip pool\nError: bad\n<AR>display arp all\nTotal:99\n<AR>"
+                  "<AR>display ip pool\nUsed:0 Idle:253\n<AR>display arp all\nTotal:6\n<AR>")
+    segs = S._split_screen_by_cmds(two_rounds, ["display ip pool", "display arp all"])
+    check("同屏切段：滚动缓冲有上一轮残留时锚定最新一轮",
+          segs.get("display arp all", "").strip().startswith("Total:6")
+          and "Used:0" in segs.get("display ip pool", "")
+          and "Total:99" not in segs.get("display arp all", ""), repr(segs))
+    # ARP
+    check("ARP Total 行优先", S._parse_arp_count("Total:3") == 3)
+    # 光衰
+    r = S._parse_optical("Rx Power(dBm): -12.50\nRx Power(dBm): -25.10")
+    check("光衰：最弱 -25.1", r == {"min": -25.1, "max": -12.5, "n": 2}, repr(r))
+    # 配置漂移（基线哈希对比）
+    _, rows = S._mon_delta_and_rows({"cfg_sha": "aaa1"}, {"cfg_sha": "bbb2"}, NO_LOG)
+    cfg = [r for r in rows if r["key"] == "cfg"][0]
+    check("配置哈希变了 → warn「已变更」", cfg["status"] == "warn" and cfg["val"] == "已变更", repr(cfg))
+    _, rows = S._mon_delta_and_rows({"cfg_sha": "aaa1"}, {"cfg_sha": "aaa1"}, NO_LOG)
+    cfg = [r for r in rows if r["key"] == "cfg"][0]
+    check("配置一致 → ok", cfg["status"] == "ok" and cfg["val"] == "无变更", repr(cfg))
+    # ARP 突增
+    _, rows = S._mon_delta_and_rows({"arp": 200}, {"arp": 100}, NO_LOG)
+    arp = [r for r in rows if r["key"] == "arp"][0]
+    check("ARP 翻倍 → warn（环路/扫描前兆）", arp["status"] == "warn", repr(arp))
+    # STP/拓扑 分类
+    r = S._parse_logbuffer("2026-10-03 16:44:02 M MSTP topology change detected, TC received on port GE0/0/4.\n")
+    check("STP/拓扑归独立线索类", any(h["cat"] == "STP/拓扑" for h in r["hits"]), repr(r))
+
+    # 深体检：只读闸门
+    r = S.parse_deepcheck_plan('{"cmds":["display interface","show version",'
+                               '"save config","undo stp all","display cpu-usage",'
+                               '"display interface","reboot"]}')
+    check("闸门放行 display/show、拦截写命令、去重",
+          r.get("cmds") == ["display interface", "show version", "display cpu-usage"]
+          and len(r.get("rejected", [])) >= 2, repr(r))
+    check("全被拦下 → error 不执行", "error" in S.parse_deepcheck_plan('{"cmds":["save","reboot"]}'))
+    check("非 JSON 计划 → error", "error" in S.parse_deepcheck_plan("我觉得应该看看接口"))
+    check("闸门本身：ping 不算只读体检命令（防借道）", not S._deepcheck_gate("ping 1.2.3.4 -c 999"))
+
+    # 前端断言守（深体检入口）
+    html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+    check("深体检按钮 + 端点接线", 'id="btnDeep"' in html and "'/api/deepcheck'" in html)
+    check("计划展示（可折叠，标注闸门拦截数）", 'dplan' in html and "dg.plan" in html)
 
 
 # ======================================================================
@@ -283,5 +388,6 @@ if __name__ == "__main__":
     test_log_cmd_and_mock()
     test_frontend()
     test_ai_diagnose()
+    test_three_layers()
     print(f"\n共 {len(PASS) + len(FAIL)} 项：OK {len(PASS)} / NG {len(FAIL)}")
     sys.exit(1 if FAIL else 0)

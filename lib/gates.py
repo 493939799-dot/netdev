@@ -25,6 +25,7 @@ _BLOCKED_RE = [
 _READ_ONLY_RE = [
     r"^display\b", r"^dis\b", r"^show\b", r"^dir\b", r"^more\b", r"^pwd\b",
     r"^ping\b", r"^tracert\b", r"^traceroute\b", r"^telnet\b", r"^ssh\b",
+    r"^nslookup\b",                       # DNS 查询（只读探针，2026-10-04 状态面板加）
     r"^screen-length\s+0\s+temporary\b", r"^undo\s+terminal\s+monitor\b",
     r"^terminal\s+", r"^return\s*$", r"^quit\s*$",
     r"^exit\s*$", r"^\?\s*$", r"^help\s*$",

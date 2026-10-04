@@ -1232,19 +1232,22 @@ MON_CMDS = {                       # 兼容旧引用：默认（华为）命令�
 }
 
 
-def mon_cmds(platform: str | None, dev: str = "") -> dict:
+def mon_cmds(platform: str | None, dev: str = "",
+             keys: list | None = None) -> dict:
     """按平台取监控命令表，并叠加「这台设备已学到的命令」。
 
     ★ 2026-10-01 修：原来只取平台默认命令，探测命中后 cache_put 的结果**从来没人用**，
       于是每轮采集都要先把默认命令撞一次墙、再逐条试候选（串口每条 1~2 秒）。
       现在走 platforms.plan_commands：学到的直接生效，第二次采集零探测成本。
+    ★ 2026-10-04 三层指标观：keys 扩到 nat/dhcp/arp/optical（不支持的平台走候选探测降级）。
     """
+    ks = keys or ["cpu", "mem", "brief"]
     if _plat is None:
         return dict(MON_CMDS)
     try:
-        c = _plat.plan_commands(platform, dev, ["cpu", "mem", "brief"])
+        c = _plat.plan_commands(platform, dev, ks)
     except Exception:
-        c = _plat.commands_for(platform, ["cpu", "mem", "brief"])
+        c = _plat.commands_for(platform, ks)
     return c or dict(MON_CMDS)
 
 
@@ -1433,7 +1436,9 @@ def _mon_baseline_append(dev: str, m: dict):
                "cpu": (m.get("cpu_1m") if m.get("cpu_1m") is not None else m.get("cpu_10s")),
                "mem_pct": m.get("mem_pct"), "if_up": m.get("if_up"),
                "if_total": m.get("if_total"),
-               "if_in_max": m.get("if_in_max"), "if_out_max": m.get("if_out_max")}
+               "if_in_max": m.get("if_in_max"), "if_out_max": m.get("if_out_max"),
+               "arp": m.get("arp"),                  # 变化层：ARP 突增基线
+               "cfg_sha": m.get("cfg_sha")}          # 变化层：配置漂移哈希
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         lines = p.read_text(encoding="utf-8").splitlines()
@@ -1465,7 +1470,8 @@ def _parse_logbuffer(text: str) -> dict:
             r"LINE\s*PROTO|link\s*(?:down|up)|changed\s+state\s+to\s+(?:down|up)"
             r"|turned\s+into\s+(?:down|up)|Interface\s+\S+\s+(?:changed|down|up)", _re.I)),
         ("路由邻居", _re.compile(r"OSPF|BGP|neighbor|peer\s+state|adjacency\s+chang", _re.I)),
-        ("环路信号", _re.compile(r"mac[-_ ]?(?:mov|flap)|loopback|flapping", _re.I)),
+        ("环路信号", _re.compile(r"mac[-_ ]?(?:mov|flap)|loopback|flapping|loop\s+detect|discarding", _re.I)),
+        ("STP/拓扑", _re.compile(r"\bSTP\b|spanning|topology\s*chang|TCN|\bTC\b\s+receiv|root\s*chang", _re.I)),
         ("告警", _re.compile(r"ALARM|CRITICAL|over\s*temperature|over\s*load", _re.I)),
     ]
     hits = []
@@ -1476,10 +1482,142 @@ def _parse_logbuffer(text: str) -> dict:
     return {"supported": True, "total": total, "hits": hits}
 
 
+# ── 体验/变化层解析（2026-10-04 三层指标观 · 批次一二）────────────────
+#   口径纪律与 _parse_logbuffer 一致：抠不到就安静返回 None（-- 绝不当 0 用），
+#   设备不支持某项时整行降级，不影响其他指标。
+def _bad_echo(text: str) -> bool:
+    t = text or ""
+    return (not t.strip() or "Unrecognized" in t
+            or t.startswith("<err>") or "<err>" in t[:20])
+
+
+def _parse_ping(text: str) -> dict | None:
+    """ping 探针：丢包率 + 平均时延。华为（time= 逐包/统计行）与思科（Success rate）通吃。"""
+    if _bad_echo(text):
+        return None
+    t = text
+    loss = None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*packet loss", t)
+    if m:
+        loss = float(m.group(1))
+    else:
+        m = re.search(r"Success rate is (\d+) percent", t, re.I)
+        if m:
+            loss = round(100.0 - float(m.group(1)), 1)
+    avg = None
+    times = [float(x) for x in re.findall(r"time[=:]\s*([\d.]+)\s*ms", t)]
+    if times:
+        avg = round(sum(times) / len(times), 1)
+    else:
+        m = re.search(r"min/avg/max[^=\n]*=\s*[\d.]+\s*/([\d.]+)\s*/[\d.]+", t)
+        if m:
+            avg = float(m.group(1))
+    # ★ 全超时兜底（2026-10-04 真机教训）：统计行还没出来/没有时，
+    #   用「Request time out 包数 + time= 成功包数」估丢包 —— 出口真不通时
+    #   不能装作「未采集」，那等于把真故障吞掉。
+    if loss is None:
+        _to = len(re.findall(r"Request time out", t, re.I))
+        if _to:
+            loss = round(_to * 100.0 / (_to + len(times)), 1)
+    if loss is None and avg is None:
+        return None
+    return {"loss": loss, "avg_ms": avg}
+
+
+def _parse_dns(text: str) -> dict | None:
+    """nslookup 探针：能否解析出地址。"""
+    if _bad_echo(text):
+        return None
+    if re.search(r"(\*\*\*|no address|unknown host|can'?t find|timed?\s*out|failed)", text, re.I):
+        return {"ok": False}
+    addrs = re.findall(r"Address:\s*([\d.]+)", text)
+    if addrs:
+        return {"ok": True, "addr": addrs[-1]}
+    return None
+
+
+def _parse_nat(text: str) -> dict | None:
+    """NAT 会话水位：used / cap / pct。格式不齐时只报 count。"""
+    if _bad_echo(text):
+        return None
+    t = text
+    used = cap = None
+    for pat in (r"(?:current\s+)?total\s+(?:number\s+of\s+)?sessions?\s*[:：]?\s*(\d+)",
+                r"Total active translations:\s*(\d+)"):
+        m = re.search(pat, t, re.I)
+        if m:
+            used = int(m.group(1))
+            break
+    m = re.search(r"(?:upper\s*limit|capacity|max(?:imum)?\s+sessions?)\s*[:：]?\s*(\d+)", t, re.I)
+    if m:
+        cap = int(m.group(1))
+    if used is None and cap is None:
+        return None
+    pct = round(used / cap * 100) if (used is not None and cap) else None
+    return {"used": used, "cap": cap, "pct": pct}
+
+
+def _parse_dhcp(text: str) -> dict | None:
+    """DHCP 池余量：display ip pool 的 Used/Idle 求和，或 show ip dhcp binding 数绑定行。
+    ★ 华为每个池会把同一组数字印两遍（Pool-name 明细块 + "IP address Statistic" 汇总块），
+      直接求和会双倍记账 —— 有 "Pool-name" 时按池分段、每段取**最后一个** Used/Idle，
+      跨池求和；没有池头的格式（mock/其他厂商）维持简单求和。"""
+    if _bad_echo(text):
+        return None
+    t = text
+    if "Pool-name" in t:
+        # 按池头切段，每段取末次出现的 Used / Idle
+        sections = re.split(r"^\s*Pool-name\b", t, flags=re.M)[1:]
+        used = idle = 0
+        seen = False
+        for sec in sections:
+            u = re.findall(r"Used\s*[:：]\s*(\d+)", sec)
+            i = re.findall(r"Idle\s*[:：]\s*(\d+)", sec)
+            if u:
+                used += int(u[-1]); seen = True
+            if i:
+                idle += int(i[-1]); seen = True
+        if seen:
+            return {"used": used, "idle": idle}
+        return None
+    used = sum(int(x) for x in re.findall(r"Used\s*[:：]\s*(\d+)", t)) or None
+    idle = sum(int(x) for x in re.findall(r"Idle\s*[:：]\s*(\d+)", t)) or None
+    if used is None and idle is None:
+        n = len(re.findall(r"^\s*\d{1,3}(?:\.\d{1,3}){3}\s+\S+", t, re.M))
+        if n:
+            return {"used": n, "idle": None}
+        return None
+    return {"used": used or 0, "idle": idle}
+
+
+def _parse_arp_count(text: str) -> int | None:
+    """ARP 表项数：优先 Total 行，兜底数含 IP 的行。"""
+    if _bad_echo(text):
+        return None
+    m = re.search(r"Total\s*[:：]?\s*(\d+)", text)
+    if m:
+        return int(m.group(1))
+    n = len(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text))
+    return n or None
+
+
+def _parse_optical(text: str) -> dict | None:
+    """光模块收光（Rx dBm）：报最弱/最强 + 端口数。预警口径：<-20 过弱，>-3 过强。
+    ★ 华为正文是 "Rx Power(dBm): -12.50"（值不带单位后缀），所以按「Rx…冒号 值」抠，
+      不能要求 "值 dBm"；思科表格式（纯列）暂不支持 → 静默降级 --。"""
+    if _bad_echo(text):
+        return None
+    rx = [float(x) for x in re.findall(r"Rx[^:\n]*[:：]\s*(-?\d+(?:\.\d+)?)", text, re.I)]
+    if not rx:
+        return None
+    return {"min": min(rx), "max": max(rx), "n": len(rx)}
+
+
 def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, list]:
-    """增量计算 + 表格行构造（含判色）。判色规则：
-    bad=var(--bad) 立刻看 ｜ warn=var(--warn) 留意 ｜ ok 正常（不标）。
-    手动档简化：错包增量>0 即报「在涨」（基线跨次累积）；「连续 2 轮」防误报规则留给自动档。"""
+    """事实清单构造（含判色）——喂给 AI 做诊断的「结构化指标」。
+    2026-10-04 三层指标观重排：体验型（决定徽章语义）→ 资源型 → 变化型 → 日志。
+    判色：bad=var(--bad) 立刻看 ｜ warn=var(--warn) 留意 ｜ ok 正常（不标）。
+    缺项一律 "--"（采不到 ≠ 0），AI 的 prompt 里明确「不要编造没给的数值」。"""
     delta = {}
     for k in ("crc", "in_err"):
         if m.get(k) is not None and last and last.get(k) is not None:
@@ -1491,6 +1629,49 @@ def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, li
         rows.append({"key": key, "label": label, "val": val, "status": status,
                      "note": note, "cmd": cmd})
 
+    # ══ 体验型 ══
+    # 出口连通（设备→公网探针）
+    p = m.get("wan")
+    if p:
+        _ls = "bad" if (p.get("loss") or 0) >= 20 else ("warn" if (p.get("loss") or 0) > 0 else "ok")
+        _v = f"丢包 {p['loss']:g}%" if p.get("loss") is not None else "丢包 --"
+        if p.get("avg_ms") is not None:
+            _v += f" · 均 {p['avg_ms']:g}ms"
+        _row("wan", "出口连通", _v, _ls, "设备→公网探针 223.5.5.5", "ping 223.5.5.5")
+    else:
+        _row("wan", "出口连通", "--", "ok", "未采到（设备不支持或未配置）", "ping 223.5.5.5")
+    # DNS 解析
+    d = m.get("dns")
+    if d:
+        _row("dns", "DNS 解析", ("正常 " + d["addr"]) if d.get("ok") else "解析失败",
+             "ok" if d.get("ok") else "bad", "nslookup 公网域名", "nslookup www.baidu.com")
+    else:
+        _row("dns", "DNS 解析", "--", "ok", "未采到（设备不支持或未配置）", "nslookup www.baidu.com")
+    # NAT 会话水位
+    n = m.get("nat")
+    if n:
+        _ps = "bad" if (n.get("pct") or 0) >= 90 else ("warn" if (n.get("pct") or 0) >= 80 else "ok")
+        _v = f"{n['used']} 条" if n.get("used") is not None else "--"
+        if n.get("pct") is not None:
+            _v += f"（{n['pct']}% 水位）"
+        _row("nat", "NAT 会话", _v, _ps,
+             f"容量 {n['cap']}" if n.get("cap") else "设备未报容量，仅报条数", "display nat session statistics")
+    else:
+        _row("nat", "NAT 会话", "--", "ok", "未采到（设备不支持或未配置）", "display nat session statistics")
+    # DHCP 池
+    h = m.get("dhcp")
+    if h:
+        _tot = (h.get("used") or 0) + (h.get("idle") or 0)
+        _pct = round((h.get("used") or 0) / _tot * 100) if _tot else None
+        _ps = "bad" if (_pct or 0) >= 95 else ("warn" if (_pct or 0) >= 90 else "ok")
+        _v = f"已用 {h.get('used')}" + (f" / 余 {h.get('idle')}" if h.get("idle") is not None else "")
+        if _pct is not None:
+            _v += f"（{_pct}%）"
+        _row("dhcp", "DHCP 池", _v, _ps, "地址池用量（耗尽=新终端进不来）", "display ip pool")
+    else:
+        _row("dhcp", "DHCP 池", "--", "ok", "未采到（设备不支持或未配置）", "display ip pool")
+
+    # ══ 资源型 ══
     # CPU
     cpu = m.get("cpu_1m") if m.get("cpu_1m") is not None else m.get("cpu_10s")
     _cs = "ok"
@@ -1501,7 +1682,7 @@ def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, li
         f"5min {m['cpu_5m']}%" if m.get("cpu_5m") is not None else "",
         f"峰值 {m['cpu_max']}%" if m.get("cpu_max") is not None else ""] if x)
     _row("cpu", "CPU", (f"{cpu:g}%" if cpu is not None else "--"), _cs,
-         _cpu_note or "采不到（点 ⚡ 让 AI 学规则）", "display cpu-usage")
+         _cpu_note or "采不到（平台档案未命中）", "display cpu-usage")
     # 内存
     mem = m.get("mem_pct")
     _ms = "bad" if (mem or 0) >= 95 else ("warn" if (mem or 0) >= 90 else "ok")
@@ -1536,7 +1717,47 @@ def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, li
             _inote = "与上次持平"
     _row("int", "接口 up", (f"{_up}/{_tot}" if _up is not None else "--"), _ins, _inote,
          "display interface brief")
-    # 设备日志（logbuffer 兜底）
+    # 光衰（比 CRC 更早的链路预警）
+    o = m.get("optical")
+    if o:
+        _os = "warn" if (o.get("min") is not None and o["min"] < -20) \
+                       or (o.get("max") is not None and o["max"] > -3) else "ok"
+        _row("optical", "光衰", f"最弱 {o['min']:g} dBm", _os,
+             f"{o['n']} 个光口 · 正常区间 -3 ~ -20 dBm", "display transceiver diagnosis")
+    else:
+        _row("optical", "光衰", "--", "ok", "未采到（电口设备不支持属正常）", "display transceiver diagnosis")
+
+    # ══ 变化型 ══
+    # ARP 表项（突增 = 环路/扫描前兆）
+    _arp = m.get("arp")
+    if _arp is not None:
+        _as = "ok"
+        _anote = "首次采集（下次起报突增）"
+        if last and last.get("arp") is not None:
+            _ad = _arp - last["arp"]
+            _la = last["arp"]
+            _surge = _ad >= 50 or (_la > 0 and _arp > _la * 1.5)
+            if _surge:
+                _as, _anote = "warn", f"比上次多 {_ad} 条（环路/扫描前兆？）"
+            elif _ad < 0:
+                _anote = f"比上次少 {-_ad} 条"
+            else:
+                _anote = "与上次持平"
+        _row("arp", "ARP 表项", str(_arp), _as, _anote, "display arp all")
+    else:
+        _row("arp", "ARP 表项", "--", "ok", "未采到（设备不支持或未配置）", "display arp all")
+    # 配置漂移（与上次采集的哈希对比）
+    _sha = m.get("cfg_sha")
+    if _sha:
+        _chg = bool(last and last.get("cfg_sha") and last["cfg_sha"] != _sha)
+        _row("cfg", "配置漂移", "已变更" if _chg else "无变更",
+             "warn" if _chg else "ok",
+             (f"与上次采集不一致（上次 {_sha} → 本次不同）" if _chg
+              else "与上次采集一致"), "display current-configuration")
+    else:
+        _row("cfg", "配置漂移", "--", "ok", "未采到", "display current-configuration")
+
+    # ══ 日志兜底 ══
     if log.get("supported"):
         _lh = log.get("hits", [])
         _ls = "warn" if _lh else "ok"
@@ -1577,9 +1798,11 @@ def ai_diagnose_prompt(dev: str, mon: dict) -> str:
                      f"最高 {max(hist):g}% / 最新 {hist[-1]:g}%")
     lines += [
         "",
-        "请以中小企业网络排障工程师视角分析这份指标，关注：CPU/内存是否持续偏高、",
-        "错包是否在增长（链路/光模块劣化）、接口占用率是否接近打满、接口翻动、",
-        "路由邻居震荡、环路信号。只依据上面给出的数值，不要编造没给的数据。",
+        "请以中小企业网络排障工程师视角分析这份指标，关注：出口连通性与 DNS（用户体验",
+        "优先）、NAT 会话/DHCP 池是否接近耗尽、CPU/内存是否持续偏高、错包是否在增长",
+        "（链路/光模块劣化）、光衰是否异常、接口占用率是否接近打满、接口翻动、路由邻居",
+        "震荡、环路信号、ARP 突增、配置是否被人改过。只依据上面给出的数值，",
+        "不要编造没给的数据；标注「未采到」的项视为该设备不支持，忽略即可。",
         "",
         "输出要求（**规整、抓重点**——界面按条展示，条与条之间用横线分割）：",
         "1. 最多 4 条；正常项合并成 1 条，没有异常就 overall=ok 且只给 1 条。",
@@ -1651,6 +1874,218 @@ def ai_diagnose(dev: str, mon: dict) -> dict:
     return parse_diag_json(out_text)
 
 
+# ── AI 深体检（批次三，2026-10-04）────────────────────────────────────
+#   快诊管日常（固定指标、秒级）；深体检管「说不上哪不对就是不对」：
+#   AI 规划一组【只读】命令 → 逐条执行 → 全部回显再交 AI 出结构化结论。
+#   ★ 闸门纪律不破：命令双重过滤（display/show 白名单 + 写操作黑名单），
+#     上限 20 条，逐条 30s 超时；仍是【人工点按钮】触发的一次性动作。
+_DEEP_DENY = re.compile(
+    r"\b(undo|save|reset|reboot|delete|clear|shutdown|restore|upgrade|"
+    r"copy|move|rename|replace|reload|erase|write)\b", re.I)
+
+
+def _deepcheck_gate(cmd: str) -> bool:
+    """只读闸门：必须以 display/show 开头，且不含任何写操作词，长度受控。"""
+    c = (cmd or "").strip()
+    if not c or len(c) > 80:
+        return False
+    if not re.match(r"^(display|show)\b", c, re.I):
+        return False
+    if _DEEP_DENY.search(c):
+        return False
+    return True
+
+
+def deepcheck_plan_prompt(dev: str, platform: str | None, last: dict | None) -> str:
+    """让 AI 按设备情况规划只读体检命令。喂它：平台、快诊基线摘要、已学命令。"""
+    base = {
+        "huawei_vrp": "display 系（华为 VRP）", "h3c_comware": "display 系（华三 Comware）",
+        "ruijie_os": "show 系（锐捷 RGOS）", "cisco_ios": "show 系（思科 IOS）",
+        "maipu_s": "display 系（迈普，类华为）",
+    }.get(platform or "", "display/show 系（厂商未标注，两种都可用）")
+    learned = {}
+    try:
+        learned = _plat.cache_all(dev) if _plat is not None else {}
+    except Exception:
+        learned = {}
+    lines = [f"设备 {dev}（命令体系：{base}）。",
+             "刚做过快诊，固定指标摘要如下（JSONL 基线，可能为空）：",
+             json.dumps({k: v for k, v in (last or {}).items() if k != "at"},
+                        ensure_ascii=False)[:600] or "（无基线，设备还没快诊过）", ""]
+    if learned:
+        lines.append("这台设备已学到的可用命令：" + json.dumps(learned, ensure_ascii=False))
+    lines += [
+        "请为它规划一轮【只读】深度体检命令（5~20 条），覆盖快诊没查到的排障面，例如：",
+        "接口 detailed 错误计数、风暴抑制/err-disable、STP 状态、双工协商、",
+        "PPPoE/拨号状态、NAT 与会话、DHCP、路由表摘要、温度电源风扇、登录用户、CPU 进程排名。",
+        "只规划该设备命令体系里【真实存在】的命令；宁缺毋滥，不确定它支持就不要给。",
+        "",
+        "只输出一个 JSON：{\"cmds\": [\"命令1\", \"命令2\", …]}，不要解释、不要围栏。",
+    ]
+    return "\n".join(lines)
+
+
+def parse_deepcheck_plan(text: str) -> dict:
+    """解析 AI 的体检计划：JSON 容错 + 逐条过只读闸门 + 去重 + 上限 20 条。
+    全被闸门拦下 → {'error': ...}（绝不执行任何未过闸的命令）。"""
+    import re as _re
+    t = (text or "").strip()
+    t = _re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=_re.S).strip()
+    m = _re.search(r"\{.*\}", t, _re.S)
+    if not m:
+        return {"error": "AI 没有返回 JSON 计划", "raw": (text or "")[:300]}
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return {"error": "AI 的计划 JSON 解析失败", "raw": m.group(0)[:300]}
+    raw_cmds = obj.get("cmds") if isinstance(obj, dict) else None
+    if not isinstance(raw_cmds, list):
+        return {"error": "计划里没有 cmds 列表", "raw": m.group(0)[:300]}
+    cmds, rejected = [], []
+    for c in raw_cmds:
+        if not isinstance(c, str):
+            continue
+        c = c.strip()
+        if not c:
+            continue
+        if _deepcheck_gate(c):
+            if c.lower() not in [x.lower() for x in cmds]:
+                cmds.append(c)
+        else:
+            rejected.append(c[:60])
+    if not cmds:
+        return {"error": "AI 给的命令全部未通过只读闸门（已拒绝执行）", "rejected": rejected}
+    return {"cmds": cmds[:20], "rejected": rejected}
+
+
+def deepcheck_diag_prompt(dev: str, plan: list, raws: dict, platform: str | None) -> str:
+    """把体检回显交给 AI 出结论（与快诊同 schema，允许最多 6 条 items）。"""
+    lines = [f"设备 {dev}（平台 {platform or '未标注'}）刚完成一轮 AI 规划的只读深体检。", ""]
+    for cmd in plan:
+        body = (raws.get(cmd) or "").strip()
+        lines.append(f"===== `{cmd}` =====")
+        lines.append(body[:1500] if body else "（无回显/执行失败）")
+        lines.append("")
+    lines += [
+        "请以排障工程师视角通读以上回显，找出快诊覆盖不到的问题：接口错误细节、风暴抑制、",
+        "err-disable、STP 异常、双工错配、拨号/隧道状态、路由异常、硬件预警等。",
+        "只依据回显里的内容下结论，不要编造。",
+        "",
+        "输出要求（**规整、抓重点**）：最多 6 条；title ≤12 字短语；detail 引用回显里的具体内容；",
+        "action 只给一条最该做的命令或动作。全部正常就 overall=ok 且只给 1 条。",
+        "",
+        "只输出一个 JSON 对象，不要解释、不要代码块围栏，格式：",
+        '{"overall": "ok|warn|bad", "summary": "一句话总体判断（不超过 40 字）",',
+        ' "items": [{"sev": "ok|warn|bad", "title": "情况标题",',
+        '  "detail": "关键事实（引用回显内容）", "action": "单条建议命令或动作"}]}',
+    ]
+    return "\n".join(lines)
+
+
+def _deepcheck_run_cmd(dev: str, window: str, via_screen: bool, cmd: str) -> str:
+    """执行单条只读命令：直连优先（静默）；串口被占走同屏。"""
+    cli = str(ROOT / "netdev")
+    if via_screen:
+        try:
+            subprocess.run([cli, "screen-send", window, cmd, "--yes"],
+                           capture_output=True, timeout=20)
+        except Exception as e:
+            return f"<err> 下发失败：{e}"
+        time.sleep(1.6)
+        _rc, t, _e = raw_netdev(["screen-read", window, "--lines", "400"], timeout=25)
+        return strip_ansi(t)
+    _rc, t, err = raw_netdev(["run", dev, cmd], timeout=30)
+    return strip_ansi(t) if not err else f"<err> {err[:200]}"
+
+
+def ai_deepcheck(dev: str) -> dict:
+    """深体检全链路：AI 规划 → 闸门 → 执行 → AI 诊断。任何一步失败返回 {'error': ...}。"""
+    cfg = _direct_cfg()
+    if not cfg["ok"]:
+        return {"error": "直连 AI 未配置：" + cfg["note"]}
+    platform = _platform_of(dev)
+    last = _mon_baseline_load(dev)
+
+    # ① AI 规划
+    try:
+        s = DirectSession("__deepplan__", model="", tools="read")
+        resp = s._chat([{"role": "user",
+                         "content": deepcheck_plan_prompt(dev, platform, last)}], stream=False)
+        body_raw = resp.read().decode("utf-8", "replace")
+        if resp.status != 200:
+            return {"error": f"规划阶段直连 API 返回 {resp.status}: {body_raw[:150]}"}
+        out = json.loads(body_raw)["choices"][0]["message"]["content"] or ""
+    except Exception as e:
+        return {"error": f"规划阶段请求失败：{type(e).__name__}: {e}"}
+    plan_r = parse_deepcheck_plan(out)
+    if plan_r.get("error"):
+        return plan_r
+    plan = plan_r["cmds"]
+
+    # ② 执行（闸门已过；直连优先，串口被占走同屏）
+    wins = _tmux_live_windows()
+    info = resolve_device(dev)
+    window = info.get("window") or dev
+    proto = (info.get("protocol") or "").strip().lower()
+    via_screen = bool(proto == "serial" and window in wins)
+    raws = {}
+    for cmd in plan:
+        raws[cmd] = _deepcheck_run_cmd(dev, window, via_screen, cmd)[:4000]
+
+    # ③ AI 诊断
+    try:
+        s2 = DirectSession("__deepdiag__", model="", tools="read")
+        resp2 = s2._chat([{"role": "user",
+                           "content": deepcheck_diag_prompt(dev, plan, raws, platform)}],
+                          stream=False)
+        body2 = resp2.read().decode("utf-8", "replace")
+        if resp2.status != 200:
+            return {"error": f"诊断阶段直连 API 返回 {resp2.status}: {body2[:150]}"}
+        out2 = json.loads(body2)["choices"][0]["message"]["content"] or ""
+    except Exception as e:
+        return {"error": f"诊断阶段请求失败：{type(e).__name__}: {e}"}
+    diag = parse_diag_json(out2)
+    if not diag.get("error"):
+        diag["plan"] = plan
+        diag["rejected"] = plan_r.get("rejected") or []
+        diag["via"] = "同屏（串口被前台占用）" if via_screen else "直连（静默）"
+    return diag
+
+
+def _split_screen_by_cmds(screen: str, cmds: list) -> dict:
+    """同屏回显按命令回显出现的位置切段（cmd → 该命令的回显段）。
+    ★ 2026-10-04 真机教训：同屏通道只有一整块屏幕、没有逐条回显 —— 不切段的话，
+      dhcp/arp 明明采到了，按各键解析时拿到的却是空串 → 全部「未采集」。
+    切法：按发送顺序在屏幕文本里依次定位每条命令的回显位置，切到下一条命令为止；
+    屏幕里找不到的命令（被顶出 900 行屏）跳过。
+    ★ 段尾兜底是【下一个裸提示符行】而不是屏幕末尾 —— 真机教训：后面的命令是在
+      前一条还没跑完时敲进去的（VRP 执行期间不回显输入），它的回显找不到时，
+      不兜底就会把 current-configuration 整段划进前一条命令的段里。
+    ★ 锚定必须是【倒序 rfind 取最新一轮】—— 真机教训：tmux 滚动缓冲跨轮次保留，
+      900 行屏里常有上一轮的回显残留；正序 find 会锚到上一轮，切出「上一轮 ping
+      → 本轮 nslookup」的巨段，混进上一轮的 Error 文本后被 _bad_echo 整段否决。"""
+    prompt_line = re.compile(r"^\s*(?:[<\[][\w.\-]{1,30}[>\]]|[\w.\-]{1,30}[>#])\s*$", re.M)
+    pos = len(screen)
+    cuts = []
+    for c in reversed(cmds):
+        p = screen.rfind(c, 0, pos)
+        cuts.append((c, p))
+        if p >= 0:
+            pos = p
+    cuts.reverse()
+    segs = {}
+    for i, (c, p) in enumerate(cuts):
+        if p < 0:
+            continue
+        if i + 1 < len(cuts) and cuts[i + 1][1] > p:
+            end = cuts[i + 1][1]
+        else:
+            _m = prompt_line.search(screen, p + len(c))
+            end = _m.end() if _m else len(screen)
+        segs[c] = screen[p + len(c):end]
+    return segs
+
+
 def collect_metrics(dev: str) -> dict:
     """采集只读指标：IP 设备（ssh/telnet）一律独立直连【静默采集】；
     串口空闲时同样直连；只有【串口被前台窗格占用】才走同屏（物理独占，绕不开）。
@@ -1689,9 +2124,42 @@ def collect_metrics(dev: str) -> dict:
                     auto_detected = True
         except Exception:
             pass
-    base_cmds = mon_cmds(platform, dev)     # {cpu, mem, brief} 按平台取 + 叠加已学到的命令
+    base_cmds = mon_cmds(platform, dev, keys=["cpu", "mem", "brief",
+                                              "nat", "dhcp", "arp", "optical"])
     base_cmds.setdefault("log", _log_cmd_for(platform))   # 设备日志（排障线索卡；不支持会被探测逻辑丢弃）
+    # 体验层固定探针（平台无关，2026-10-04 三层指标观）：出口连通 / DNS / 配置漂移源
+    base_cmds.setdefault("wan", "ping 223.5.5.5")
+    base_cmds.setdefault("dns", "nslookup www.baidu.com")
+    base_cmds.setdefault("cfg", "display current-configuration"
+                        if (platform or "huawei") in ("huawei_vrp", "h3c_comware", "maipu_s")
+                        else "show running-config")
     raws, cmds, used = {}, [], {}
+
+    def _wait_prompt(window: str, echo_token: str) -> bool:
+        """同屏通道：等「命令开始 → 提示符回来」再发下一条。
+        ★ 2026-10-04 真机教训：固定 sleep 是在赌时间 —— ping 4 包全超时要 ~9s
+          （每包 2s），等短了统计行没出来、等长了白磨；更糟的是前一条没跑完就敲
+          下一条时，VRP 执行期间不回显输入，下一条的回显整个消失，切段全乱。
+        做法：末行从「裸提示符」变成回显/输出 = 已开始；末行变回裸提示符 = 跑完
+        （上限 ~19s，兜住 ping 全超时）。回显+提示符同屏即在 = 秒完成。"""
+        prompt_re = re.compile(r"^\s*(?:[<\[][\w.\-]{1,30}[>\]]|[\w.\-]{1,30}[>#])\s*$")
+        started = False
+        for _ in range(24):
+            time.sleep(0.8)
+            _rc, _t, _e = raw_netdev(["screen-read", window, "--lines", "6"], timeout=15)
+            _lines = [l.strip() for l in strip_ansi(_t or "").splitlines() if l.strip()]
+            if not _lines:
+                continue
+            _last = _lines[-1]
+            if not started:
+                if not prompt_re.match(_last):
+                    started = True               # 末行变成回显/输出 → 命令已开始
+                elif echo_token and echo_token in "\n".join(_lines):
+                    return True                  # 回显+提示符都在 → 已跑完
+                continue
+            if len(_last) < 60 and prompt_re.match(_last):
+                return True
+        return False
 
     def _send_and_collect(work: dict):
         """发一组命令并读出回显（同屏或直连）。返回合并文本。"""
@@ -1703,10 +2171,16 @@ def collect_metrics(dev: str) -> dict:
                 except Exception:
                     pass
                 cmds.append(cmd); used[key] = cmd
-                time.sleep(0.9)
-            time.sleep(1.2)
+                _wait_prompt(window, (cmd.split() or [""])[0])
+            time.sleep(0.6)
             _rc, text, _e = raw_netdev(["screen-read", window, "--lines", "900"], timeout=30)
             raws["screen"] = strip_ansi(text)
+            # ★ 同屏没有逐条回显 —— 按命令回显位置切段回填 raws[key]，
+            #   让 ③ 的「按各键解析」在同屏通道同样成立。
+            segs = _split_screen_by_cmds(raws["screen"], cmds)
+            for _k, _kc in used.items():
+                if _kc in segs and not raws.get(_k):
+                    raws[_k] = segs[_kc]
             return raws["screen"]
         acc = []
         for key, cmd in work.items():
@@ -1726,8 +2200,14 @@ def collect_metrics(dev: str) -> dict:
     #     缓存的生效点前移到 mon_cmds()/plan_commands()（建计划阶段就覆盖默认命令）。
     if _plat is not None and _plat.looks_like_bad_command(first_text):
         # 设备不认当前命令集：逐指标试候选，命中就缓存（下次直接生效）
+        # ★ 2026-10-04 优化：直连通道下按【各键自己的回显】决定要不要探测 ——
+        #   某键的输出明明是好的，就别再拿别的候选撞墙（新键多了以后省好几秒）。
         print(f"  · {dev}：平台命令未命中，开始探测候选命令…")
         for key in list(base_cmds.keys()):
+            _own = raws.get(key, "")
+            # ★ 同屏切段后 raws[key] 同样可信：输出是好的就跳过探测（省好几秒）
+            if _own.strip() and not _plat.looks_like_bad_command(_own):
+                continue
             for cand in _plat.candidates_for(key, platform):
                 if cand == base_cmds.get(key):
                     continue
@@ -1737,7 +2217,7 @@ def collect_metrics(dev: str) -> dict:
                                        capture_output=True, timeout=20)
                     except Exception:
                         pass
-                    time.sleep(0.9)
+                    _wait_prompt(window, (cand.split() or [""])[0])
                     _rc, t2, _e = raw_netdev(["screen-read", window, "--lines", "200"], timeout=25)
                     t2 = strip_ansi(t2)
                 else:
@@ -1759,6 +2239,19 @@ def collect_metrics(dev: str) -> dict:
     except Exception:
         learned = {}
     m = _parse_metrics(blob, platform, dev)
+    # 体验/变化层新指标的解析（各键独立回显，-- 绝不当 0 用）
+    import hashlib as _hl
+    m["wan"] = _parse_ping(raws.get("wan", ""))
+    m["dns"] = _parse_dns(raws.get("dns", ""))
+    m["nat"] = _parse_nat(raws.get("nat", ""))
+    m["dhcp"] = _parse_dhcp(raws.get("dhcp", ""))
+    m["arp"] = _parse_arp_count(raws.get("arp", ""))
+    m["optical"] = _parse_optical(raws.get("optical", ""))
+    _cfg_txt = raws.get("cfg", "")
+    # ★ 同屏通道的配置是 900 行屏里截出来的（配置长于屏就缺头），sha 逐轮不稳 →
+    #   会对同一份配置报「漂移」。漂移基线只认直连全量回显；同屏轮次不参与。
+    m["cfg_sha"] = _hl.sha256(_cfg_txt.encode("utf-8", "replace")).hexdigest()[:16] \
+        if _cfg_txt.strip() and not _bad_echo(_cfg_txt) and not via_screen else None
     log_info = _parse_logbuffer(raws.get("log", ""))
     last = _mon_baseline_load(dev)
     delta, rows = _mon_delta_and_rows(m, last, log_info)
@@ -2393,6 +2886,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._api_metric_learn(b)
         if u.path == "/api/monitor/diagnose":
             return self._api_monitor_diagnose(b)
+        if u.path == "/api/deepcheck":
+            return self._api_deepcheck(b)
         if u.path == "/api/metric/learn/save":
             return self._api_metric_learn_save(b)
         if u.path == "/api/metric/learn/remove":
@@ -3352,6 +3847,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": f"采集失败：{type(e).__name__}: {e}"}, 500)
         diag = ai_diagnose(dev, mon)
         return self._json({"ok": True, "diag": diag, "monitor": mon})
+
+    def _api_deepcheck(self, b: dict):
+        """AI 深体检：AI 规划只读命令 → 闸门 → 执行 → AI 诊断（人工触发，分钟级）。"""
+        dev = (b.get("device") or "").strip()
+        if not dev:
+            return self._json({"error": "缺少 device"}, 400)
+        with screen_lock(dev):          # 与快诊/快照同屏互斥
+            diag = ai_deepcheck(dev)
+        return self._json({"ok": not diag.get("error"), "diag": diag})
 
     # ══ 快照管理 ══
     def _api_snap_save(self, b: dict):
