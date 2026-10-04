@@ -206,10 +206,17 @@ button.mono:disabled{opacity:.45;cursor:wait}
 .win-bar .btns{margin-left:auto;color:var(--g2);letter-spacing:2px;font-size:11px;display:flex;gap:6px;align-items:center}
 .wbtn{cursor:pointer;color:var(--g2);font-size:12px;line-height:1;padding:1px 4px;border:1px solid transparent;border-radius:3px}
 .wbtn:hover{color:var(--g0);border-color:var(--g5)}
-/* ── 标题栏动效图标：平时暗淡，忙时才亮并动 ── */
-.ico{height:9px;width:auto;max-width:26px;margin-left:5px;vertical-align:-1px;opacity:.28;
-  transition:opacity .3s ease, filter .3s ease;overflow:visible}
-.ico.busy{opacity:1;filter:drop-shadow(0 0 3px rgba(var(--g-rgb),.85))}
+/* ── 标题栏动效图标：平时暗淡，忙时才亮、变色并动 ──
+   2026-10-04 用户指定：适度加大（9→12px），忙时要有颜色变化 ——
+   颜色走语义色：--st-on 绿（活动）↔ --st-busy 琥珀（忙碌）呼吸，
+   与设备行在线点 / AI 点阵忙态同一套语言；基色写在 .busy 规则里，
+   ink 主题把动画冻结后仍落在绿色上（不会掉回默认色）。 */
+.ico{height:12px;width:auto;max-width:38px;margin-left:5px;vertical-align:-2px;opacity:.28;
+  transition:opacity .3s ease, filter .3s ease, color .3s ease;overflow:visible}
+.ico.busy{opacity:1;color:var(--st-on);filter:drop-shadow(0 0 3px currentColor);
+  animation-name:icocol;animation-duration:2.4s;animation-timing-function:ease-in-out;
+  animation-iteration-count:infinite}
+@keyframes icocol{0%,100%{color:var(--st-on)}50%{color:var(--st-busy)}}
 /* ① 网状（AI 思考）：节点呼吸 + 连线流动 */
 .ico.net line{stroke:currentColor;stroke-width:.9;stroke-opacity:.45}
 .ico.net circle{fill:currentColor;opacity:.55;transform-box:fill-box;transform-origin:center}
@@ -596,7 +603,15 @@ td.ops{white-space:nowrap}
 
   <!-- 状态：静默采集 + AI 结构化诊断（主视图），指标表格收进折叠详情 -->
   <section class="win">
-    <div class="win-bar"><span class="t">状态</span><span class="sub" id="monSub">未采集</span><span class="spacer"></span><button class="mono" id="btnMon" title="快诊：采集常用排障指标并由 AI 诊断（静默直连不抢屏）"><svg class="bi"><use href="#bi-arrow-clockwise"/></svg></button>
+    <div class="win-bar"><span class="t">状态<svg class="ico net mon-net" viewBox="0 0 44 14" aria-hidden="true">
+      <line x1="4" y1="7" x2="14" y2="3"/><line x1="14" y1="3" x2="24" y2="10"/>
+      <line x1="24" y1="10" x2="34" y2="4"/><line x1="34" y1="4" x2="40" y2="9"/>
+      <line x1="4" y1="7" x2="24" y2="10"/><line x1="14" y1="3" x2="34" y2="4"/>
+      <line x1="24" y1="10" x2="40" y2="9"/><line x1="4" y1="7" x2="34" y2="4"/>
+      <circle cx="4" cy="7" r="1.5"/><circle cx="14" cy="3" r="1.5"/>
+      <circle cx="24" cy="10" r="1.5"/><circle cx="34" cy="4" r="1.5"/>
+      <circle cx="40" cy="9" r="1.5"/>
+    </svg></span><span class="sub" id="monSub">未采集</span><span class="spacer"></span><button class="mono" id="btnMon" title="快诊：采集常用排障指标并由 AI 诊断（静默直连不抢屏）"><svg class="bi"><use href="#bi-arrow-clockwise"/></svg></button>
       <button class="mono" id="btnDeep" title="深体检：AI 规划一组只读命令全跑一遍，出全面诊断（约 1~3 分钟）">🔍</button>
       <button class="mono" id="btnRules" title="查看/清除 AI 学到的解析规则">📚</button><span class="btns">▢ ✕</span></div>
     <div class="win-body">
@@ -874,9 +889,14 @@ function aiBusy(on){
      用 getElementById 而不走 $()：$ 是文件后面的 const，避免任何 TDZ 风险。 */
   const sp=document.getElementById('aiStop');
   if(sp) sp.classList.toggle('busy', !!on);
-  const ic=document.querySelector('.ico.net'); if(!ic) return;
+  const ic=document.querySelector('.ico.net:not(.mon-net)'); if(!ic) return;
   if(on){ ic.classList.add('busy'); clearTimeout(_aiT); }
   else  { clearTimeout(_aiT); _aiT=setTimeout(()=>ic.classList.remove('busy'), 600); }
+}
+/* 状态面板自己的网状图标（快诊/深体检跑的时候动；2026-10-04 用户指定加） */
+function monIcon(on){
+  const ic=document.querySelector('.ico.mon-net'); if(!ic) return;
+  ic.classList.toggle('busy', !!on);
 }
 function termBusy(hold){
   const ic=document.querySelector('.ico.pick'); if(!ic) return;
@@ -2251,7 +2271,7 @@ function renderDiag(diag, plan){
   box.innerHTML = h;
 }
 async function loadMonitor(quiet){
-  if(monBusy) return; monBusy=true;
+  if(monBusy) return; monBusy=true; monIcon(true);
   const dev0 = CURDEV || '';
   const d0 = (window.DEVICES||[]).find(x=>x.name===dev0) || {};
   // 临时目标窗格不在线：不再硬拦截 —— 2026-09-30 后端静默直连通道对临时目标同样可用，
@@ -2290,14 +2310,14 @@ async function loadMonitor(quiet){
   }catch(e){
     $('monSub').textContent='采集失败';
     if(!quiet) audit('FAIL',dev,'监控采集异常');
-  }finally{ btn.textContent='⟳ 采集'; btn.disabled=false; monBusy=false; }
+  }finally{ btn.textContent='⟳ 采集'; btn.disabled=false; monBusy=false; monIcon(false); }
 }
 $('btnMon').onclick=()=>loadMonitor(false);
 $('btnRules').onclick=()=>showRules();
 /* 深体检：AI 规划只读命令 → 闸门 → 逐条执行 → AI 出全面结论（人工触发，分钟级） */
 let deepBusy = false;
 $('btnDeep').onclick = async ()=>{
-  if(deepBusy || monBusy) return; deepBusy = true;
+  if(deepBusy || monBusy) return; deepBusy = true; monIcon(true);
   const dev = CURDEV || '';
   const bd=$('btnDeep'), bm=$('btnMon');
   if(!dev){ say('系统','<span class="w">先选一个设备再深体检。</span>','ai'); deepBusy=false; return; }
@@ -2322,7 +2342,7 @@ $('btnDeep').onclick = async ()=>{
     $('diagBox').innerHTML = '<div class="w">深体检请求失败：'+esc(String(e.message||e))+'</div>';
     $('monSub').textContent = '深体检失败';
   }finally{
-    bd.disabled = bm.disabled = false; bd.classList.remove('busy'); deepBusy = false;
+    bd.disabled = bm.disabled = false; bd.classList.remove('busy'); deepBusy = false; monIcon(false);
   }
 };
 
