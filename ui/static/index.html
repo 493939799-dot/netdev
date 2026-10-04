@@ -400,6 +400,19 @@ th{background:rgba(var(--g-rgb),.1);color:var(--g1);font-weight:400}
 tr:hover td{background:rgba(var(--g-rgb),.06)}
 td.ops{white-space:nowrap}
 
+/* 状态区：AI 诊断视图（主）+ 指标表格（折叠详情） */
+#monDetail summary{cursor:pointer;font-size:10px;color:var(--dim);margin:6px 0 4px;user-select:none}
+#monDetail summary:hover{color:var(--g1)}
+.diag-badge{display:inline-block;font-weight:700;font-size:11.5px;padding:1px 9px;
+  border:1px solid currentColor;margin:2px 0 5px;letter-spacing:2px}
+.diag-sum{font-size:11px;line-height:1.55;margin-bottom:4px}
+.diag-item{margin:6px 0;padding-left:13px;position:relative;font-size:10.5px;line-height:1.55}
+.diag-item:before{content:'';position:absolute;left:0;top:5px;width:6px;height:6px;
+  border-radius:50%;background:currentColor}
+.diag-item .dt{font-weight:700}
+.diag-item .dd{color:var(--dim)}
+.diag-item .da{color:var(--g1)}
+.diag-item .da:before{content:'→ '}
 /* 监控区：简易表格（2026-10-04 用户指定：不做成卡片，贴合终端气质、复用全局 table 样式）
    面板仅 ~240px 宽：三列布局，值+状态竖排在中间列（四列会把状态挤成一词一行） */
 .mon-tbl{width:100%}
@@ -597,17 +610,21 @@ td.ops{white-space:nowrap}
     </div>
   </section>
 
-  <!-- 排障监控 -->
+  <!-- 状态：静默采集 + AI 结构化诊断（主视图），指标表格收进折叠详情 -->
   <section class="win">
-    <div class="win-bar"><span class="t">监控</span><span class="sub" id="monSub">未采集</span><span class="spacer"></span><button class="mono" id="btnMon" title="手动采集一次指标"><svg class="bi"><use href="#bi-arrow-clockwise"/></svg></button>
+    <div class="win-bar"><span class="t">状态</span><span class="sub" id="monSub">未采集</span><span class="spacer"></span><button class="mono" id="btnMon" title="采集指标并由 AI 诊断（静默直连不抢屏）"><svg class="bi"><use href="#bi-arrow-clockwise"/></svg></button>
       <button class="mono" id="btnRules" title="查看/清除 AI 学到的解析规则">📚</button><span class="btns">▢ ✕</span></div>
     <div class="win-body">
-      <table class="mon-tbl" id="monTable">
-        <thead><tr><th style="width:64px">指标</th><th>当前 · 变化与状态</th><th style="width:44px">趋势</th></tr></thead>
-        <tbody id="monRows"><tr><td colspan="3" class="m">点 ⟳ 采集一次（手动触发 · 静默直连不抢屏）</td></tr></tbody>
-      </table>
-      <canvas id="bwChart" style="width:100%;height:46px;display:block;margin-top:5px"></canvas>
-      <div class="hint" id="monHint">异常行标黄（留意）/ 红（立刻看）· 点行下钻看原始回显 · 采不到值点 ⚡ 让 AI 学规则</div>
+      <div id="diagBox"><div class="hint" style="border:none;margin:0;padding:2px 0">点 ⟳ 采集常用排障指标，AI 分析后给出结构化情况与建议</div></div>
+      <details id="monDetail">
+        <summary>指标详情（采集的原始数值与判色）</summary>
+        <table class="mon-tbl" id="monTable">
+          <thead><tr><th style="width:64px">指标</th><th>当前 · 变化与状态</th><th style="width:44px">趋势</th></tr></thead>
+          <tbody id="monRows"><tr><td colspan="3" class="m">点 ⟳ 采集一次（手动触发 · 静默直连不抢屏）</td></tr></tbody>
+        </table>
+        <canvas id="bwChart" style="width:100%;height:46px;display:block;margin-top:5px"></canvas>
+        <div class="hint" id="monHint">异常行标黄（留意）/ 红（立刻看）· 点行下钻看原始回显 · 采不到值点 ⚡ 让 AI 学规则</div>
+      </details>
     </div>
   </section>
 
@@ -2279,6 +2296,36 @@ function renderMonRows(rows){
       + `<td>${trend}</td></tr>`;
   }).join('');
 }
+/* AI 诊断视图渲染：徽章（overall）+ 一句话总结 + 逐条「情况→建议」。
+   AI 不可用/解析失败 → 降级：亮黄横幅说明原因 + 自动展开「指标详情」表格。 */
+const DIAG_SEV = {ok:'var(--st-on)', warn:'var(--warn)', bad:'var(--bad)'};
+const DIAG_TXT = {ok:'正 常', warn:'留 意', bad:'异 常'};
+function renderDiag(diag){
+  const box = $('diagBox'); if(!box) return;
+  const det = $('monDetail');
+  if(!diag || diag.error){
+    box.innerHTML = '<div class="w" style="font-size:10.5px;line-height:1.5">⚠ AI 诊断不可用：'
+      + esc(String((diag && diag.error) || '未知原因'))
+      + '</div><div class="m" style="font-size:10px">已仅完成指标采集 —— 展开下方「指标详情」查看数值与判色。'
+      + '（AI 诊断需在设置里配置直连后端）</div>';
+    if(det) det.open = true;
+    return;
+  }
+  const sev = DIAG_SEV[diag.overall] || DIAG_SEV.warn;
+  const txt = DIAG_TXT[diag.overall] || '留 意';
+  let h = `<span class="diag-badge" style="color:${sev}">${txt}</span>`
+    + `<div class="diag-sum">${esc(diag.summary || '')}</div>`;
+  for(const it of (diag.items || [])){
+    const c = DIAG_SEV[it.sev] || DIAG_SEV.warn;
+    h += `<div class="diag-item" style="color:${c}">`
+      + `<span class="dt">${esc(it.title)}</span>`
+      + (it.detail ? `<div class="dd">${esc(it.detail)}</div>` : '')
+      + (it.action ? `<div class="da">${esc(it.action)}</div>` : '')
+      + `</div>`;
+  }
+  box.innerHTML = h;
+  if(det) det.open = false;          // 有诊断结论时收起原始指标，用户想看再点开
+}
 async function loadMonitor(quiet){
   if(monBusy) return; monBusy=true;
   const dev0 = CURDEV || '';
@@ -2288,40 +2335,44 @@ async function loadMonitor(quiet){
   const tempOffline = (d0.kind==='temp' && !d0.window_live);
   if(tempOffline && quiet){ monBusy=false; return; }      // 自动采集：离线临时目标安静跳过
   const btn=$('btnMon'), old=btn.textContent;
-  btn.textContent='采集中…'; btn.disabled=true; $('monSub').textContent='采集中…';
+  btn.textContent='采集+诊断中…'; btn.disabled=true; $('monSub').textContent='采集中…';
   const dev = dev0;
   try{
-    const d = await api('/api/monitor?device='+encodeURIComponent(dev));
+    // ★ 一次请求完成「静默采集 + AI 诊断」；采集慢（串口）+ AI 分析，给足超时
+    const d = await api('/api/monitor/diagnose', {device:dev}, 240000);
     if(!d.ok){
       $('monSub').textContent='采集失败'; audit('FAIL',dev,errMsg(d));
       if(tempOffline && !quiet) say('系统','<span class="w">临时目标直连采集失败。</span><br>'
         + '<span class="m">可以先点它开一次终端，再采集（会走同屏通道）。</span>','ai');
       return;      // 按钮与 monBusy 由 finally 复位
     }
-    renderMonRows(d.rows);
+    const mon = d.monitor || {};
+    renderDiag(d.diag);
+    renderMonRows(mon.rows);
     // CPU 历史：优先用后端基线（JSONL 落盘，跨刷新/跨重启保留趋势；手动档跨间隔累积）。
     // 基线里存的是 cpu_1m ?? cpu_10s；基线为空（首装/写失败）才退回本机累积。
-    const hv = d.hist_cpu;
+    const hv = mon.hist_cpu;
     if(Array.isArray(hv) && hv.length){ MON_HIST = hv.slice(-60); }
     else{
-      const _c = (d.metrics||{}).cpu_10s;
+      const _c = (mon.metrics||{}).cpu_10s;
       if(_c!=null){ MON_HIST.push(_c); if(MON_HIST.length>60) MON_HIST.shift(); }
     }
-    $('monSub').textContent = `${d.via} · ${String(d.at).slice(11)}`;
+    $('monSub').textContent = `${mon.via} · ${String(mon.at).slice(11)}`;
     // 平台提示：自动识别 or 档案匹配 or 未标注（配 title 悬停看全）
     const _platEl = document.getElementById('monSub');
     if(_platEl){
-      const pv = d.platform && d.platform!=='(未标注)' ? d.platform : '';
-      const lr = d.learned || {};
+      const pv = mon.platform && mon.platform!=='(未标注)' ? mon.platform : '';
+      const lr = mon.learned || {};
       const lk = Object.keys(lr);
-      _platEl.title = (d.platform_auto
+      _platEl.title = (mon.platform_auto
         ? `自动识别平台：${pv}（按 display version 判断）`
         : (pv ? `平台档案：${pv}` : '未标注平台（用默认档案 + 候选探测）'))
         + (lk.length ? `\n已学到 ${lk.length} 条命令（下次直接用，不再探测）：\n`
             + lk.map(k=>`  ${k} → ${lr[k]}`).join('\n') : '');
     }
     _fitSpark(); drawCpuChart();
-    if(!quiet) audit('READ',dev,`采集指标（${(d.cmds||[]).length} 条只读 · ${d.via}）`);
+    if(!quiet) audit('READ',dev,`采集+AI 诊断（${(mon.cmds||[]).length} 条只读 · ${mon.via}`
+      + (d.diag && !d.diag.error ? ` · AI 判定 ${d.diag.overall}` : ' · AI 不可用') + '）');
   }catch(e){
     $('monSub').textContent='采集失败';
     if(!quiet) audit('FAIL',dev,'监控采集异常');

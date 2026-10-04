@@ -215,8 +215,8 @@ def test_frontend():
     check("监控区有 #monRows 表格", 'id="monRows"' in html and "mon-tbl" in html)
     check("旧 .cards4/.mcard 已移除", ".cards4" not in html and "mcard" not in html)
     check("行渲染函数 renderMonRows 存在", "function renderMonRows" in html)
-    check("渲染走后端 rows", "renderMonRows(d.rows)" in html)
-    check("CPU 历史接后端基线 hist_cpu", "d.hist_cpu" in html)
+    check("渲染走后端 rows（diagnose 响应的 monitor.rows）", "renderMonRows(mon.rows)" in html)
+    check("CPU 历史接后端基线 hist_cpu", "mon.hist_cpu" in html)
     check("判色 class 接到语义色", 'class="bad-row"' in html and 'class="warn-row"' in html)
     check("⚡ 学习按钮保留（表格行内）", 'class="learn-btn"' in html)
     check("接口行下钻保留 showIfDetail", "showIfDetail()" in html)
@@ -226,11 +226,55 @@ def test_frontend():
           and "$('mCrc')" not in html and "$('mIf')" not in html)
 
 
+# ======================================================================
+# 六、AI 状态诊断（2026-10-04 用户指定：监控改「状态」，AI 给结构化建议）
+# ======================================================================
+def test_ai_diagnose():
+    print("\n[6] AI 状态诊断（prompt 组装 + JSON 解析 + 前端断言守）")
+    mon = {"platform": "huawei_vrp", "via": "直连（静默）",
+           "rows": [{"key": "cpu", "label": "CPU", "val": "7%", "status": "ok", "note": "1min 7.0%"},
+                    {"key": "err", "label": "错包", "val": "12", "status": "bad", "note": "↑ 在涨 +12"}],
+           "delta": {"crc": 12},
+           "log": {"supported": True, "total": 10,
+                   "hits": [{"cat": "接口翻动", "n": 6,
+                             "sample": "Interface GE0/0/2 has turned into DOWN state."}]},
+           "hist_cpu": [5.0, 6.0, 7.0]}
+    p = S.ai_diagnose_prompt("mock-hw", mon)
+    check("prompt 含设备名与平台", "mock-hw" in p and "huawei_vrp" in p)
+    check("prompt 喂结构化指标（值+备注）", "7%" in p and "在涨 +12" in p)
+    check("prompt 喂日志线索（分类+样本）", "接口翻动×6" in p and "turned into DOWN" in p)
+    check("prompt 喂 CPU 历史统计", "最高 7%" in p and "近 3 次" in p)
+    check("prompt 禁止编造 + 强制只出 JSON", "不要编造" in p and "只输出一个 JSON" in p)
+
+    r = S.parse_diag_json('{"overall":"bad","summary":"错包在涨","items":'
+                          '[{"sev":"bad","title":"t","detail":"d","action":"a"}]}')
+    check("裸 JSON 解析", r.get("overall") == "bad" and r["items"][0]["action"] == "a", repr(r))
+    r = S.parse_diag_json('```json\n{"overall":"ok","summary":"正常","items":[]}\n```')
+    check("``` 围栏 JSON 解析", r.get("overall") == "ok" and r.get("items") == [], repr(r))
+    r = S.parse_diag_json('分析如下：\n{"overall":"warn","summary":"留意","items":[]} 以上。')
+    check("带前后废话也能抠出 JSON", r.get("overall") == "warn", repr(r))
+    check("无 JSON → error", "error" in S.parse_diag_json("我觉得设备挺好的"))
+    check("缺 overall → error", "error" in S.parse_diag_json('{"summary":"x"}'))
+    r = S.parse_diag_json('{"overall":"离谱档","summary":"x","items":[{"sev":"?","title":"t"}]}')
+    check("未知档位归 warn、坏 sev 归 warn（不炸）",
+          r.get("overall") == "warn" and r["items"][0]["sev"] == "warn", repr(r))
+
+    html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
+    check("状态区主视图 #diagBox", 'id="diagBox"' in html)
+    check("指标表格收进 <details> 折叠", '<details id="monDetail">' in html)
+    check("徽章三档用语义色", "DIAG_SEV" in html and "var(--st-on)" in html
+          and "var(--bad)" in html)
+    check("采集走 /api/monitor/diagnose", "/api/monitor/diagnose" in html)
+    check("AI 失败降级：展开指标详情 + 黄条提示", "det.open = true" in html)
+    check("有诊断结论时收起表格", "det.open = false" in html)
+
+
 if __name__ == "__main__":
     test_logbuffer_parse()
     test_delta_and_colors()
     test_baseline()
     test_log_cmd_and_mock()
     test_frontend()
+    test_ai_diagnose()
     print(f"\n共 {len(PASS) + len(FAIL)} 项：OK {len(PASS)} / NG {len(FAIL)}")
     sys.exit(1 if FAIL else 0)

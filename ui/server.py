@@ -1547,6 +1547,104 @@ def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, li
     return delta, rows
 
 
+# ── AI 状态诊断（监控区主视图，2026-10-04 用户指定）──────────────────
+#   用户原话：监控界面改为「状态」——根据常用排障所需指标，指挥 AI 分析，
+#   给出结构化情况建议。定位 = 设计稿里的「低频智能层」：
+#   · 采集链路不变（静默直连，AI 不接管实时链路）；
+#   · AI 只在【人工点按钮】后对已采到的结构化指标做一次分析（不是每轮轮询都调）；
+#   · 输出强制 JSON（overall/summary/items），解析失败降级为错误提示 + 展开指标表格。
+def ai_diagnose_prompt(dev: str, mon: dict) -> str:
+    """组装诊断 prompt（纯函数，回归可测）。喂给 AI 的是【结构化指标】，
+    不是原始回显 —— 数值口径已由解析层定好，AI 负责解读与建议，不负责算数。"""
+    rows = mon.get("rows") or []
+    delta = mon.get("delta") or {}
+    log = mon.get("log") or {}
+    hist = mon.get("hist_cpu") or []
+    lines = [f"设备：{dev}（平台 {mon.get('platform') or '未标注'}，采集方式 {mon.get('via')}）", ""]
+    lines.append("本次采集指标（状态标记：bad=超阈值 warn=接近阈值 ok=正常）：")
+    for r in rows:
+        lines.append(f"  · {r['label']}：{r['val']}  [{r['status']}]  {r['note']}")
+    if delta:
+        lines.append(f"相对上次采集的增量：{json.dumps(delta, ensure_ascii=False)}")
+    if log.get("supported"):
+        lines.append(f"设备日志缓冲区：共 {log.get('total', 0)} 条，"
+                     + ("；".join(f"{h['cat']}×{h['n']}（最近一条：{h['sample'][:80]}）"
+                                  for h in log.get("hits", [])) or "无异常线索"))
+    else:
+        lines.append("设备日志缓冲区：未采到（设备不支持或未配置）")
+    if len(hist) >= 2:
+        lines.append(f"CPU 历史（近 {len(hist)} 次采集）：最低 {min(hist):g}% / "
+                     f"最高 {max(hist):g}% / 最新 {hist[-1]:g}%")
+    lines += [
+        "",
+        "请以中小企业网络排障工程师视角分析这份指标，关注：CPU/内存是否持续偏高、",
+        "错包是否在增长（链路/光模块劣化）、接口占用率是否接近打满、接口翻动、",
+        "路由邻居震荡、环路信号。只依据上面给出的数值，不要编造没给的数据。",
+        "",
+        "只输出一个 JSON 对象，不要解释、不要代码块围栏，格式：",
+        '{"overall": "ok|warn|bad",',
+        ' "summary": "一句话总体判断",',
+        ' "items": [',
+        '   {"sev": "ok|warn|bad", "title": "情况标题（如：链路错包在增长）",',
+        '    "detail": "具体情况，引用具体数值",',
+        '    "action": "建议动作（可执行的命令或下一步排查步骤；无则给空字符串）"}',
+        ' ]}',
+        "正常项可以合并成一条 ok 项；没有异常就 overall=ok、items 只给 1 条。",
+    ]
+    return "\n".join(lines)
+
+
+def parse_diag_json(text: str) -> dict:
+    """从 AI 回复里抠诊断 JSON（容忍 ``` 围栏/前后废话）。解析失败返回 {'error': ...}。"""
+    import re as _re
+    t = (text or "").strip()
+    t = _re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=_re.S).strip()
+    m = _re.search(r"\{.*\}", t, _re.S)
+    if not m:
+        return {"error": "AI 没有返回 JSON", "raw": (text or "")[:400]}
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return {"error": "AI 的 JSON 解析失败", "raw": m.group(0)[:400]}
+    if not isinstance(obj, dict) or "overall" not in obj or "summary" not in obj:
+        return {"error": "AI 的 JSON 缺少 overall/summary 字段", "raw": m.group(0)[:400]}
+    if obj.get("overall") not in ("ok", "warn", "bad"):
+        obj["overall"] = "warn"                     # 未知档位按「留意」处理，不炸
+    items = obj.get("items")
+    if not isinstance(items, list):
+        items = []
+    clean = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        clean.append({"sev": it.get("sev") if it.get("sev") in ("ok", "warn", "bad") else "warn",
+                      "title": str(it.get("title") or "")[:80],
+                      "detail": str(it.get("detail") or "")[:400],
+                      "action": str(it.get("action") or "")[:300]})
+    return {"overall": obj["overall"], "summary": str(obj.get("summary") or "")[:200],
+            "items": clean}
+
+
+def ai_diagnose(dev: str, mon: dict) -> dict:
+    """把采集结果交给直连 AI 做结构化诊断。失败返回 {'error': ...}，绝不抛。"""
+    cfg = _direct_cfg()
+    if not cfg["ok"]:
+        return {"error": "直连 AI 未配置：" + cfg["note"]}
+    prompt = ai_diagnose_prompt(dev, mon)
+    try:
+        s = DirectSession("__diag__", model="", tools="read")
+        resp = s._chat([{"role": "user", "content": prompt}], stream=False)
+        body_raw = resp.read().decode("utf-8", "replace")
+        if resp.status != 200:
+            return {"error": f"直连 API 返回 {resp.status}: {body_raw[:200]}"}
+        body = json.loads(body_raw)
+        out_text = (((body.get("choices") or [{}])[0]).get("message") or {}) \
+            .get("content") or ""
+    except Exception as e:
+        return {"error": f"直连请求失败：{type(e).__name__}: {e}"}
+    return parse_diag_json(out_text)
+
+
 def collect_metrics(dev: str) -> dict:
     """采集只读指标：IP 设备（ssh/telnet）一律独立直连【静默采集】；
     串口空闲时同样直连；只有【串口被前台窗格占用】才走同屏（物理独占，绕不开）。
@@ -2287,6 +2385,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._api_term_close(b)
         if u.path == "/api/metric/learn":
             return self._api_metric_learn(b)
+        if u.path == "/api/monitor/diagnose":
+            return self._api_monitor_diagnose(b)
         if u.path == "/api/metric/learn/save":
             return self._api_metric_learn_save(b)
         if u.path == "/api/metric/learn/remove":
@@ -3233,6 +3333,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(collect_metrics(dev))
         except Exception as e:
             return self._json({"error": f"采集失败：{type(e).__name__}: {e}"}, 500)
+
+    def _api_monitor_diagnose(self, b: dict):
+        """采集 + AI 诊断一次完成（监控区「状态」主视图的数据源）。
+        采集失败 → 500；AI 失败 → ok:true + diag.error（前端降级只显指标）。"""
+        dev = (b.get("device") or "").strip()
+        if not dev:
+            return self._json({"error": "缺少 device"}, 400)
+        try:
+            mon = collect_metrics(dev)
+        except Exception as e:
+            return self._json({"error": f"采集失败：{type(e).__name__}: {e}"}, 500)
+        diag = ai_diagnose(dev, mon)
+        return self._json({"ok": True, "diag": diag, "monitor": mon})
 
     # ══ 快照管理 ══
     def _api_snap_save(self, b: dict):
