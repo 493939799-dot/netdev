@@ -400,19 +400,28 @@ th{background:rgba(var(--g-rgb),.1);color:var(--g1);font-weight:400}
 tr:hover td{background:rgba(var(--g-rgb),.06)}
 td.ops{white-space:nowrap}
 
-.cards4{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}
-.mcard{border:1px solid var(--g3);background:rgba(var(--g-rgb),.05);padding:4px 6px;cursor:pointer;min-width:0;position:relative}
-/* ⚡ 学习角标：要一眼看得见（原来 opacity .45 + 11px 太淡，实测用户找不到） */
+/* 监控区：简易表格（2026-10-04 用户指定：不做成卡片，贴合终端气质、复用全局 table 样式）
+   面板仅 ~240px 宽：三列布局，值+状态竖排在中间列（四列会把状态挤成一词一行） */
+.mon-tbl{width:100%}
+.mon-tbl th{text-align:left;font-weight:400;color:var(--dim);font-size:9.5px;letter-spacing:.5px}
+.mon-tbl td{font-size:11px;vertical-align:top}
+.mon-tbl .mk{font-weight:700;white-space:nowrap;cursor:pointer}
+.mon-tbl .mv{font-weight:700;white-space:nowrap;line-height:1.3}
+.mon-tbl .ms{font-size:9.5px;color:var(--dim);line-height:1.45;margin-top:1px}
+.mon-tbl tr.warn-row td{background:rgba(255,210,63,.08)}
+.mon-tbl tr.bad-row td{background:rgba(255,59,48,.10)}
+.mon-tbl tr{cursor:pointer}
+/* ⚡ 学习角标：要一眼看得见（原来 opacity .45 + 11px 太淡，实测用户找不到）
+   表格里改为行内（不再绝对定位——td 没有定位上下文，绝对定位会飘走） */
+.mon-tbl .learn-btn{position:static;margin-left:4px;border:none;background:none;
+  padding:0;font-size:11px;border-radius:0}
+.mon-tbl .learn-btn:hover{transform:none;background:none;opacity:1}
+/* ⚡ 学习角标（其他弹窗里仍在用）：要一眼看得见（原来 opacity .45 + 11px 太淡，实测用户找不到） */
 .learn-btn{position:absolute;top:-1px;right:-1px;font-size:13px;line-height:1;cursor:pointer;
   opacity:.9;padding:2px 4px;border:1px solid var(--g3);border-radius:0 0 0 5px;
   background:rgba(var(--g-rgb),.16);transition:all .15s}
 .learn-btn:hover{opacity:1;background:rgba(var(--g-rgb),.42);border-color:var(--g1);
   transform:scale(1.18)}
-.mcard:hover{border-color:var(--g1);background:rgba(var(--g-rgb),.13)}
-.mcard .ml{font-size:9.5px;color:var(--dim);letter-spacing:1px}
-.mcard .mv{font-size:15px;font-weight:700;line-height:1.1}
-.mcard .mv small{font-size:10px;font-weight:400;color:var(--g1)}
-.mcard .ms{font-size:9.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .spark{display:block;width:100%;height:16px;margin-top:1px}
 .hint{margin-top:5px;font-size:10px;color:var(--dim);border-top:1px dashed var(--g4);padding-top:5px}
 .hint b{color:var(--g1);font-weight:400}
@@ -593,26 +602,12 @@ td.ops{white-space:nowrap}
     <div class="win-bar"><span class="t">监控</span><span class="sub" id="monSub">未采集</span><span class="spacer"></span><button class="mono" id="btnMon" title="手动采集一次指标"><svg class="bi"><use href="#bi-arrow-clockwise"/></svg></button>
       <button class="mono" id="btnRules" title="查看/清除 AI 学到的解析规则">📚</button><span class="btns">▢ ✕</span></div>
     <div class="win-body">
-      <div class="cards4">
-        <div class="mcard" data-cmd="display cpu-usage" data-key="cpu">
-          <div class="ml">CPU</div><div class="mv" id="mCpu">--<small>%</small></div>
-          <canvas class="spark" id="spCpu"></canvas>
-        </div>
-        <div class="mcard" data-cmd="display memory-usage" data-key="ram">
-          <div class="ml">RAM</div><div class="mv" id="mMem">--<small>%</small></div>
-          <div class="ms" id="mMemS">--</div>
-        </div>
-        <div class="mcard" data-cmd="display interface GigabitEthernet0/0/2" data-key="crc">
-          <div class="ml">CRC / 错包</div><div class="mv" id="mCrc">--</div>
-          <div class="ms" id="mCrcS">--</div>
-        </div>
-        <div class="mcard" data-cmd="display interface brief">
-          <div class="ml">INT</div><div class="mv" style="font-size:14px" id="mIf">--</div>
-          <div class="ms" id="mIfS">--</div>
-        </div>
-      </div>
+      <table class="mon-tbl" id="monTable">
+        <thead><tr><th style="width:64px">指标</th><th>当前 · 变化与状态</th><th style="width:44px">趋势</th></tr></thead>
+        <tbody id="monRows"><tr><td colspan="3" class="m">点 ⟳ 采集一次（手动触发 · 静默直连不抢屏）</td></tr></tbody>
+      </table>
       <canvas id="bwChart" style="width:100%;height:46px;display:block;margin-top:5px"></canvas>
-      <div class="hint" id="monHint">CPU 曲线 = 本机每次采集的历史（真实值）· 点指标卡可在终端下钻</div>
+      <div class="hint" id="monHint">异常行标黄（留意）/ 红（立刻看）· 点行下钻看原始回显 · 采不到值点 ⚡ 让 AI 学规则</div>
     </div>
   </section>
 
@@ -2228,30 +2223,61 @@ $('aiStop').onclick=async ()=>{
 let MON_HIST = [];        // CPU 历史（本机每次采集追加一个真实值）
 let monBusy = false;
 
+/* ★ canvas 不能用 CSS 变量，取语义色 --st-on（活动/在线=绿）——
+   三主题各有一套值（minimal #0f8a3a / ink #3f6b3a），别再硬编码 #00ff41 */
+function _stOn(){
+  const v = getComputedStyle(document.documentElement).getPropertyValue('--st-on').trim();
+  return v || '#00ff41';
+}
 function _fitSpark(){
-  const sp=$('spCpu'), sx=sp.getContext('2d');
+  const sp=$('spCpu'); if(!sp) return;   // 表格还没渲染（无 cpu 行）时安静退出
+  const sx=sp.getContext('2d');
   sp.width=sp.clientWidth*2; sp.height=32; sx.setTransform(2,0,0,2,0,0);
   sx.clearRect(0,0,sp.clientWidth,16);
   if(MON_HIST.length<2) return;
-  const mx=Math.max(10, ...MON_HIST), n=MON_HIST.length;
+  const mx=Math.max(10, ...MON_HIST), n=MON_HIST.length, C=_stOn();
   sx.beginPath();
   MON_HIST.forEach((v,i)=>{ const px=i/(n-1)*sp.clientWidth, py=15-(v/mx)*14; i?sx.lineTo(px,py):sx.moveTo(px,py); });
-  sx.strokeStyle='#00ff41'; sx.lineWidth=1.1; sx.shadowColor='#00ff41'; sx.shadowBlur=4; sx.stroke(); sx.shadowBlur=0;
+  sx.strokeStyle=C; sx.lineWidth=1.1; sx.shadowColor=C; sx.shadowBlur=4; sx.stroke(); sx.shadowBlur=0;
 }
 function drawCpuChart(){
   const bc=$('bwChart'), bx=bc.getContext('2d');
   bc.width=bc.clientWidth*2; bc.height=92; bx.setTransform(2,0,0,2,0,0);
   const H=46; bx.clearRect(0,0,bc.clientWidth,H);
-  bx.strokeStyle='rgba(0,255,65,.13)'; bx.lineWidth=.5;
+  bx.strokeStyle='rgba(128,128,128,.16)'; bx.lineWidth=.5;   // 网格线用中性灰，浅色主题不刺眼
   for(let i=0;i<=3;i++){const y=H/3*i;bx.beginPath();bx.moveTo(0,y);bx.lineTo(bc.clientWidth,y);bx.stroke();}
   if(MON_HIST.length<2) return;
-  const mx=Math.max(10, ...MON_HIST), n=MON_HIST.length;
+  const mx=Math.max(10, ...MON_HIST), n=MON_HIST.length, C=_stOn();
   bx.beginPath();
   MON_HIST.forEach((v,i)=>{ const px=i/(n-1)*bc.clientWidth, py=H-(v/mx)*H*0.9-2; i?bx.lineTo(px,py):bx.moveTo(px,py); });
-  bx.strokeStyle='#00ff41'; bx.lineWidth=1.3; bx.shadowColor='#00ff41'; bx.shadowBlur=5; bx.stroke(); bx.shadowBlur=0;
-  bx.font='9px monospace'; bx.fillStyle='rgba(0,255,65,.8)';
+  bx.strokeStyle=C; bx.lineWidth=1.3; bx.shadowColor=C; bx.shadowBlur=5; bx.stroke(); bx.shadowBlur=0;
+  bx.globalAlpha=.8; bx.font='9px monospace'; bx.fillStyle=C;
   bx.fillText('CPU% · 峰值 '+mx.toFixed(1)+'%', 2, 10);
   bx.fillText('采样 '+n+' 次', 2, 21);
+  bx.globalAlpha=1;
+}
+/* 表格行渲染：后端 _mon_delta_and_rows 已算好 6 行（增量/判色/备注），
+   前端只负责画 —— 判色 bad→红 warn→黄（语义色 .bad/.w，三主题各有一套值）。
+   CPU 行的趋势格放行内 spark；其它行放中性破折号。 */
+const MON_KEYMAP = {cpu:'cpu', ram:'ram', err:'crc', uti:'if', int:'if', log:'log'};
+function renderMonRows(rows){
+  const tb = $('monRows'); if(!tb) return;
+  if(!Array.isArray(rows) || !rows.length){
+    tb.innerHTML = '<tr><td colspan="3" class="m">采不到指标行（点行旁 ⚡ 让 AI 学解析规则）</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r=>{
+    const tcls = r.status==='bad' ? ' class="bad-row"' : (r.status==='warn' ? ' class="warn-row"' : '');
+    const ccls = r.status==='bad' ? 'bad' : (r.status==='warn' ? 'w' : '');
+    const learn = ['cpu','ram','err','uti','int'].includes(r.key)
+      ? `<span class="learn-btn" title="让 AI 学一条解析规则（采集不到值时用）">⚡</span>` : '';
+    const trend = r.key==='cpu' ? '<canvas class="spark" id="spCpu"></canvas>' : '<span class="m">—</span>';
+    return `<tr${tcls} data-key="${esc(r.key)}">`
+      + `<td class="mk">${esc(r.label)}${learn}</td>`
+      + `<td><div class="mv ${ccls}">${esc(String(r.val))}</div>`
+      + `<div class="ms ${ccls}" title="${esc(String(r.note))}">${esc(String(r.note))}</div></td>`
+      + `<td>${trend}</td></tr>`;
+  }).join('');
 }
 async function loadMonitor(quiet){
   if(monBusy) return; monBusy=true;
@@ -2272,18 +2298,15 @@ async function loadMonitor(quiet){
         + '<span class="m">可以先点它开一次终端，再采集（会走同屏通道）。</span>','ai');
       return;      // 按钮与 monBusy 由 finally 复位
     }
-    const m=d.metrics||{};
-    $('mCpu').innerHTML = (m.cpu_10s!=null? m.cpu_10s : '--')+'<small>%</small>';
-    $('mCpu').title = `峰值 ${m.cpu_max??'--'}% · 1min ${m.cpu_1m??'--'}% · 5min ${m.cpu_5m??'--'}%`;
-    if(m.cpu_10s!=null){ MON_HIST.push(m.cpu_10s); if(MON_HIST.length>60) MON_HIST.shift(); }
-    $('mMem').innerHTML = (m.mem_pct!=null? m.mem_pct : '--')+'<small>%</small>';
-    $('mMemS').textContent = (m.mem_used&&m.mem_total)
-      ? `${(m.mem_used/1048576).toFixed(0)}M / ${(m.mem_total/1048576).toFixed(0)}M` : '--';
-    $('mCrc').textContent = (m.crc!=null? m.crc : '--');
-    $('mCrcS').textContent = (m.crc!=null) ? (m.crc===0? '链路正常 · 无错包' : '⚠ 有错包') : '--';
-    $('mIf').innerHTML = (m.if_up!=null? m.if_up : '--')+'/'+(m.if_total||'?')+' <small>up</small>';
-    $('mIfS').textContent = (m.if_up===0)? '⚠ 网口未接线'
-      : `最高入 ${m.if_in_max??'--'}% / 出 ${m.if_out_max??'--'}%`;
+    renderMonRows(d.rows);
+    // CPU 历史：优先用后端基线（JSONL 落盘，跨刷新/跨重启保留趋势；手动档跨间隔累积）。
+    // 基线里存的是 cpu_1m ?? cpu_10s；基线为空（首装/写失败）才退回本机累积。
+    const hv = d.hist_cpu;
+    if(Array.isArray(hv) && hv.length){ MON_HIST = hv.slice(-60); }
+    else{
+      const _c = (d.metrics||{}).cpu_10s;
+      if(_c!=null){ MON_HIST.push(_c); if(MON_HIST.length>60) MON_HIST.shift(); }
+    }
     $('monSub').textContent = `${d.via} · ${String(d.at).slice(11)}`;
     // 平台提示：自动识别 or 档案匹配 or 未标注（配 title 悬停看全）
     const _platEl = document.getElementById('monSub');
@@ -2308,54 +2331,42 @@ $('btnMon').onclick=()=>loadMonitor(false);
 $('btnRules').onclick=()=>showRules();
 addEventListener('resize',()=>{ try{_fitSpark(); drawCpuChart();}catch(e){} });
 
-// 指标卡下钻（保留：点了在终端执行对应命令）
-/* 指标卡下钻：
-     · 「接口」卡 → 弹窗列出所有在线接口的带宽/CRC/光衰
-     · 其它卡   → 弹窗单独取该指标的值（不再往终端发命令，避免打断同屏） */
-/* 每张可学习的卡片右上角挂一个 ⚡ —— 采不到值时点它，让 AI 提议解析规则。
-   （原来只有双击入口，太隐蔽；角标常驻，一眼可见） */
-document.querySelectorAll('.mcard').forEach(el=>{
-  const k = el.dataset.key;
-  if(!k) return;
-  const b = document.createElement('span');
-  b.className = 'learn-btn';
-  b.textContent = '⚡';
-  b.title = '让 AI 学一条解析规则（采集不到值时用）';
-  b.onclick = (ev)=>{ ev.stopPropagation(); openLearn(k); };
-  el.appendChild(b);
-});
-document.querySelectorAll('.mcard').forEach(el=>el.onclick=async ()=>{
-  const label=(el.querySelector('.ml')||{}).textContent||'';
-  if(label.includes('INT') || label.includes('接口')) return showIfDetail();          // 接口 → 弹窗看全部
-  // 其它卡片：不弹窗，直接在卡片里取值并显示
-  const key = el.dataset.key;
-  if(!key) return;
-  const dev = CURDEV || '';
-  // ⚠ 副标题元素【可能不存在】（CPU 卡就没有 .ms），
-  //   以前用 `|| el` 兜底，结果整张卡的文字被替换成了“失败”（实测踩到）。
-  const sub = el.querySelector('.ms');
-  const setSub = (t)=>{ if(sub) sub.textContent = t; };
-  const oldSub = sub ? sub.textContent : '';
-  setSub('取值中…');
+// 表格行下钻（事件委托：行由 JS 重画，不能给单行绑死）
+//   · 接口占用 / 接口 up 行 → showIfDetail() 弹窗看全部接口
+//   · 其它行 → /api/metric/one 单独取值（走同屏，用户看得见），结果显示在「变化与状态」格
+//   · ⚡ → openLearn（映射回 metric-one 的 key：err→crc、uti/int→if）
+$('monRows').onclick = async (ev)=>{
+  const tr = ev.target.closest('tr'); if(!tr || !tr.dataset.key) return;
+  const key = tr.dataset.key;
+  if(ev.target.closest('.learn-btn')){
+    ev.stopPropagation();
+    openLearn(MON_KEYMAP[key] || key);
+    return;
+  }
+  if(key==='uti' || key==='int') return showIfDetail();
+  const noteTd = tr.querySelector('.ms'); if(!noteTd) return;
+  const oldNote = noteTd.textContent;
+  noteTd.textContent = '取值中…（同屏执行，可切到终端看）';
   try{
-    const r = await api('/api/metric/one?device='+encodeURIComponent(dev)+'&key='+key);
-    if(r.__err__||r.error){ setSub('取不到：'+String(r.__err__||r.error).slice(0,24)); return; }
-    const v = r.value;
-    const at = String(r.at||'').slice(11);
-    if(key==='cpu'){
-      if(v!=null){ $('mCpu').innerHTML = v+'<small>%</small>'; setSub('单次取值 '+at); }
-      else setSub('未识别格式 · 长按/双击卡片可让 AI 学');
-    }else if(key==='ram'){
-      if(v!=null){ $('mMem').innerHTML = v+'<small>%</small>'; setSub('单次取值 '+at); }
-      else setSub('未识别格式 · 长按/双击卡片可让 AI 学');
-    }else if(key==='crc'){
-      if(v!=null){ $('mCrc').textContent = v; setSub(v? '⚠ 有错包' : '链路正常 · 无错包'); }
-      else setSub(firstLine(r.output));
-    }else{
-      setSub(firstLine(r.output));
+    const r = await api('/api/metric/one?device='+encodeURIComponent(CURDEV||'')
+      +'&key='+(MON_KEYMAP[key]||key));
+    if(r.__err__||r.error){
+      noteTd.textContent = '取不到：'+String(r.__err__||r.error).slice(0,40);
+      noteTd.classList.add('w');
+      return;
     }
-  }catch(e){ setSub('失败'); if(sub) setTimeout(()=>{ sub.textContent = oldSub; }, 2500); }
-});
+    const v = r.value;
+    if(v!=null && key!=='log'){
+      noteTd.textContent = '单次取值 '+v+' · '+String(r.at||'').slice(11);
+    }else{
+      const fl = firstLine(r.output);
+      noteTd.textContent = fl ? fl.slice(0,120) : '（无回显）';
+    }
+  }catch(e){
+    noteTd.textContent = '失败';
+    setTimeout(()=>{ noteTd.textContent = oldNote; }, 2500);
+  }
+};
 
 /* ── ⚡ AI 学习：采不到值时点这里 ── */
 let LEARN_CTX = null;
@@ -2472,12 +2483,15 @@ async function renderIfTable(d){
   const ifs = allIfs.filter(it => flt==='up' ? isUp(it) : (flt==='phys' ? isPhys(it) : true));
   const _upN = allIfs.filter(isUp).length;
   $('ifSub').textContent=`设备 ${dev} · ${d.at} · 全部 ${allIfs.length} 个 / 在线 ${_upN} 个`;
-  // 顺手把在线数写回监控面板的 INT 卡（原来这里是 --，用户看完弹窗外面还是空）
+  // 顺手把物理口在线数写回监控表格的「接口 up」行（原来这里是 --，用户看完弹窗外面还是空）
   try{
     const _phys = allIfs.filter(it=>/^(GigabitEthernet|FastEthernet|Ethernet|Cellular|XGigabitEthernet|10GE)/i.test(it.name||''));
     const _upPhys = _phys.filter(isUp).length;
-    const mi=$('mIf'); if(mi) mi.innerHTML = _upPhys+'/'+_phys.length+' <small>up</small>';
-    const ms=$('mIfS'); if(ms) ms.textContent = `物理口 ${_phys.length} · 在线 ${_upPhys}`;
+    const tr = document.querySelector('#monRows tr[data-key="int"]');
+    if(tr){
+      tr.querySelector('.mv').innerHTML = _upPhys+'/'+_phys.length;
+      tr.querySelector('.ms').textContent = `物理口 ${_phys.length} · 在线 ${_upPhys}（接口弹窗刷新）`;
+    }
   }catch(e){}
   $('ifCount').textContent = `显示 ${ifs.length} 个${flt==='all'?'（全部）':(flt==='phys'?'（仅物理口）':'（仅在线）')}`;
   let h='<table><tr><th>接口</th><th>PHY</th><th>协议</th><th>入带宽</th><th>出带宽</th>'
@@ -2703,6 +2717,9 @@ function applyTheme(){
   term.options.fontSize = S.termFontSize;
   term.options.theme = xtermTheme();
   try{ fitAddon.fit(); }catch(e){}
+  // 监控区的 canvas（CPU spark / 大图）颜色取自 --st-on，切主题后要重画，
+  // 否则浅色主题下还留着上一主题的荧光绿（canvas 不会自己跟着 CSS 变量走）
+  try{ if(typeof _fitSpark==='function') _fitSpark(); if(typeof drawCpuChart==='function') drawCpuChart(); }catch(e){}
   const v=$('sTermFsV'); if(v) v.textContent=S.termFontSize;
 }
 let refreshTimer=null;

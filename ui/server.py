@@ -1375,6 +1375,178 @@ def _parse_metrics(text: str, platform: str | None = None, dev: str = "") -> dic
     return m
 
 
+# ══════════════════════════════════════════════════════════════════
+#  监控基线 / 增量 / 异常判定（2026-10-04 设计稿 v1.3 第一批）
+#  病根：错包/占用率原先是「总量快照」—— 历史存量无诊断价值，
+#  唯一有意义的口径是「相对上次采集新增了多少」。这里补上基线累积。
+# ══════════════════════════════════════════════════════════════════
+def _mon_baseline_path(dev: str):
+    safe = re.sub(r"[^\w.-]", "_", dev) or "device"
+    return ROOT / "live" / "monitor" / f"{safe}.jsonl"
+
+
+def _mon_baseline_load(dev: str) -> dict | None:
+    """读上一次采集快照（JSONL 最后一行完整 JSON）。坏了/没有 → None，绝不抛。"""
+    try:
+        p = _mon_baseline_path(dev)
+        if not p.exists():
+            return None
+        last = None
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    last = json.loads(line)
+                except Exception:
+                    pass
+        return last
+    except Exception:
+        return None
+
+
+def _mon_baseline_all(dev: str, key: str = "cpu", cap: int = 60) -> list:
+    """取历史序列（给前端画趋势；手动模式下跨次累积）。"""
+    try:
+        p = _mon_baseline_path(dev)
+        if not p.exists():
+            return []
+        out = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                v = json.loads(line).get(key)
+                if v is not None:
+                    out.append(float(v))
+            except Exception:
+                pass
+        return out[-cap:]
+    except Exception:
+        return []
+
+
+def _mon_baseline_append(dev: str, m: dict):
+    """本轮快照追加进 JSONL（>2000 行轮转到尾部 1000）。失败静默 —— 基线缺失只影响增量，不影响采集。"""
+    try:
+        p = _mon_baseline_path(dev)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "crc": m.get("crc"), "in_err": m.get("in_err"),
+               "cpu": (m.get("cpu_1m") if m.get("cpu_1m") is not None else m.get("cpu_10s")),
+               "mem_pct": m.get("mem_pct"), "if_up": m.get("if_up"),
+               "if_total": m.get("if_total"),
+               "if_in_max": m.get("if_in_max"), "if_out_max": m.get("if_out_max")}
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        lines = p.read_text(encoding="utf-8").splitlines()
+        if len(lines) > 2000:
+            p.write_text("\n".join(lines[-1000:]) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _log_cmd_for(platform: str | None) -> str:
+    """日志缓冲区命令：display 系 / show 系。"""
+    return "show logging" if platform in ("ruijie_os", "cisco_ios") else "display logbuffer"
+
+
+def _parse_logbuffer(text: str) -> dict:
+    """logbuffer 分类（排障线索卡）：接口翻动 / 路由邻居 / 环路信号 / 告警。
+    只认带时间戳的日志正文行，避免把表头/回显当线索。抠不到就安静返回。"""
+    import re as _re
+    if not text or "Unrecognized" in text or "<err>" in text[:20]:
+        return {"supported": False, "total": 0, "hits": []}
+    body = [l for l in text.splitlines()
+            if _re.match(r"^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", l)     # 华为/华三式
+            or _re.match(r"^\s*[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}", l)]  # 思科式
+    total = len(body)
+    cats = [
+        # ★ 2026-10-04 测试抓出：华为真机正文是 "Interface GE0/0/2 has turned into
+        #   DOWN state."——原正则只认 "changed state to"，VRP 的 turned into 全漏。
+        ("接口翻动", _re.compile(
+            r"LINE\s*PROTO|link\s*(?:down|up)|changed\s+state\s+to\s+(?:down|up)"
+            r"|turned\s+into\s+(?:down|up)|Interface\s+\S+\s+(?:changed|down|up)", _re.I)),
+        ("路由邻居", _re.compile(r"OSPF|BGP|neighbor|peer\s+state|adjacency\s+chang", _re.I)),
+        ("环路信号", _re.compile(r"mac[-_ ]?(?:mov|flap)|loopback|flapping", _re.I)),
+        ("告警", _re.compile(r"ALARM|CRITICAL|over\s*temperature|over\s*load", _re.I)),
+    ]
+    hits = []
+    for cat, pat in cats:
+        rows = [l.strip() for l in body if pat.search(l)]
+        if rows:
+            hits.append({"cat": cat, "n": len(rows), "sample": rows[-1][:150]})
+    return {"supported": True, "total": total, "hits": hits}
+
+
+def _mon_delta_and_rows(m: dict, last: dict | None, log: dict) -> tuple[dict, list]:
+    """增量计算 + 表格行构造（含判色）。判色规则：
+    bad=var(--bad) 立刻看 ｜ warn=var(--warn) 留意 ｜ ok 正常（不标）。
+    手动档简化：错包增量>0 即报「在涨」（基线跨次累积）；「连续 2 轮」防误报规则留给自动档。"""
+    delta = {}
+    for k in ("crc", "in_err"):
+        if m.get(k) is not None and last and last.get(k) is not None:
+            d = m[k] - last[k]
+            delta[k] = d if d >= 0 else None     # 计数器回绕/设备重启 → 本轮增量弃用
+    rows = []
+
+    def _row(key, label, val, status, note, cmd):
+        rows.append({"key": key, "label": label, "val": val, "status": status,
+                     "note": note, "cmd": cmd})
+
+    # CPU
+    cpu = m.get("cpu_1m") if m.get("cpu_1m") is not None else m.get("cpu_10s")
+    _cs = "ok"
+    if cpu is not None:
+        _cs = "bad" if cpu >= 90 else ("warn" if cpu >= 70 else "ok")
+    _cpu_note = " · ".join(x for x in [
+        f"1min {m['cpu_1m']}%" if m.get("cpu_1m") is not None else "",
+        f"5min {m['cpu_5m']}%" if m.get("cpu_5m") is not None else "",
+        f"峰值 {m['cpu_max']}%" if m.get("cpu_max") is not None else ""] if x)
+    _row("cpu", "CPU", (f"{cpu:g}%" if cpu is not None else "--"), _cs,
+         _cpu_note or "采不到（点 ⚡ 让 AI 学规则）", "display cpu-usage")
+    # 内存
+    mem = m.get("mem_pct")
+    _ms = "bad" if (mem or 0) >= 95 else ("warn" if (mem or 0) >= 90 else "ok")
+    _row("ram", "内存", (f"{mem}%" if mem is not None else "--"), _ms,
+         f"{(m['mem_used']/1048576):.0f}M / {(m['mem_total']/1048576):.0f}M"
+         if m.get("mem_used") and m.get("mem_total") else "--", "display memory-usage")
+    # 错包（增量口径）
+    _d = delta.get("crc") if delta.get("crc") is not None else delta.get("in_err")
+    if _d is not None:
+        _es, _en = ("bad", f"↑ 在涨 +{_d}") if _d > 0 else ("ok", "无新增")
+    else:
+        _es, _en = "ok", "首次采集（下次起报增量）" if m.get("crc") is not None else "--"
+    _row("err", "错包", (f"{m['crc']:,}" if m.get("crc") is not None else "--"), _es,
+         _en, "display interface brief")
+    # 接口占用率
+    _iu, _ou = m.get("if_in_max"), m.get("if_out_max")
+    _mx = max([x for x in (_iu, _ou) if x is not None], default=None)
+    _us = "bad" if (_mx or 0) >= 90 else ("warn" if (_mx or 0) >= 70 else "ok")
+    _row("uti", "接口占用", (f"入 {_iu}% / 出 {_ou}%" if _mx is not None else "--"), _us,
+         "最高口利用率（300 秒均值）", "display interface brief")
+    # 接口 up（对比基线）
+    _up = m.get("if_up"); _tot = m.get("if_total")
+    _ins = "ok"
+    _inote = "--"
+    if _up is not None and last and last.get("if_up") is not None:
+        _dif = _up - last["if_up"]
+        if _dif < 0:
+            _ins, _inote = "warn", f"比上次少 {-_dif} 个（有口 down 了？）"
+        elif _dif > 0:
+            _inote = f"比上次多 {_dif} 个（刚恢复/新接）"
+        else:
+            _inote = "与上次持平"
+    _row("int", "接口 up", (f"{_up}/{_tot}" if _up is not None else "--"), _ins, _inote,
+         "display interface brief")
+    # 设备日志（logbuffer 兜底）
+    if log.get("supported"):
+        _lh = log.get("hits", [])
+        _ls = "warn" if _lh else "ok"
+        _lnote = "；".join(f"{h['cat']} ×{h['n']}" for h in _lh) or f"{log['total']} 条无异常线索"
+        _row("log", "设备日志", f"{log['total']} 条", _ls, _lnote, "display logbuffer")
+    else:
+        _row("log", "设备日志", "--", "ok", "设备不支持或未采到（不影响其他指标）", "display logbuffer")
+    return delta, rows
+
+
 def collect_metrics(dev: str) -> dict:
     """采集只读指标：IP 设备（ssh/telnet）一律独立直连【静默采集】；
     串口空闲时同样直连；只有【串口被前台窗格占用】才走同屏（物理独占，绕不开）。
@@ -1414,6 +1586,7 @@ def collect_metrics(dev: str) -> dict:
         except Exception:
             pass
     base_cmds = mon_cmds(platform, dev)     # {cpu, mem, brief} 按平台取 + 叠加已学到的命令
+    base_cmds.setdefault("log", _log_cmd_for(platform))   # 设备日志（排障线索卡；不支持会被探测逻辑丢弃）
     raws, cmds, used = {}, [], {}
 
     def _send_and_collect(work: dict):
@@ -1481,11 +1654,21 @@ def collect_metrics(dev: str) -> dict:
         learned = _plat.cache_all(dev) if _plat is not None else {}
     except Exception:
         learned = {}
-    return {"device": dev, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    m = _parse_metrics(blob, platform, dev)
+    log_info = _parse_logbuffer(raws.get("log", ""))
+    last = _mon_baseline_load(dev)
+    delta, rows = _mon_delta_and_rows(m, last, log_info)
+    _mon_baseline_append(dev, m)
+    return {"ok": True,            # ★ 2026-10-04 补：前端 loadMonitor 判 d.ok，
+                                   #   此键从未返回过（一直靠 !undefined 误判走失败分支前的
+                                   #   渲染代码兜着）；补上让成功/失败判定真实成立。
+            "device": dev, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "via": via_note,
             "platform": platform or "(未标注)",
             "platform_auto": bool(auto_detected),
-            "metrics": _parse_metrics(blob, platform, dev),
+            "metrics": m,
+            "delta": delta, "rows": rows, "log": log_info,
+            "hist_cpu": _mon_baseline_all(dev, "cpu"),
             "cmds": cmds, "used": used, "learned": learned,
             "raw": {k: v[-4000:] for k, v in raws.items()}}
 
@@ -1699,6 +1882,7 @@ _METRIC_CMDS = {
     "ram":  "display memory-usage",
     "crc":  "display interface brief",
     "if":   "display interface brief",
+    "log":  "display logbuffer",          # 监控表格「设备日志」行的下钻
     "ver":  "display version",
     "clock": "display clock",
 }

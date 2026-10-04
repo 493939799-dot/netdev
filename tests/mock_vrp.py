@@ -111,6 +111,31 @@ def handle(st: State, cmd: str) -> str:
         head = f"\nBasic ACL {num}, {len(rules)} rules\nAcl's step is 5\n"
         body = "".join(f" rule {r}\n" for r in rules) or " (no rules)\n"
         return head + body
+    if low.startswith("display cpu-usage"):
+        # 格式对齐 lib/platforms.py huawei_vrp 档案的正则（CPU Usage: n% / one minute: n%），
+        # 供监控表格的 CPU/内存行离线联调。
+        return ("\nCPU Usage: 18% Max: 44%\n"
+                "CPU Usage for one minute: 12%\n"
+                "CPU Usage for five minutes: 10%\n")
+    if low.startswith("display memory-usage"):
+        return ("\nMemory Using Percentage Is: 32%\n"
+                "System Total Memory Is: 261516 bytes\n"
+                "Total Memory Used Is: 83684 bytes\n")
+    if low.startswith("display logbuffer") or low in ("show logging", "display logfile"):
+        # 供监控面板的日志分类（_parse_logbuffer）联调：
+        # 混入 GE0/0/2 链路翻动 + OSPF 邻居变化样本，全部带时间戳正文行。
+        return (
+            "\n2026-10-04 09:12:33  MOCK-HW %%01IFNET/4/IF_STATE(l)[0]:Interface GE0/0/2 has turned into DOWN state.\n"
+            "2026-10-04 09:12:41  MOCK-HW %%01IFNET/4/IF_STATE(l)[1]:Interface GE0/0/2 has turned into UP state.\n"
+            "2026-10-04 09:13:02  MOCK-HW %%01OSPF/3/NBR_CHANGE(l)[2]:Neighbor changes: router id 10.0.0.1, neighbor 10.0.0.2 changed from Full to Down.\n"
+            "2026-10-04 09:13:09  MOCK-HW %%01IFNET/4/IF_STATE(l)[3]:Interface GE0/0/2 has turned into DOWN state.\n"
+            "2026-10-04 09:13:15  MOCK-HW %%01IFNET/4/IF_STATE(l)[4]:Interface GE0/0/2 has turned into UP state.\n"
+            "2026-10-04 09:15:27  MOCK-HW %%01OSPF/3/NBR_CHANGE(l)[5]:Neighbor changes: router id 10.0.0.1, neighbor 10.0.0.2 changed from Down to Full.\n"
+            "2026-10-03 22:41:10  MOCK-HW %%01IFNET/4/IF_STATE(l)[6]:Interface GE0/0/1 has turned into DOWN state.\n"
+            "2026-10-03 22:41:15  MOCK-HW %%01IFNET/4/IF_STATE(l)[7]:Interface GE0/0/1 has turned into UP state.\n"
+            "2026-10-03 18:02:44  MOCK-HW %%01AAA/6/AAA_SUCCESS(l)[8]:User admin login successfully.\n"
+            "2026-10-02 11:20:05  MOCK-HW %%01CONFIG/6/CONFIG_SAVE(l)[9]:The configuration is saved successfully.\n"
+        )
     if low in ("display users",):
         return "\n  User-Intf  Delay   Type   Network Address   AuthenStatus\n  0  CON 0   00:00:00  Serial\n"
     if low in ("system-view", "sys"):
