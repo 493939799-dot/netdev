@@ -22,13 +22,15 @@ import time
 DEFAULT_COLOR = "\033[38;5;208m"      # 256 色里的橙色
 RESET = "\033[39m"      # 只重置前景色，保留外层样式（如暗色/加粗）
 
-# 输入回显三色（256 色）：
-#   人   = 浅蓝 —— 明显区别于默认前景，又不刺眼
-#   AI   = 紫   —— 和蓝拉开色相距离
-#   系统 = 灰   —— 监控探测这类 netdev 代发的噪音，压暗即可
-HUMAN_COLOR = os.environ.get("NETDEV_HUMAN_COLOR") or "\033[38;5;75m"
-AI_COLOR = os.environ.get("NETDEV_AI_COLOR") or "\033[38;5;141m"
-SYS_COLOR = os.environ.get("NETDEV_SYS_COLOR") or "\033[38;5;245m"
+# 输入回显三色（256 色）。★ 选取标准：白底（minimal/ink 浅色主题的网页
+# 终端是纯白背景）与黑底都要 ≥4:1 对比 —— 浅紫 141/浅蓝 75 在白底上
+# 几乎透明（2026-10-04 用户实测"看不清"），故用中深饱和色。
+#   人   = 蓝 33 (#0087ff)
+#   AI   = 紫 129 (#af00ff，深紫罗兰)
+#   系统 = 灰 243 —— 监控探测这类 netdev 代发的噪音，压暗即可
+HUMAN_COLOR = os.environ.get("NETDEV_HUMAN_COLOR") or "\033[38;5;33m"
+AI_COLOR = os.environ.get("NETDEV_AI_COLOR") or "\033[38;5;129m"
+SYS_COLOR = os.environ.get("NETDEV_SYS_COLOR") or "\033[38;5;243m"
 
 
 def _color() -> str:
