@@ -210,20 +210,24 @@ def test_log_cmd_and_mock():
 # 五、前端断言守：监控区必须是简易表格
 # ======================================================================
 def test_frontend():
-    print("\n[5] 前端断言守（表格化 + 基线趋势接线）")
+    print("\n[5] 前端断言守（2026-10-04 定稿：纯 AI 诊断视图，指标详情已删）")
     html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
-    check("监控区有 #monRows 表格", 'id="monRows"' in html and "mon-tbl" in html)
-    check("旧 .cards4/.mcard 已移除", ".cards4" not in html and "mcard" not in html)
-    check("行渲染函数 renderMonRows 存在", "function renderMonRows" in html)
-    check("渲染走后端 rows（diagnose 响应的 monitor.rows）", "renderMonRows(mon.rows)" in html)
-    check("CPU 历史接后端基线 hist_cpu", "mon.hist_cpu" in html)
-    check("判色 class 接到语义色", 'class="bad-row"' in html and 'class="warn-row"' in html)
-    check("⚡ 学习按钮保留（表格行内）", 'class="learn-btn"' in html)
-    check("接口行下钻保留 showIfDetail", "showIfDetail()" in html)
-    check("行下钻走事件委托（行是重画的）", "$('monRows').onclick" in html)
-    check("bwChart 大图保留", "id=\"bwChart\"" in html)
-    check("旧卡片元素 ID 已清干净", "$('mCpu')" not in html and "$('mMem')" not in html
+    check("状态区主视图 #diagBox", 'id="diagBox"' in html)
+    check("指标详情表格已整体移除（details/table/canvas/hint）",
+          all(s not in html for s in
+              ('id="monDetail"', 'id="monTable"', 'id="monRows"', 'id="bwChart"',
+               'id="monHint"', 'class="mon-tbl"', 'renderMonRows', 'MON_KEYMAP',
+               'MON_HIST', '_fitSpark', 'drawCpuChart', '_stOn')))
+    check("旧卡片元素 ID 也清干净", "$('mCpu')" not in html and "$('mMem')" not in html
           and "$('mCrc')" not in html and "$('mIf')" not in html)
+    check("每条建议用横线分割（diag-item 上边框）",
+          ".diag-item{border-top:1px dashed var(--g4)" in html)
+    check("徽章三档用语义色", "DIAG_SEV" in html and "var(--st-on)" in html
+          and "var(--bad)" in html)
+    check("采集走 /api/monitor/diagnose", "/api/monitor/diagnose" in html)
+    check("AI 失败降级：黄条说明原因", "AI 诊断不可用" in html)
+    check("接口详情弹窗保留（?open=if 等入口还在用 showIfDetail）", "showIfDetail" in html)
+    check("📚 已学规则入口保留（btnRules）", "$('btnRules').onclick=()=>showRules();" in html)
 
 
 # ======================================================================
@@ -245,6 +249,8 @@ def test_ai_diagnose():
     check("prompt 喂日志线索（分类+样本）", "接口翻动×6" in p and "turned into DOWN" in p)
     check("prompt 喂 CPU 历史统计", "最高 7%" in p and "近 3 次" in p)
     check("prompt 禁止编造 + 强制只出 JSON", "不要编造" in p and "只输出一个 JSON" in p)
+    check("输出要求规整：限条数 + 短语标题 + 单条动作",
+          "最多 4 条" in p and "不超过 12 个字" in p and "不要给一堆命令清单" in p)
 
     r = S.parse_diag_json('{"overall":"bad","summary":"错包在涨","items":'
                           '[{"sev":"bad","title":"t","detail":"d","action":"a"}]}')
@@ -261,12 +267,13 @@ def test_ai_diagnose():
 
     html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
     check("状态区主视图 #diagBox", 'id="diagBox"' in html)
-    check("指标表格收进 <details> 折叠", '<details id="monDetail">' in html)
+    check("指标详情已整体移除（用户 2026-10-04 指定不要了）",
+          all(s not in html for s in ('id="monDetail"', 'id="monTable"', 'id="monRows"')))
     check("徽章三档用语义色", "DIAG_SEV" in html and "var(--st-on)" in html
           and "var(--bad)" in html)
     check("采集走 /api/monitor/diagnose", "/api/monitor/diagnose" in html)
-    check("AI 失败降级：展开指标详情 + 黄条提示", "det.open = true" in html)
-    check("有诊断结论时收起表格", "det.open = false" in html)
+    check("AI 失败降级：黄条说明原因（不假装有结论）", "AI 诊断不可用" in html)
+    check("每条建议横线分割", ".diag-item{border-top:1px dashed var(--g4)" in html)
 
 
 if __name__ == "__main__":
