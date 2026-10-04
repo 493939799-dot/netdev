@@ -2284,8 +2284,10 @@ async function loadMonitor(quiet){
   // 只有直连也失败时才提示"开一次终端走同屏"。原来这里 return 会泄漏 monBusy（按钮永久失效）。
   const tempOffline = (d0.kind==='temp' && !d0.window_live);
   if(tempOffline && quiet){ monBusy=false; return; }      // 自动采集：离线临时目标安静跳过
-  const btn=$('btnMon'), old=btn.textContent;
-  btn.textContent='采集+诊断中…'; btn.disabled=true; $('monSub').textContent='采集中…';
+  const btn=$('btnMon');
+  // ★ 按钮文字不动（真机教训：换成长文字「采集+诊断中…」会把窄面板标题栏再次挤爆），
+  //   进度只走面板体说明行 monSub —— 那行本来就是干这个的
+  btn.disabled=true; $('monSub').textContent='采集中…';
   const dev = dev0;
   try{
     // ★ 一次请求完成「静默采集 + AI 诊断」；采集慢（串口）+ AI 分析，给足超时
@@ -2316,7 +2318,7 @@ async function loadMonitor(quiet){
   }catch(e){
     $('monSub').textContent='采集失败';
     if(!quiet) audit('FAIL',dev,'监控采集异常');
-  }finally{ btn.textContent='⟳ 采集'; btn.disabled=false; monBusy=false; monIcon(false); }
+  }finally{ btn.disabled=false; monBusy=false; monIcon(false); }
 }
 $('btnMon').onclick=()=>loadMonitor(false);
 $('btnRules').onclick=()=>showRules();
