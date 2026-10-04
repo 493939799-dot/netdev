@@ -10,22 +10,7 @@ Serial console, SSH and Telnet all converge into a single CLI. That CLI is the
 (blacklist, human approval, forced backup, per-line verification) lives in that
 one path, so the AI cannot route around it.
 
-```
-┌──────────┐   ┌──────────┐   ┌──────────┐
- │  Human   │   │ Web UI   │   │    AI    │   ← 3 front doors…
- └────┬─────┘   └────┬─────┘   └────┬─────┘
-      │             │              │
-      └─────────────┼──────────────┘
-                    ▼
-            ┌───────────────┐
-            │  netdev CLI   │          ← …one door. All guardrails live here.
-            └───────┬───────┘
-                    ▼
-        ┌───────────────────────────┐
-        │ serial · SSH · Telnet     │
-        │ (tmux: 人机同屏 / shared) │
-        └───────────────────────────┘
-```
+![Architecture: 3 front doors (Human / Web UI / AI), one door — the netdev CLI, with all four guardrails inside](docs/netdev-architecture.svg)
 
 ## Why
 

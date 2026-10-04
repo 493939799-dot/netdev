@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 400" font-family="-apple-system,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif">
+  <!-- 三个前门 -->
+  <g>
+    <rect x="60" y="46" width="170" height="58" rx="10" fill="#f6f5f2" stroke="#8a8a86" stroke-width="1.5"/>
+    <text x="145" y="82" text-anchor="middle" font-size="20" fill="#1f2328" font-weight="600">人工</text>
+
+    <rect x="345" y="46" width="170" height="58" rx="10" fill="#f6f5f2" stroke="#8a8a86" stroke-width="1.5"/>
+    <text x="430" y="82" text-anchor="middle" font-size="20" fill="#1f2328" font-weight="600">网页界面</text>
+
+    <rect x="630" y="46" width="170" height="58" rx="10" fill="#f6f5f2" stroke="#8a8a86" stroke-width="1.5"/>
+    <text x="715" y="82" text-anchor="middle" font-size="20" fill="#1f2328" font-weight="600">AI</text>
+
+    <text x="826" y="82" font-size="15" fill="#8a8a86">← 三个前门</text>
+  </g>
+
+  <!-- 汇流：三条竖线 → 一条总线 → 一支箭头 -->
+  <g stroke="#8a8a86" stroke-width="1.5" fill="none">
+    <line x1="145" y1="104" x2="145" y2="148"/>
+    <line x1="430" y1="104" x2="430" y2="148"/>
+    <line x1="715" y1="104" x2="715" y2="148"/>
+    <line x1="145" y1="148" x2="715" y2="148"/>
+    <line x1="430" y1="148" x2="430" y2="176"/>
+  </g>
+  <path d="M422 176 l8 12 8 -12 z" fill="#8a8a86"/>
+
+  <!-- 唯一的一扇门：netdev CLI（护栏在里面） -->
+  <g>
+    <rect x="290" y="188" width="280" height="104" rx="12" fill="#ffffff" stroke="#0f8a3a" stroke-width="2.5"/>
+    <text x="430" y="222" text-anchor="middle" font-size="21" fill="#0f6b2e" font-weight="700">netdev CLI</text>
+    <g font-size="13.5" fill="#57606a" text-anchor="middle">
+      <rect x="310" y="240" width="56" height="26" rx="13" fill="#f0f9f1" stroke="#0f8a3a" stroke-opacity=".45"/>
+      <text x="338" y="258">黑名单</text>
+      <rect x="374" y="240" width="76" height="26" rx="13" fill="#f0f9f1" stroke="#0f8a3a" stroke-opacity=".45"/>
+      <text x="412" y="258">人工审批</text>
+      <rect x="458" y="240" width="76" height="26" rx="13" fill="#f0f9f1" stroke="#0f8a3a" stroke-opacity=".45"/>
+      <text x="496" y="258">强制备份</text>
+      <rect x="542" y="240" width="8" height="26" rx="0" fill="none" stroke="none"/>
+    </g>
+    <text x="590" y="246" font-size="15" fill="#8a8a86">← 只有一扇门，</text>
+    <text x="590" y="268" font-size="15" fill="#8a8a86">护栏全在里面</text>
+  </g>
+
+  <!-- CLI → 通道 -->
+  <g stroke="#8a8a86" stroke-width="1.5" fill="none">
+    <line x1="430" y1="292" x2="430" y2="322"/>
+  </g>
+  <path d="M422 322 l8 12 8 -12 z" fill="#8a8a86"/>
+
+  <!-- 通道 -->
+  <g>
+    <rect x="290" y="338" width="280" height="52" rx="10" fill="#f6f5f2" stroke="#8a8a86" stroke-width="1.5"/>
+    <text x="430" y="360" text-anchor="middle" font-size="16" fill="#1f2328" font-weight="600">串口 · SSH · Telnet</text>
+    <text x="430" y="380" text-anchor="middle" font-size="12.5" fill="#8a8a86">tmux：人机同屏</text>
+  </g>
+</svg>
