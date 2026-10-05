@@ -1124,6 +1124,7 @@ class DirectSession:
         # 系统人设：设备调试助手（见文件头 DEBUG_SYSTEM_PROMPT）
         msgs = [{"role": "system", "content": DEBUG_SYSTEM_PROMPT}] + self.messages
 
+        _stored = False      # ★ 本轮回复是否已写回 self.messages（异常/中止路径见 finally）
         try:
             for _ in range(self.MAX_ITER):
                 if self._abort.is_set():
@@ -1171,7 +1172,21 @@ class DirectSession:
                     self.messages += tool_results
                     self._turn_text = []
                     continue
-                # 纯文本 → 结束
+                # 纯文本 → 结束。★ 2026-10-05 修 P0：必须把这条回复写回 self.messages。
+                #   旧实现直接 break —— 于是【纯文本回复只发给了本轮的模型，
+                #   从不进入上下文】。后果（用户真机实测）：
+                #     ① AI 记不住自己说过什么：讲了故事、被问时断然否认，
+                #        且它引用的"依据"（上下文里只有一个 netdev_list 调用）
+                #        在它自己的上下文里【是真的】—— 不是幻觉，是被我们删了。
+                #     ② 它会重复回答已答过的问题、重复做已做过的检查；
+                #        写操作场景下不记得刚提交过什么变更 → 有重复下发风险。
+                #   与 1168 行的「带工具 assistant 写回」对称：两种结束方式都要落上下文。
+                #   ⚠ 这里【不能】清空 self._turn_text —— finally 里的 turn_end
+                #   流水要用它记录 assistant 全文（清了就记成空串）。
+                _final = "".join(self._turn_text)
+                if _final:
+                    self.messages.append({"role": "assistant", "content": _final})
+                    _stored = True
                 break
         except Exception as e:
             self._emit({"type": "error",
@@ -1180,6 +1195,13 @@ class DirectSession:
                                  "error": f"{type(e).__name__}: {e}"})
         finally:
             self._close_msg()              # 兜底收口（含 abort / 异常路径）
+            # ★ 2026-10-05：异常 / 中止路径也要把已产出的文本写回上下文 ——
+            #   否则"被用户按停止 / 中途报错的那一轮"照样从 AI 的记忆里消失
+            #   （同一个 P0 的另一个入口）。正常结束已由 _stored 标记，不会重复。
+            if not _stored:
+                _tail = "".join(self._turn_text)
+                if _tail:
+                    self.messages.append({"role": "assistant", "content": _tail})
             self._emit({"type": "agent_end"})
             self.last_active = time.time()
             _ai_audit(self.aid, {"type": "turn_end",
