@@ -2799,6 +2799,118 @@ def _mock_pid(port: int):
         return None, pidf        # 残留 pid 文件：进程已死
 
 
+def cmd_ai_log(a):
+    """AI 会话流水（append-only）—— 查「AI 说过什么、调过哪个工具、改过什么」。
+
+    为什么有这个命令（2026-10-05）：AI 的对话上下文是内存态、会被压缩，
+    实测出现过「先顺着提问编内容、后以绝对语气否认自己讲过」的两连 ——
+    根因是它对自身历史既不可靠也无处可查。设备侧一直有镜像日志 / 审批流水，
+    AI 自己的行为现在也有同等证据链：logs/ai-session/<aid>/session.jsonl。
+
+    用法：
+      netdev ai log                 # 列会话 + 显示最近一个会话的尾部
+      netdev ai log --list          # 只列会话（时间/条数/设备）
+      netdev ai log --aid <aid>     # 看指定会话
+      netdev ai log --last 100 --json
+    """
+    import json as _json
+    base = ROOT / "logs" / "ai-session"
+    aid = (getattr(a, "aid", "") or "").strip()
+    want_json = bool(getattr(a, "json", False))
+    last = int(getattr(a, "last", 40) or 40)
+
+    sessions = []
+    if base.is_dir():
+        for d in sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
+            f = d / "session.jsonl"
+            if not f.is_file():
+                continue
+            n, first, lst, dev, model = 0, "", "", "", ""
+            try:
+                for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        r = _json.loads(ln)
+                    except Exception:
+                        continue
+                    n += 1
+                    first = first or r.get("at", "")
+                    lst = r.get("at", "") or lst
+                    if r.get("type") == "session_start":
+                        dev, model = r.get("device", "") or dev, r.get("model", "") or model
+            except Exception:
+                continue
+            sessions.append({"aid": d.name, "n": n, "first": first, "last": lst,
+                             "device": dev, "model": model, "path": str(f)})
+    if not sessions:
+        print("还没有 AI 会话流水（在界面里用过 AI 助手之后就会有）。")
+        return 0
+    if getattr(a, "list", False):
+        if want_json:
+            print(_json.dumps(sessions, ensure_ascii=False, indent=1))
+            return 0
+        print(f"{C['bold']}AI 会话流水（append-only，位于 logs/ai-session/）{C['reset']}")
+        for s in sessions:
+            print(f"  {s['last'][:19]}  {s['n']:>5} 条  {s['device'] or '-':<12} "
+                  f"{s['model'] or '-':<20} aid={s['aid']}")
+        return 0
+
+    pick = next((s for s in sessions if s["aid"] == aid), sessions[0]) if aid \
+        else sessions[0]
+    f = pathlib.Path(pick["path"])
+    try:
+        rows = [_json.loads(x) for x in
+                f.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+    except Exception as e:
+        print(f"✘ 读流水失败：{type(e).__name__}: {e}")
+        return 1
+    if want_json:
+        for r in rows[-last:]:
+            print(_json.dumps(r, ensure_ascii=False))
+        return 0
+
+    print(f"{C['bold']}会话 {pick['aid']}{C['reset']}  "
+          f"{C['dim']}设备={pick['device'] or '-'} 模型={pick['model'] or '-'}  "
+          f"共 {len(rows)} 条事件（显示最近 {min(last, len(rows))} 条）{C['reset']}")
+    print(f"{C['dim']}  流水文件：{pick['path']}{C['reset']}\n")
+    for r in rows[-last:]:
+        t = r.get("at", "")[11:]
+        k = r.get("type")
+        if k == "user":
+            print(f"{t}  {C['cyn']}👤 你 {C['reset']}{r.get('text','')[:160]}")
+        elif k == "tool_call":
+            arg = _json.dumps(r.get("args") or {}, ensure_ascii=False)[:130]
+            print(f"{t}  {C['blu']}🔧 工具 {C['reset']}{r.get('name','')}({arg}) "
+                  f"{C['dim']}→ {r.get('result_chars',0)} 字符{C['reset']}")
+        elif k == "turn_end":
+            txt = (r.get("assistant") or "").replace("\n", " ")[:160]
+            extra = f" {C['dim']}[{r.get('seconds','?')}s{' 已中止' if r.get('aborted') else ''}]{C['reset']}"
+            print(f"{t}  {C['grn']}🤖 AI {C['reset']}{txt}{extra}")
+        elif k == "compact":
+            print(f"{t}  {C['yel']}🗜 压缩 {C['reset']}丢弃 {r.get('dropped')} 条 → "
+                  f"摘要 {r.get('summary_chars')} 字（原文仍在流水）")
+        elif k == "error":
+            print(f"{t}  {C['red']}✘ 错误 {C['reset']}{str(r.get('error',''))[:160]}")
+        elif k == "session_start":
+            print(f"{t}  {C['dim']}▶ 会话开始 model={r.get('model','')} "
+                  f"tools={r.get('tools','')} device={r.get('device','')}{C['reset']}")
+        elif k == "session_end":
+            print(f"{t}  {C['dim']}■ 会话结束（{r.get('reason','')}）{C['reset']}")
+    print(f"\n{C['dim']}提示：会话被压缩过也不怕 —— 原文永远在本文件里。{C['reset']}")
+    return 0
+
+
+def cmd_ai(a):
+    """`netdev ai` 无子命令时：打印用法。"""
+    print(f"{C['bold']}netdev ai{C['reset']} —— AI 助手相关的查看工具\n")
+    print("  netdev ai log [--aid <id>] [--list] [--last N] [--json]")
+    print(f"{C['dim']}    查 AI 会话流水：你说过什么、AI 答过什么、调了哪个工具、"
+          f"改过什么（append-only）{C['reset']}")
+    return 0
+
+
 def cmd_mock(a):
     """本机设备模拟器（华为 VRP）—— 没有真设备也能把界面跑起来看。
 
@@ -3906,9 +4018,20 @@ def main(argv=None):
     pl.set_defaults(fn=cmd_policy)
     sub.add_parser("mcp", help="以 MCP stdio 服务器方式运行").set_defaults(fn=cmd_mcp)
 
+    # AI 助手流水查看（2026-10-05）：AI 的对话上下文是内存态且会被压缩，
+    # 光靠它自己"记得"不可靠 —— 这里给它一个 append-only 的证据链查询入口。
+    ai = sub.add_parser("ai", help="AI 助手：查看会话流水（说过什么/调过什么工具，有据可查）")
+    ai_sub = ai.add_subparsers(dest="ai_cmd")
+    ail = ai_sub.add_parser("log", help="查看 AI 会话流水（默认显示最近一个会话）")
+    ail.add_argument("--aid", default="", help="指定会话 ID（见 --list）")
+    ail.add_argument("--list", action="store_true", help="只列出会话（时间/条数/设备）")
+    ail.add_argument("--last", type=int, default=40, help="显示最近 N 条事件（默认 40）")
+    ail.add_argument("--json", action="store_true", help="输出原始 JSON 行（机器可读）")
+    ail.set_defaults(fn=cmd_ai_log)
+    ai.set_defaults(fn=cmd_ai)
+
     a = p.parse_args(argv)
     return a.fn(a)
-
 
 if __name__ == "__main__":
     try:

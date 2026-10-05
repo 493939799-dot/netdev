@@ -572,11 +572,92 @@ DEBUG_SYSTEM_PROMPT = """你是【网络设备调试助手】，正在协助一�
 · 你手上【没有】任何文件读写工具 —— 设备数据的唯一合法来源就是 netdev_* 工具。
   想引用"某份落盘结果"，只能用 netdev_screen_read / netdev_watch_tail 这类
   设备通道工具，或请在座的工程师帮你贴出来。
+
+★ 关于你自己的记忆（2026-10-05 加，务必执行）：
+你的对话上下文是【内存态】：它会被自动压缩、也可能因界面刷新而重置 ——
+所以你对"自己以前说过什么、做过什么"的把握【不可靠】，别把它当成事实依据。
+· 【禁止】对"某事有没有发生过"做绝对断言（例如"我一个都没讲过""我从没执行过
+  那条命令"）。要么给出可核对的依据，要么如实说："我的上下文里没有相关记录，
+  建议核对流水"。语气上的确定 ≠ 事实上的确凿。
+· 被问到你自己的历史（刚才说过什么 / 发过什么命令）时：设备侧的去查实时回显
+  （netdev_screen_read / netdev_watch_tail）；你自己的对话与操作流水在
+  logs/ai-session/<会话ID>/session.jsonl（append-only，人可查）—— 你手上没有
+  读文件的工具，如实说明并请工程师核对，不要凭记忆下结论。
+· 当用户的提问【前提与你上下文冲突】时（例如"你刚才讲的那个故事"，而你
+  上下文里没有它），【先澄清】"我的上下文里没有这段记录"，再问清对方指的是
+  什么 —— 绝不顺着对方的前提现编内容。顺着编，就是幻觉。
 """
 
 
 AI_SESSIONS: dict = {}
 AI_LOCK = threading.Lock()
+
+# ── AI 会话流水（append-only JSONL，2026-10-05 加）──────────────────────
+#   为什么必须有：对话上下文是【内存态】且会被压缩，于是用户问
+#   "你刚才说过/做过什么"时，AI 只能凭残存上下文【断言】——实测出现过
+#   「先顺着提问编内容、后以绝对语气否认」两连。设备侧有镜像日志 /
+#   approvals.log / 快照，AI 自己的行为也必须有同等证据链：
+#   每个用户输入、每次工具调用（名称+参数）、每次结果（摘要）、每轮回复、
+#   每次压缩/异常，全部 append-only 落盘，人可查、AI 可被问责。
+#   位置：logs/ai-session/<aid>/session.jsonl（logs/ 已被 gitignore 排除）
+AI_LOG_DIR = ROOT / "logs" / "ai-session"
+AI_LOG_LOCK = threading.Lock()
+
+
+def _ai_audit(aid: str, ev: dict) -> None:
+    """记一条 AI 会话流水。尽力而为：流水失败绝不影响对话本身。"""
+    try:
+        raw = aid or ""
+        safe = re.sub(r"[^A-Za-z0-9_-]", "", raw)[:32]
+        if not safe or safe != raw[:32]:
+            # aid 异常（含路径分隔符等）→ 用哈希命名，绝不让它影响目录结构
+            import hashlib
+            safe = "aid-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        d = AI_LOG_DIR / safe
+        d.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": round(time.time(), 3), "at": time.strftime("%F %T"), **ev}
+        line = json.dumps(rec, ensure_ascii=False)
+        with AI_LOG_LOCK:
+            with open(d / "session.jsonl", "a", encoding="utf-8") as fp:
+                fp.write(line + "\n")
+    except Exception:
+        pass
+
+
+def ai_log_sessions() -> list[dict]:
+    """列出落盘过的 AI 会话（供 `netdev ai log --list` 与界面恢复用）。"""
+    out = []
+    try:
+        for d in sorted(AI_LOG_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
+            f = d / "session.jsonl"
+            if not f.is_file():
+                continue
+            n, first, last, device, model = 0, "", "", "", ""
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    for ln in fp:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            r = json.loads(ln)
+                        except Exception:
+                            continue
+                        n += 1
+                        first = first or r.get("at", "")
+                        last = r.get("at", "") or last
+                        if r.get("type") == "session_start":
+                            device = r.get("device", "") or device
+                            model = r.get("model", "") or model
+            except Exception:
+                continue
+            out.append({"aid": d.name, "events": n, "first": first, "last": last,
+                        "device": device, "model": model,
+                        "path": str(f)})
+    except Exception:
+        pass
+    return out
+
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -783,6 +864,9 @@ class DirectSession:
         # read 档位：不挂任何工具（只对话）；read+netdev / full 才给 netdev 工具
         self.use_netdev = self.tools_key in NETDEV_TOOLSETS
         self.cwd = cwd or str(ROOT)
+        self.name = ""                       # 界面上的会话名（用于刷新后恢复）
+        self.device = ""                     # 这个会话焊死的设备（前端传）
+        self.created = time.time()
         self.subs: set[queue.Queue] = set()
         self.lock = threading.Lock()
         self.alive = True
@@ -1028,9 +1112,13 @@ class DirectSession:
         self._turn_text = []
         self._in_msg = False               # 新轮次：气泡状态复位
         self.messages.append({"role": "user", "content": text})
+        _t0 = time.time()
+        _ai_audit(self.aid, {"type": "user", "text": text,
+                             "ctx_msgs": len(self.messages)})
         if not self.cfg.get("ok"):
             self._emit({"type": "error", "error": self.cfg.get("note", "直连未配置")})
             self._emit({"type": "agent_end"})
+            _ai_audit(self.aid, {"type": "error", "error": self.cfg.get("note", "")})
             return
 
         # 系统人设：设备调试助手（见文件头 DEBUG_SYSTEM_PROMPT）
@@ -1068,6 +1156,10 @@ class DirectSession:
                             "function": {"name": t["name"], "arguments": t["args"]},
                         })
                         result = self._call_tool(t["name"], args)
+                        _ai_audit(self.aid, {"type": "tool_call", "name": t["name"],
+                                             "args": args,
+                                             "result_chars": len(str(result or "")),
+                                             "result_head": str(result or "")[:200]})
                         tool_results.append({
                             "role": "tool",
                             "tool_call_id": t["id"],
@@ -1084,10 +1176,16 @@ class DirectSession:
         except Exception as e:
             self._emit({"type": "error",
                         "error": f"直连请求异常: {type(e).__name__}: {e}"})
+            _ai_audit(self.aid, {"type": "error",
+                                 "error": f"{type(e).__name__}: {e}"})
         finally:
             self._close_msg()              # 兜底收口（含 abort / 异常路径）
             self._emit({"type": "agent_end"})
             self.last_active = time.time()
+            _ai_audit(self.aid, {"type": "turn_end",
+                                 "assistant": "".join(self._turn_text)[:4000],
+                                 "seconds": round(time.time() - _t0, 2),
+                                 "aborted": bool(self._abort.is_set())})
 
     # ── 对外接口 ──
     def prompt(self, text: str) -> bool:
@@ -1102,14 +1200,79 @@ class DirectSession:
         return True
 
     def compact(self, instructions: str = "") -> bool:
-        # 内存态上下文：把旧消息压缩成一条摘要，保留最近 2 条
-        if len(self.messages) > 6:
-            keep = self.messages[-2:]
-            summary = ("（以下为更早对话的压缩摘要）"
-                       + (instructions or "") + " …")
-            self.messages = [{"role": "system", "content": summary}] + keep
-            return True
-        return False
+        """把更早的对话压成【摘要】（原文有流水归档，可回查）。
+
+        ★ 2026-10-05 重写。旧实现是「丢弃旧消息 + 塞一句占位符」：
+          前端 🗜 按钮文案承诺"结构化摘要"，实际是**无痕失忆**——
+          实测用户问"你刚才讲了几次故事"，AI 上下文里真没有，于是以
+          绝对语气否认（而它此前确实讲过）。调试是累积过程，
+          丢上下文 = 丢证据链。现在：
+            ① 原文本来就 append-only 落在 logs/ai-session/<aid>/session.jsonl；
+            ② 尽力让模型生成**真摘要**（失败则如实写明"未生成摘要、原文见流水"）；
+            ③ 保留最近 4 条原始消息（旧实现只留 2 条）。
+        """
+        if len(self.messages) <= 8:
+            return False
+        keep = self.messages[-4:]
+        old = self.messages[:-4]
+        summary = self._summarize_messages(old, instructions)
+        note = summary or ("（本次未生成摘要 —— 模型不可用或超时；"
+                           "完整原文见流水文件，不要凭记忆断言早前内容）")
+        self.messages = [{"role": "system", "content":
+                          "【上下文压缩】更早的对话已压缩为下面的摘要。\n"
+                          "原文（append-only，可核对任何细节）："
+                          f"logs/ai-session/{self.aid}/session.jsonl\n\n" + note}] + keep
+        _ai_audit(self.aid, {"type": "compact", "dropped": len(old),
+                             "kept": len(keep), "summary_chars": len(summary),
+                             "summary": (summary or "")[:3000]})
+        return True
+
+    # ── 真摘要（compact 用；非流式一次请求，失败返回 ""）────────────────
+    def _summarize_messages(self, old: list[dict], instructions: str = "") -> str:
+        try:
+            import http.client
+
+            def _txt(m: dict) -> str:
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = json.dumps(c, ensure_ascii=False)
+                t = str(c or "").strip()
+                if not t and m.get("tool_calls"):
+                    t = "[调用工具] " + ", ".join(
+                        (x.get("function") or {}).get("name", "?") for x in m["tool_calls"])
+                return t[:1500]
+
+            convo = [f"[{m.get('role')}] {_txt(m)}" for m in old if _txt(m)]
+            if not convo:
+                return ""
+            req = {
+                "model": self.model or "deepseek-chat",
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content":
+                     "你是网络设备调试会话的记录员。把下面这段对话压缩成结构化摘要，务必保留："
+                     "①已确认的设备事实（设备名 + 数据时间）②已执行过的操作，尤其写操作（改了什么、"
+                     "是否备份、结果）③未决问题与待办 ④用户明确表达过的偏好或约束。"
+                     "只写对话里真实出现过的内容，不许推测或补充；用中文，400 字内。"},
+                    {"role": "user", "content": (instructions + "\n\n" if instructions else "")
+                     + "\n".join(convo)},
+                ],
+            }
+            payload = json.dumps(req, ensure_ascii=False).encode("utf-8")
+            u = urllib.parse.urlparse(self.cfg["base_url"] + "/chat/completions")
+            conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=60) \
+                if u.scheme == "https" else \
+                http.client.HTTPConnection(u.hostname, u.port or 80, timeout=60)
+            conn.request("POST", u.path + ("?" + u.query if u.query else ""), body=payload,
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": f"Bearer {self.cfg['api_key']}"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                return ""
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            return (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception:
+            return ""
 
     def stats(self) -> bool:
         return False
@@ -2836,6 +2999,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._api_stream(qs.get("sid", [""])[0])
         if p == "/api/ai/stream":
             return self._api_ai_stream(qs.get("aid", [""])[0])
+        if p == "/api/ai/list":
+            return self._api_ai_list()
         if p == "/api/metric/learn/list":
             return self._api_metric_learn_list()
         if p == "/api/metric/one":
@@ -3198,8 +3363,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         aid = secrets.token_urlsafe(9)
         s = DirectSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
                           tools=b.get("tools") or "read+netdev")
+        s.name = (b.get("name") or "").strip()
+        s.device = (b.get("device") or "").strip()
         with AI_LOCK:
             AI_SESSIONS[aid] = s
+        _ai_audit(aid, {"type": "session_start", "name": s.name, "device": s.device,
+                        "model": s.model, "tools": s.tools_key, "cwd": s.cwd})
         tool_list = ([t["function"]["name"] for t in s._tool_schemas]
                      if s._tool_schemas else None)
         resp = {"aid": aid, "backend": "direct",
@@ -3267,6 +3436,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         models = _direct_models()
         return self._json({"ok": bool(models), "models": models})
 
+    def _api_ai_list(self):
+        """列出【仍然活着】的 AI 会话 —— 供前端刷新后恢复（2026-10-05）。
+
+        为什么需要：前端会话列表是纯内存，刷新即丢，而服务端会话还活着；
+        旧行为是刷新后再新建一个、顺手把旧会话关掉 ⇒ 一次 F5 一次失忆。
+        现在前端把 aid 记在 localStorage，启动时用本接口核对：
+        还在 → 直接恢复订阅（服务端会回放最近 120 个事件，界面重建）；
+        不在 → 新建。
+        """
+        with AI_LOCK:
+            items = [{"aid": s.aid, "name": s.name, "device": s.device,
+                      "model": s.model, "messages": len(s.messages),
+                      "created": s.created, "last_active": s.last_active}
+                     for s in AI_SESSIONS.values() if s.alive]
+        items.sort(key=lambda x: x["last_active"], reverse=True)
+        return self._json({"sessions": items})
+
     def _api_ai_send(self, b: dict):
         s = AI_SESSIONS.get(b.get("aid", ""))
         if not s:
@@ -3306,7 +3492,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "AI 会话不存在"}, 404)
         ok = s.compact(str(b.get("instructions") or ""))
         return self._json({"ok": ok,
-                           "msg": "已压缩：较早的消息折成一条摘要，保留最近的工作上下文"
+                           "msg": "已压缩：较早的消息折成摘要（原文有流水可回查），保留最近 4 条"
                                   if ok else "消息还不够多，暂时不需要压缩"})
 
     def _api_ai_stats(self, b: dict):
@@ -3333,6 +3519,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with AI_LOCK:
             s = AI_SESSIONS.pop(b.get("aid", ""), None)
         if s:
+            _ai_audit(s.aid, {"type": "session_end", "reason": "close",
+                              "turns_msgs": len(s.messages)})
             s.close()
         return self._json({"ok": True})
 
