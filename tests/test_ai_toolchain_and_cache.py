@@ -695,8 +695,11 @@ def test_ai_stop_button_dotmatrix():
     js = html[html.index("function aiBusy(on)"):html.index("function termBusy(")]
     check("aiBusy 会切停止按钮的 .busy",
           "getElementById('aiStop')" in js and "classList.toggle('busy'" in js)
-    check("aiBusy 仍保留 AI 标题图标的原逻辑（没被改坏）",
-          "ico.net" in js and "_aiT" in js)
+    # 2026-10-06：网状图标删除，忙态改为「AI 助手」标题光晕（winAi.classList 'busy'）
+    check("aiBusy 忙态落在 winAi 标题光晕上（网状图标已废）",
+          "getElementById('winAi')" in js and "classList.add('busy'" in js and "_aiT" in js)
+    check("★ 旧 AI 标题网状图标逻辑没有残留",
+          "ico.net" not in js)
 
     # ⑤ 旧设计不许复活
     check("★ 旧的 .dots.stop 点阵写法没有残留",
