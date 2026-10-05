@@ -57,6 +57,47 @@ class State:
 SHARED = State()   # 全设备共享状态：save 后 flash 配置在其他会话也生效（贴近真机）
 
 
+# ── 接口明细（2026-10-05 补）────────────────────────────────────────────
+#   原来只有 `display interface brief`，任何接口【明细】查询都会落到末尾的
+#   "Unrecognized command"。实测 AI 想查 `display interface GigabitEthernet0/0/0`
+#   （判断为什么 down）时撞墙，只能如实回"该模拟器不认此命令"——
+#   逼真度缺口。这里补一份贴近真机 VRP 的明细回显。
+_IF_TABLE = {
+    "gigabitethernet0/0/0": ("GigabitEthernet0/0/0", "UP", "UP", ""),
+    "ge0/0/0": ("GigabitEthernet0/0/0", "UP", "UP", ""),
+    "gigabitethernet0/0/1": ("GigabitEthernet0/0/1", "DOWN", "DOWN", ""),
+    "ge0/0/1": ("GigabitEthernet0/0/1", "DOWN", "DOWN", ""),
+    "vlanif1": ("Vlanif1", "UP", "UP", "Internet Address is 192.168.1.1/24"),
+}
+
+
+def _mock_if_detail(cmd: str) -> str:
+    """`display interface <名>` 的明细回显（贴近真机 VRP 格式）。"""
+    parts = cmd.split()
+    arg = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+    key = arg.lower()
+    hit = _IF_TABLE.get(key)
+    if hit is None and key.replace(" ", "") == "vlanif1":
+        hit = _IF_TABLE["vlanif1"]           # `display interface vlanif 1`
+    if hit is None:
+        return f"\nError: The interface {arg or '(none)'} does not exist.\n"
+    name, phy, proto, addr = hit
+    lines = [f"\n{name} current state : {phy}",
+             f"Line protocol current state : {proto}",
+             "Description :",
+             "Switch Port, PVID :    1, TPID : 8100(Hex), The Maximum Frame Length is 9216"]
+    if addr:
+        lines.append(addr)
+    lines += [
+        "IP Sending Frames' Format is PKTFMT_ETHNT_2, Hardware address is 00e0-fc12-3456",
+        "    Last 300 seconds input rate 0 bits/sec, 0 packets/sec",
+        "    Last 300 seconds output rate 0 bits/sec, 0 packets/sec",
+        "    Input: 0 packets, 0 bytes",
+        "    Output: 0 packets, 0 bytes",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 class Handler(paramiko.ServerInterface):
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if username == USER else paramiko.AUTH_FAILED
@@ -98,9 +139,34 @@ def handle(st: State, cmd: str) -> str:
         return "\nSlot  Type    Online    Power    Register    Alarm\n  0   AR111-S Present   Present  Registered  Normal\n"
     if low.startswith("display interface brief"):
         return "\nInterface     PHY   Protocol  InUti OutUti  inErrors outErrors\nGE0/0/0       up    up           0%     0%         0         0\nGE0/0/1       down  down         0%     0%         0         0\n"
+    if low.startswith("display interface "):
+        # ★ 2026-10-05 补：接口【明细】查询（display interface <名>）。
+        #   必须排在 brief 之后 —— 否则 brief 会被这条吃掉。
+        return _mock_if_detail(c)
+    if low.startswith("display port vlan"):
+        # ★ 2026-10-05 补：端口 VLAN 归属（AI 排查 vlan 时常用）
+        return ("\nPort                    Link Type    PVID  Trunk VLAN List\n"
+                "--------------------------------------------------------------"
+                "-----------------\n"
+                "GigabitEthernet0/0/0    access       1     -\n"
+                "GigabitEthernet0/0/1    access       1     -\n"
+                "GigabitEthernet0/0/2    access       1     -\n")
     if low.startswith("display ip interface brief"):
         return "\nInterface          IP Address        Physical   Protocol\nVlanif1            192.168.1.1/24    up         up\n"
     if low.startswith("display vlan"):
+        _parts = c.split()
+        if len(_parts) >= 3 and _parts[2].isdigit():
+            # ★ 2026-10-05 补：`display vlan 888` 原来会返回【全部】VLAN 列表，
+            #   真机是精确查询（不存在则明确报错）。实测 AI 据此把"888 不存在"
+            #   和 1/110 混在一起读，是噪音来源。
+            _vid = _parts[2]
+            _known = {"1": ("enable", "default", "-"),
+                      "110": ("enable", "default", "WaiWang")}
+            if _vid not in _known:
+                return "\nError: The specified VLAN does not exist.\n"
+            _st, _prop, _desc = _known[_vid]
+            return (f"\nVLAN ID: {_vid}\n  VLAN Type: {_prop}    Status: {_st}\n"
+                    f"  Description: {_desc}\n")
         return "\nVID   Status  Property  MAC-LRN  Statistics  Description\n1     enable  default   enable   enable      -\n110   enable  default   enable   enable      WaiWang\n"
     if low.startswith("display current-configuration"):
         if "|" in c:

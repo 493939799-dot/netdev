@@ -407,6 +407,42 @@ def _identity_card(dev, got):
     return 0
 
 
+# ── run 的逐条机器可读结果（2026-10-05 加）──────────────────────────────
+#   问题：原来 run 只把「整批 ok」交给上层 —— 一条命令失败（例如模拟器不认的
+#   display 子命令）就把整批标 ok=False。后果有二：
+#     ① MCP 的 t_run 按整批 ok 给每条命令打同一个 ok，并把 output 清空
+#        → AI 以为"整批失败"，成功命令的回显也一起丢了；
+#     ② 界面按整批 ok 打红叉，明明大部分命令成功。
+#   修法：CLI 加 --json，逐条回 ok / 回显 / 错误，并给出 n_ok / partial。
+_CMD_FAIL_MARKS = ("Unrecognized command", "Wrong parameter", "Incomplete command",
+                   "Ambiguous command", "Error: ", "Too many parameters")
+
+
+def _cmd_rejected(text: str) -> bool:
+    """同屏路径用：凭回显判断这条命令是否被设备拒绝（尽力而为）。
+
+    同屏路径拿到的是屏上文本，没有 engine 的 r.ok 可用，只能看回显里有没有
+    设备侧的报错标志。宁可漏判（标成功）也不要误判（把正常回显标失败）。
+    """
+    b = text or ""
+    return any(mk in b for mk in _CMD_FAIL_MARKS)
+
+
+def _first_error_line(text: str) -> str:
+    for l in (text or "").splitlines():
+        if any(mk in l for mk in _CMD_FAIL_MARKS):
+            return l.strip()[:200]
+    return "设备拒绝了该命令（回显见 output）"
+
+
+def _run_json(records):
+    """把逐条结果汇总成机器可读结构（供 netdev_mcp.t_run 解析）。"""
+    n = len(records)
+    n_ok = sum(1 for r in records if r.get("ok"))
+    return {"ok": n > 0 and n_ok == n, "partial": 0 < n_ok < n,
+            "n_ok": n_ok, "n_total": n, "commands": records}
+
+
 def cmd_run(a):
     dev = resolve_target(a.device)
 
@@ -422,6 +458,7 @@ def cmd_run(a):
     s = _open(dev)
     m = mirror.Mirror(dev["name"])
     ok_all = True
+    _jres = []                                   # ★ 逐条结果（--json 用）
     try:
         for cmd in a.commands:
             k = gates.classify(cmd)
@@ -435,10 +472,17 @@ def cmd_run(a):
                 if k == gates.BLOCKED:
                     m.send(cmd, "blocked"); m.recv("黑名单命令，拒绝执行", ok=False)
                 ok_all = False
+                _jres.append({"command": cmd, "ok": False, "output": "",
+                              "error": f"被闸门拒绝（{_risk_tag(k)}）"})
                 continue
             m.send(cmd, k)
             r = engine.run_smart(s, cmd)
             m.recv(r.text, r.ok)
+            _err = (r.error or "").strip()
+            if not r.ok and len(_err) < 12:
+                _err = _first_error_line(r.text or "")   # engine 只给 "Error:" → 补全
+            _jres.append({"command": cmd, "ok": bool(r.ok), "output": r.text or "",
+                          "error": None if r.ok else _err})
             print(f"{C['blu']}▷ {cmd}{C['reset']}")
             print(r.text if r.text else "(无回显)")
             if not r.ok:
@@ -448,7 +492,10 @@ def cmd_run(a):
             print()
     finally:
         s.close(); m.close()
-    print(f"{C['dim']}留档: {m.log_path}{C['reset']}")
+    if getattr(a, "json", False):
+        print(json.dumps(_run_json(_jres), ensure_ascii=False))
+    else:
+        print(f"{C['dim']}留档: {m.log_path}{C['reset']}")
     return 0 if ok_all else 1
 
 
@@ -1605,6 +1652,7 @@ def _run_via_pane(dev, win, a):
     """
     m = mirror.Mirror(dev["name"])
     ok_all = True
+    _jres = []                                   # ★ 逐条结果（--json 用）
     try:
         for cmd in a.commands:
             k = gates.classify(cmd)
@@ -1614,6 +1662,8 @@ def _run_via_pane(dev, win, a):
                 m.send(cmd, k)
                 m.recv("run 通道只允许只读命令", ok=False)
                 ok_all = False
+                _jres.append({"command": cmd, "ok": False, "output": "",
+                              "error": "run 通道只允许只读命令"})
                 continue
             m.send(cmd, k)
             try:
@@ -1621,15 +1671,28 @@ def _run_via_pane(dev, win, a):
             except SystemExit as e:
                 m.recv(str(e), ok=False)
                 print(f"{C['red']}✘ {e}{C['reset']}")
+                _jres.append({"command": cmd, "ok": False, "output": "", "error": str(e)})
+                if getattr(a, "json", False):
+                    print(json.dumps(_run_json(_jres), ensure_ascii=False))
                 return 1
             body = _trim_tail(_after_echo(text, cmd)) if text else ""
-            m.recv(body, ok=True)
+            # ★ 2026-10-05：原来这里硬编码 ok=True —— 同屏路径下设备报错也会被
+            #   标成成功。现在凭回显判一次（尽力而为），并把结果一并记进 _jres。
+            _ok = not _cmd_rejected(body)
+            m.recv(body, _ok)
+            _jres.append({"command": cmd, "ok": _ok, "output": body,
+                          "error": None if _ok else _first_error_line(body)})
+            if not _ok:
+                ok_all = False
             print(f"{C['blu']}▷ {cmd}{C['reset']}")
             print(body if body else "(无回显)")
             print()
     finally:
         m.close()
-    print(f"{C['dim']}留档: {m.log_path}{C['reset']}")
+    if getattr(a, "json", False):
+        print(json.dumps(_run_json(_jres), ensure_ascii=False))
+    else:
+        print(f"{C['dim']}留档: {m.log_path}{C['reset']}")
     return 0 if ok_all else 1
 
 
@@ -3826,6 +3889,7 @@ def main(argv=None):
 
     r = sub.add_parser("run", help="执行只读命令")
     r.add_argument("device"); r.add_argument("commands", nargs="+")
+    r.add_argument("--json", action="store_true", help="机器可读输出（逐条 ok/回显，给网页/AI 用）")
     r.set_defaults(fn=cmd_run)
 
     ap = sub.add_parser("apply", help="下发配置（备份→确认→逐条→save）")

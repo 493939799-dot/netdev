@@ -10,6 +10,37 @@
 
 ## [未发布]
 
+### run 的「一条命令失败 = 整批失败」语义修正 + mock 接口明细补齐
+
+**A. `netdev_run` 多命令时，一条失败就把整批标成失败（已修）**
+`netdev run` 一直只把「整批 ok」交给上层：`cmd_run` 里 `ok_all` 只要有一条命令
+`not r.ok` 就置 False，`netdev_mcp.t_run` 再把这个整批 ok **复制给每一条命令**，
+并把成功命令的 `output` 一并清空。后果：AI 看到 `ok:false` 就以为"整批失败"、
+连成功命令的回显也拿不到；界面按整批 ok 打红叉，明明大部分命令成功。
+实测触发：`netdev_run` 里带一条模拟器不认的命令（如 `display interface GigabitEthernet0/0/0`）
+→ 整批红叉。现改为**逐条**回结果：
+- CLI 加 `--json`，输出 `{ok, partial, n_ok, n_total, commands:[{command, ok, output, error}]}`；
+- `t_run` 解析后逐条标 ok，并新增 `partial`（部分成功）；
+- 界面把 `partial` 显示成**琥珀色「部分成功」**，不再一律红叉；
+- 同屏路径原先硬编码 `m.recv(body, ok=True)`（设备报错也标成功），
+  现凭回显判定（`Unrecognized command` / `Error:` 等）。
+
+**B. mock 缺接口明细命令（已补）**
+`tests/mock_vrp.py` 原来只有 `display interface brief`，任何接口**明细**查询
+（`display interface GigabitEthernet0/0/0`、`display interface vlanif 1`）
+都落到末尾的 `Unrecognized command` —— 实测 AI 想查「GE0/0/1 为什么 down」时撞墙，
+只能如实回"该模拟器不认此命令"。本次补：`display interface <名>` 明细、
+`display port vlan`、`display vlan <id>` 精确查询（不存在则明确报
+`Error: The specified VLAN does not exist.`，不再回全表）。
+
+**D. 闲聊时可能伪造设备回显（已加约束）**
+讲故事/举例时，AI 可能生成 `%LINK-3-UPDOWN:` 这类日志行、`display interface brief`
+的完整表格 —— 即使标了"虚构"，格式也与真实日志无法一眼区分，工程师事后可能误当记录。
+提示词新增第 8 条：闲聊/举例不得生成看起来像真实设备回显的内容；需要举例时用文字描述
+或明确标注"这是我编的示例"；并【绝不】把示例数据伪装成设备读到的结果。
+
+**守门测试**：新增 `tests/test_run_partial_and_mock_detail.py`（26 项），已接入 CI。
+
 ### mock 时钟不再是死字符串 + 提示词「前提澄清」校准
 
 **B. mock 的 `display clock` 是硬编码死字符串（已修）**

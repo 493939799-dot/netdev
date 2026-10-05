@@ -118,15 +118,69 @@ def t_list(_):
             "note": "写操作请用 netdev_apply 且 confirmed=true；黑名单命令会被拒绝"}
 
 
+def _parse_run_json(out: str):
+    """从 CLI `run --json` 的输出里取出逐条结果。
+
+    返回 {"results": [...], "raw": <人类可读文本>}；拿不到 JSON 时返回 None
+    （调用方回退到"整批 ok"的旧判定，绝不让工具因解析失败而崩）。
+    """
+    txt = (out or "").rstrip()
+    if not txt:
+        return None
+    line = ""
+    for l in reversed(txt.splitlines()):
+        s = l.strip()
+        if s.startswith("{") and s.endswith("}"):
+            line = s
+            break
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return None
+    cmds = obj.get("commands")
+    if not isinstance(cmds, list) or not cmds:
+        return None
+    res = []
+    for it in cmds:
+        if not isinstance(it, dict):
+            return None
+        res.append({
+            "command": str(it.get("command") or ""),
+            "ok": bool(it.get("ok")),
+            "output": str(it.get("output") or "")[-8000:],
+            "error": (str(it["error"])[:800] if it.get("error") else None),
+        })
+    return {"results": res, "raw": txt[: -len(line)].rstrip()}
+
+
 def t_run(args):
-    # ★ 改调 CLI：CLI 会优先走同屏会话（用户看得见每条命令）
-    rc, out, err = _netdev_cli(["run", args["device"], *args["commands"]], timeout=200)
-    ok = rc == 0
-    results = [{"command": c, "ok": ok, "output": out.strip()[-8000:] if ok else "",
-                "error": None if ok else (err.strip() or out.strip())[-800:]}
-               for c in args["commands"]]
+    # ★ 改调 CLI：CLI 会优先走同屏会话（用户看得见每条命令）。
+    #   2026-10-05：加 --json —— 让 CLI 回【逐条】结果。原来只拿 exit code，
+    #   一条命令失败（例如模拟器不认的 display 子命令）就把整批标 ok=False，
+    #   连成功命令的回显都被清空 → AI 以为全挂、界面打红叉。
+    rc, out, err = _netdev_cli(["run", args["device"], *args["commands"], "--json"],
+                               timeout=200)
+    parsed = _parse_run_json(out)
+    if parsed is None:
+        # 旧版 CLI / 输出异常 → 退回整批判定（保守，不让工具崩）
+        ok = rc == 0
+        results = [{"command": c, "ok": ok,
+                    "output": out.strip()[-8000:] if ok else "",
+                    "error": None if ok else (err.strip() or out.strip())[-800:]}
+                   for c in args["commands"]]
+        raw = out.strip()[-8000:]
+        n_ok = len(results) if ok else 0
+    else:
+        results = parsed["results"]
+        raw = parsed["raw"][-8000:]
+        n_ok = sum(1 for r in results if r["ok"])
+    n = len(results)
+    ok = n > 0 and n_ok == n
     return {"device": args["device"], "via": "CLI（优先同屏）", "ok": ok,
-            "results": results, "raw": out.strip()[-8000:]}
+            "partial": 0 < n_ok < n, "n_ok": n_ok, "n_total": n,
+            "results": results, "raw": raw}
     # 以下为旧实现（保留备查，不再执行）
     dev = engine.get_device(args["device"])
     s, src = _open(dev)

@@ -554,6 +554,15 @@ DEBUG_SYSTEM_PROMPT = """你是【网络设备调试助手】，正在协助一�
 6. 发现异常（配置不符预期、报错、接口 down…）先报告给工程师，
    不要自己尝试修复。
 7. 回答用中文，简洁、直接、给结论。涉及配置变更时用列表列清楚。
+8. ★【闲聊 / 举例时不要伪造设备回显】讲故事、打比方、或解释"这种情况通常会看到
+   什么"时，**不要生成看起来像真实设备回显的内容** —— 例如 `%LINK-3-UPDOWN:` 这类
+   日志行、`display interface brief` 的完整表格、带时间戳的设备日志块。这类内容
+   即使标了"虚构"，格式上也和真实日志无法一眼区分，工程师事后可能误当成真机记录。
+   · 需要举例时：用【文字描述】（"接口会翻动、日志里出现链路状态变化"），或明确
+     写一句"以下是我编的示例格式，不是本机回显"，并让示例与真实回显在排版上明显分开；
+   · 【绝不】把示例数据伪装成本次会话里从设备读到的结果。
+9. 【失败也要说清】工具返回若带 partial=true（部分命令成功、部分失败），要如实
+   说明哪几条成功、哪几条失败，不要笼统说"执行失败"，也不要只报成功的那部分。
 
 信息出处：工具返回里带 _identity（device / tool / at），
 那是"这份数据来自哪台设备、什么时候取的"—— 引用数据时以此为准，
@@ -1033,9 +1042,14 @@ class DirectSession:
             payload = fn(args or {})
             payload = netdev_mcp.envelope(name, args or {}, payload)
             payload = self._summarize_tool_result(name, payload)
-            _bad = bool(payload.get("ok") is False)
+            # ★ 2026-10-05：区分「整批失败」与「部分成功」。
+            #   原来 _bad = (ok is False) —— netdev_run 多命令里只要一条失败
+            #   （如模拟器不认的 display 子命令），整批 ok 就是 False，
+            #   界面照样打红叉、AI 以为全挂。带 partial 的结果不判 error。
+            _partial = bool(payload.get("partial"))
+            _bad = bool(payload.get("ok") is False and not _partial)
             self._emit({"type": "tool_execution_end", "toolName": name,
-                        "isError": _bad,
+                        "isError": _bad, "partial": _partial,
                         "error": self._failure_reason(payload) if _bad else None})
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as e:
