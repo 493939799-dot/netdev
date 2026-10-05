@@ -1140,7 +1140,19 @@ class DirectSession:
             return
 
         # 系统人设：设备调试助手（见文件头 DEBUG_SYSTEM_PROMPT）
-        msgs = [{"role": "system", "content": DEBUG_SYSTEM_PROMPT}] + self.messages
+        # ★ 2026-10-05：把「本会话锁定的设备」写进【系统提示词】。
+        #   此前设备名只由**前端**拼在用户消息文本里 —— 于是任何非前端入口
+        #   （API 直调、将来的别的 UI/CLI）发的消息，AI 都不知道锁定了哪台，
+        #   会退回"自己猜一台"：实测就是这么跑偏到 huawei 真机上的
+        #   （会话锁的是 mock-hw，用户只问"设备现在几点"）。
+        #   放在系统提示词里，从任何入口进来都生效，也与 §设备绑定 条款呼应。
+        _sys = DEBUG_SYSTEM_PROMPT
+        if self.device:
+            _sys += (f"\n\n【本次会话已锁定的调试设备】{self.device}\n"
+                     f"（这是界面替你锁定的目标；**除非用户在本轮明确要求换设备，"
+                     f"所有 netdev 操作一律只用它** —— 无论用户消息里有没有再提这个"
+                     f"设备名。不要因为设备清单里还有别的设备就去查它们。）")
+        msgs = [{"role": "system", "content": _sys}] + self.messages
 
         _stored = False      # ★ 本轮回复是否已写回 self.messages（异常/中止路径见 finally）
         try:
