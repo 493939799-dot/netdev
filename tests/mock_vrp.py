@@ -82,7 +82,16 @@ def handle(st: State, cmd: str) -> str:
     if low == "display version":
         return VERSION_TEXT
     if low == "display clock":
-        return "\n2026-09-16 14:04:14\nWednesday\nTime Zone(BJ) : UTC+08:00\n"
+        # ★ 2026-10-05：原来是**硬编码的死字符串**，永远回 "2026-09-16 14:04:14"。
+        #   实测后果（AI 端）：连续两次读数分秒一模一样，它据此判断
+        #   「时钟看起来不走（可能是 mock 的静态回显，也可能是真卡住了，
+        #     我无法从回显区分）」—— 白白消耗它的注意力，还让"设备时间"这个
+        #   常见排障点在这个模拟器上永远无法演示。改成本机时间实时生成。
+        _now = time.localtime()
+        _wd = ("Monday", "Tuesday", "Wednesday", "Thursday",
+               "Friday", "Saturday", "Sunday")[_now.tm_wday]
+        return (f"\n{time.strftime('%Y-%m-%d %H:%M:%S', _now)}\n{_wd}\n"
+                f"Time Zone(BJ) : UTC+08:00\n")
     if low == "display esn":
         return "\nESN of slot 0:\n    21500102842SH8602524\n"
     if low.startswith("display device"):
