@@ -164,7 +164,7 @@ hardware won't get contributions.
 
 ```bash
 ./netdev selftest                                          # end-to-end, against the simulator
-./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 135 checks
+./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 136 checks
 ./.venv/bin/python tests/test_approval_gates.py            # 19 checks (security-critical)
 ./.venv/bin/python tests/test_ui_lifecycle.py              # 27 checks
 ./.venv/bin/python tests/test_mock_cmd.py                  # 21 checks
