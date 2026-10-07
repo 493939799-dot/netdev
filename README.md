@@ -345,6 +345,9 @@ py -3.12 -m venv .venv
 └── live/               # 镜像流日志
 ```
 
+> 每个文件属于哪个平台（Mac / Windows / 共享）、平台差异怎么隔离、新增平台文件有什么规矩，
+> 见 **[docs/平台差异.md](docs/平台差异.md)** —— 一张表看懂全仓的平台归属。
+
 ## 关键配置
 
 - `config/devices.toml`：设备清单（**只写 `password_env` 变量名，不写密码**）

@@ -249,6 +249,11 @@ to `0.0.0.0`. See [SECURITY.md](SECURITY.md) for the full trust boundary.
 pieces are the serial bridge, the shared-screen layer (tmux on macOS / a built-in
 daemon on Windows), and the launchers.
 
+One repo, one shared core, a thin per-platform layer — no platform branches, no
+split directories. For the full file-by-file platform map (which file is
+macOS-only, Windows-only, or shared), see
+[docs/平台差异.md](docs/平台差异.md) (Chinese).
+
 ## License
 
 [MIT](LICENSE)

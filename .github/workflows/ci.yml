@@ -64,6 +64,22 @@ jobs:
       - name: 从模板生成设备清单（全新克隆里没有，自检要用自带的模拟器）
         run: cp config/devices.toml.example config/devices.toml
 
+      - name: 确认关键脚本仍有可执行位（防 Windows 提交抹掉权限位）
+        run: |
+          # Windows 文件系统不记录 POSIX 权限位，从 Windows 提交会把 100755 抹成 100644，
+          # 导致 macOS 上 ./netdev 报 permission denied、.command 双击打不开。
+          # 2026-10-07 真踩过一次（提交 818dff6 抹掉 22 个文件 → CI 变红，32e832c 修复）。
+          # 修复方式：git update-index --chmod=+x <文件>，再提交。
+          fail=0
+          for f in netdev netdev-mcp \
+                   bin/serial bin/tel \
+                   bin/一键体检.command bin/设备工具台.command bin/推送更新.command bin/开源.command \
+                   ui/启动.command ui/start.sh \
+                   dist/build_bundle.sh dist/installer/install.sh dist/installer/uninstall.sh; do
+            if [ -x "$f" ]; then echo "  ✔ $f"; else echo "  ✘ $f 丢了可执行位（应为 100755）"; fail=1; fi
+          done
+          exit $fail
+
       - name: 回归 · AI 工具链一致性 + 采集缓存 + 宿主 shim 剥离 + MCP 握手（57 项）
         run: ./.venv/bin/python tests/test_ai_toolchain_and_cache.py
 
