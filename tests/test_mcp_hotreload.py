@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""netdev MCP 源码热重载端到端测试（子进程 JSON-RPC 驱动；不连任何设备）。
+r"""netdev MCP 源码热重载端到端测试（子进程 JSON-RPC 驱动；不连任何设备）。
 
 覆盖四项：
   (a) 基线：initialize → tools/list 拿到 N 个工具；tools/call netdev_list 成功（isError=false）
@@ -12,7 +12,8 @@
       且仍收到 notifications/tools/list_changed（工具定义变化就该通知）
 
 测试全程只有一个 MCP 子进程（不重启），finally 里字节级还原源码、删临时文件并断言清理成功。
-运行：./.venv/bin/python tests/test_mcp_hotreload.py      （在项目根目录下执行）
+运行：.venv\Scripts\python.exe tests\test_mcp_hotreload.py   （Windows，项目根目录下）
+      ./.venv/bin/python tests/test_mcp_hotreload.py         （macOS）
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "netdev_mcp.py"
 LIB = ROOT / "lib"
-PY = ROOT / ".venv" / "bin" / "python"
+PY = ROOT / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
 PROBE = "netdev_hotreload_probe"
 PROBE_LIB = LIB / "_broken_probe.py"      # (c) 语法错误用
 PROBE_LIB2 = LIB / "_probe_lib.py"        # (b) lib 模块热重载用（即本次报的核心缺陷那一类）
@@ -71,11 +72,14 @@ class McpServer:
     """一个 MCP 子进程 + 行级 JSON-RPC 驱动（通知与响应分开收集）。"""
 
     def __init__(self):
-        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}  # 不往 lib/__pycache__ 落临时 pyc
+        # PYTHONUTF8=1：MCP 的工具描述与返回内容含中文，必须让子进程按 UTF-8
+        # 写、本测试按 UTF-8 读（下面 encoding= 与它成对），否则在中文 Windows
+        # （默认 cp936）上 JSON-RPC 报文会解码失败。
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"}
         self.proc = subprocess.Popen(
             [str(PY), str(SRC)], cwd=str(ROOT), env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1)
+            text=True, bufsize=1, encoding="utf-8", errors="replace")
         self._id = 0
         self._out = queue.Queue()
         self._lock = threading.Lock()
@@ -321,7 +325,17 @@ def main():
     print("== netdev MCP 源码热重载测试 ==")
     print(f"源码: {SRC}")
     print(f"解释器: {PY}")
-    assert PY.exists(), f"缺少 venv python: {PY}"
+    if not PY.exists():
+        print(f"\n✘ 找不到项目虚拟环境的 Python 解释器：{PY}")
+        print("  请先在项目根目录创建 venv 并安装依赖：")
+        if os.name == "nt":
+            print("    python -m venv .venv")
+            print("    .venv\\Scripts\\python.exe -m pip install -r requirements-win.txt")
+        else:
+            print("    python -m venv .venv")
+            print("    .venv/bin/python -m pip install -r requirements.txt")
+        print("\n  注意：Windows 开发请用 requirements-win.txt（含 pywinpty / keyring）")
+        return 1
 
     md5_before = md5(SRC)
     original_bytes = SRC.read_bytes()

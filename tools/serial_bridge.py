@@ -11,12 +11,19 @@
 """
 import os
 import pathlib
+import queue
 import re
-import select
 import sys
-import termios
+import threading
 import time
-import tty
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lib import host  # noqa: E402
+
+if not host.IS_WIN:
+    import select
+    import termios
+    import tty
 
 import serial
 import signal
@@ -63,7 +70,12 @@ ser = serial.Serial(port, baud, timeout=0, bytesize=8, parity="N",
                     stopbits=1, rtscts=False, xonxoff=False)
 fd = sys.stdin.fileno()
 old_attr = None
-if os.isatty(fd):
+if host.IS_WIN:
+    # Windows：被 pane-daemon 以管道拉起，无需（也没有）termios/raw 设置
+    if not os.isatty(fd):
+        sys.stderr.write("[serial_bridge] 提示：stdin 管道模式（pane-daemon 宿主）\n")
+        sys.stderr.flush()
+elif os.isatty(fd):
     old_attr = termios.tcgetattr(fd)
     tty.setraw(fd)
 else:
@@ -296,6 +308,16 @@ def _serial_readable(wait: float = 2.5) -> bool:
         ser.write(b"\r\n")
         t0 = time.time()
         while time.time() - t0 < wait:
+            if host.IS_WIN:
+                try:
+                    if ser.in_waiting:
+                        d = ser.read(4096)
+                        if d:
+                            return True
+                except Exception:
+                    return False
+                time.sleep(min(0.03, wait / 10))
+                continue
             try:
                 r, _, _ = select.select([ser.fileno()], [], [], 0.25)
             except Exception:
@@ -381,6 +403,13 @@ def _self_check_and_fix():
             t0, buf = time.time(), b""
             while time.time() - t0 < secs:
                 try:
+                    if host.IS_WIN:
+                        if ser.in_waiting:
+                            d = ser.read(4096)
+                            if d:
+                                buf += d
+                        time.sleep(min(0.03, secs / 10))
+                        continue
                     r, _, _ = select.select([ser.fileno()], [], [], 0.2)
                     if r:
                         d = ser.read(4096)
@@ -411,18 +440,177 @@ def _self_check_and_fix():
     except Exception:
         pass
     _tried = " / ".join(str(x) for x in [baud] + _cands)
+    _occ = ("关掉别的串口程序（串口助手 / PuTTY / SecureCRT 等），"
+            "或在设备管理器里把该 COM 口「禁用→启用」一次"
+            if host.IS_WIN else f"lsof {port}")
     out(("\r\n[串口自检] ✗ 已试过 %s 各档，设备都没有回应。\r\n"
          "   请依次确认：\r\n"
          "     ① 波特率：设备侧 console 速率（华为常见 9600 或 115200）\r\n"
          "     ② 串口线 / USB 转接头：换根线或换个 USB 口\r\n"
          "     ③ 设备是否已开机、console 口是否接对\r\n"
-         "     ④ 串口是否被别的程序占用：lsof %s\r\n"
-         "   注：本自检只发了一个回车，未改动设备任何配置。\r\n" % (_tried, port)).encode())
+         "     ④ 串口是否被别的程序占用：%s\r\n"
+         "   注：本自检只发了一个回车，未改动设备任何配置。\r\n" % (_tried, _occ)).encode())
 
 out(f"\r\n[串口已连接] {port} @ {baud}\r\n"
     f"[人机同屏会话；退出 Ctrl+]  IP高亮+输入着色={'开' if _paint_on else '关'}   退格适配={mode_note}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
 
 _self_check_and_fix()   # 接入自检：确认设备真的有回应
+
+
+# ════════════════════════════════════════════════════════════════════
+# Windows 主循环：stdin 泵线程喂 queue（替代 select on fd），
+# 串口用 in_waiting 轮询（替代 select on ser.fileno）；节拍仍是 0.2s。
+# POSIX 主循环在下面，一行不改。
+# ════════════════════════════════════════════════════════════════════
+if host.IS_WIN:
+    # 输入来自守护喂送通道（本环境 stdin 管道写入被拦截）
+    from lib import pane as _pane_mod
+    _feed_port = int(os.environ.get("NETDEV_FEED_PORT", "0"))
+    if not _feed_port:
+        raise SystemExit("[serial_bridge] 缺少 NETDEV_FEED_PORT")
+    q_in, _feed_sock = _pane_mod.feed_client(_feed_port)
+
+    def _handle_input(data: bytes):
+        """处理一批 stdin 字节。返回 False 表示要退出循环。"""
+        if not data:
+            return False
+        if b"\x1d" in data:                    # Ctrl+]
+            return False
+        send = fix_keys(data)
+        if _tf is not None:                    # 丢掉终端模拟器的自动应答
+            send = _tf.strip(send)
+        ser.write(send)
+        if _paint_on and _echo:
+            _echo.expect(send)                 # 登记期待回显 → 输入着色
+        _pending_since[0] = time.time()        # 发了东西 → 开始等回音
+        if log:
+            log.write(_input_for_log(data, "[输入] ").encode())
+            if send != data:
+                log.write("[键位适配] 0x7f -> 0x08\n".encode())
+        return True
+
+    def _handle_serial():
+        """读并分发一批串口数据。"""
+        try:
+            data = ser.read(8192)
+        except Exception as e:                  # 拔线 / 别的程序同时打开
+            _read_fails[0] += 1
+            n = _read_fails[0]
+            if n == 1:
+                out(f"\r\n[serial_bridge] 读串口失败：{type(e).__name__}: {e}\r\n".encode())
+                out("  可能原因：① USB 转串口被拔出/松动 ② 有别的程序也在读同一个口\r\n".encode())
+                out("  ↳ 正在尝试自动恢复（原地重开串口 → 退避重试）…\r\n".encode())
+            if reopen_serial():
+                _read_fails[0] = 0
+                out("  ✓ 串口已恢复，继续工作\r\n".encode())
+                return
+            if n >= MAX_RETRY:
+                out(f"\r\n[serial_bridge] 已重试 {n} 次仍打不开串口，放弃。\r\n".encode())
+                _exit_now[0] = True
+                return
+            _wait = min(0.4 * n, 3.0)
+            out(f"  · 第 {n}/{MAX_RETRY} 次重试未成功，{_wait:.1f}s 后再试…\r\n".encode())
+            time.sleep(_wait)
+            return
+        else:
+            if _read_fails[0]:
+                _read_fails[0] = 0
+        if data:
+            _last_data[0] = time.time()
+            _pending_since[0] = 0.0             # 有回音 → 待决解除
+            maybe_autologin(data)
+            emit_screen(_echo.feed(data) if _paint_on and _echo else data)
+            if log:
+                try:
+                    log.write(data)             # 日志保留原始字节
+                except (ValueError, OSError):
+                    pass
+
+    def _win_main() -> int:
+        # ★ 2026-10-07 修（网页终端「输入很卡」）：原节拍是 0.2s —— 主循环每 200ms 才看
+        #   一次串口，设备回显（你敲的字符、回车后的提示符）最多要等 0.2s 才被读走转发到
+        #   网页（平均 ~100ms）。POSIX 版用 select(timeout=0.2)，有数据立刻醒；Windows 版
+        #   换成 in_waiting 轮询 + 无条件 sleep(0.2)，等于给每个回显加了固定延迟。
+        #   这里把节拍降到 10ms（Python 3.11+ 在 Windows 用高精度定时器，10ms 是准的），
+        #   并把原来「每轮都做」的孤儿判定（OpenProcess）降到每秒一次，避免空转开销。
+        _TICK = 0.01
+        _last_heartbeat = 0.0
+        _last_orphan = 0.0
+        try:
+            while not _exit_now[0]:
+                _now = time.time()
+                # 锁心跳：每 8 秒续一次
+                if _now - _last_heartbeat > 8:
+                    _last_heartbeat = _now
+                    try:
+                        if _pl is not None:
+                            _pl.heartbeat(port, _HOLDER)
+                    except Exception:
+                        pass
+                # 孤儿判定：父守护没了 → 退出释放串口（每秒看一次即可）
+                if _now - _last_orphan > 1.0:
+                    _last_orphan = _now
+                    if not host.pid_alive(os.getppid()):
+                        out("\r\n[serial_bridge] 宿主守护已退出 → 自动退出（释放串口）\r\n".encode())
+                        break
+                # ── 看门狗：串口静默失效自愈 ──
+                if (_LOGGED_IN[0] and _pending_since[0] and _last_data[0] > 0
+                    and (_now - _pending_since[0]) > 20.0
+                    and (_now - _last_data[0]) > 20.0
+                    and (_now - _WD_RETRY[0]) > 30.0):
+                    _pending_since[0] = 0.0
+                    _WD_RETRY[0] = _now
+                    out("\r\n[serial_bridge] 看门狗：发出输入后长时间零回显 → 自动重开串口…\r\n".encode())
+                    if reopen_serial():
+                        out("  ✓ 串口已自动恢复（看门狗）\r\n".encode())
+                        _read_fails[0] = 0
+                    else:
+                        out("  ✗ 重开未成功；请检查 USB 线 / 是否有别的程序占用串口\r\n".encode())
+                # stdin 队列（非阻塞排空）
+                while True:
+                    try:
+                        d = q_in.get_nowait()
+                    except queue.Empty:
+                        break
+                    if not _handle_input(d):
+                        _exit_now[0] = True
+                        break
+                if _exit_now[0]:
+                    out("\r\n[serial_bridge] 释放串口\r\n".encode())
+                    break
+                # 串口数据
+                try:
+                    if ser.in_waiting:
+                        _handle_serial()
+                    elif _paint_on and _echo and _echo.pending() and _now - _last_data[0] > 0.15:
+                        emit_screen(_echo.flush())
+                except Exception:
+                    pass
+                time.sleep(_TICK)
+        except Exception as e:
+            import traceback
+            out(f"\r\n[serial_bridge] 异常退出: {type(e).__name__}: {e}\r\n".encode())
+            out(traceback.format_exc().encode())
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            try:
+                if _pl is not None:
+                    _pl.release(port, _HOLDER)
+            except Exception:
+                pass
+            if log:
+                try:
+                    log.write("\n[会话结束]\n".encode())
+                    log.close()
+                except Exception:
+                    pass
+            out("\r\n[串口已断开]\r\n".encode())
+        return 0
+
+    raise SystemExit(_win_main())
 
 try:
     _last_orphan_check = 0.0
@@ -501,7 +689,9 @@ try:
                 if n == 1:
                     out(f"\r\n[serial_bridge] 读串口失败：{type(e).__name__}: {e}\r\n".encode())
                     out("  可能原因：① USB 转串口被拔出/松动 ② 有别的程序也在读同一个口\r\n".encode())
-                    out(f"  查占用：lsof {port}\r\n".encode())
+                    _occ2 = ("关掉别的串口程序（串口助手 / PuTTY 等），或在设备管理器里禁用→启用该 COM 口"
+                             if host.IS_WIN else f"lsof {port}")
+                    out(f"  查占用：{_occ2}\r\n".encode())
                     out("  ↳ 先别急：正在尝试自动恢复（原地重开串口 → 退避重试）…\r\n".encode())
                 # ① 原地重开（最常见：抢口的那方已退出，口可重新打开）
                 if reopen_serial():

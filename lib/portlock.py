@@ -24,7 +24,7 @@ import os
 import pathlib
 import time
 
-from . import paths as _paths
+from . import host, paths as _paths
 ROOT = _paths.ROOT
 STATE = ROOT / "state"
 LOCKFILE = STATE / "portlocks.json"
@@ -58,18 +58,8 @@ def _save(d: dict) -> None:
 
 
 def _alive(pid: int) -> bool:
-    """进程是否还活着（本机）。"""
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True          # 存在但属于别人
-    except Exception:
-        return False
+    """进程是否还活着（本机）。跨平台统一走 lib.host.pid_alive。"""
+    return host.pid_alive(pid)
 
 
 def status(port: str) -> dict | None:

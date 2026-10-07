@@ -1,0 +1,15 @@
+# 仓库内一律 LF；文本文件自动识别
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF 才能正常执行
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制：不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
+*.zip binary
+*.svg text eol=lf

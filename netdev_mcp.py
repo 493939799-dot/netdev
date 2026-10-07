@@ -18,14 +18,28 @@ import time
 import traceback
 
 ROOT = pathlib.Path(__file__).resolve().parent
-CLI = str(ROOT / "netdev")
 LIB_DIR = ROOT / "lib"
 sys.path.insert(0, str(ROOT))
 
-from lib import approval, creds, engine, gates, mirror  # noqa: E402
+from lib import approval, creds, engine, gates, host, mirror, pane  # noqa: E402
+
+# ★ 2026-10-06：抑制子进程弹出控制台窗口。
+#   AI 工具调用（netdev_run/apply/…）在本进程内转调 netdev CLI；UI 服务是
+#   DETACHED 拉起的（没有控制台），于是 Windows 会给这个 python 子进程
+#   **新建一个控制台窗口** —— 界面上一执行命令就弹黑框（用户实测）。
+#   统一加 CREATE_NO_WINDOW；POSIX 下为 0（等于默认，无影响）。
+_NO_WINDOW = 0x08000000 if host.IS_WIN else 0
+
+
+def cli_argv() -> list:
+    """netdev CLI argv 前缀（Windows 无 shell 入口脚本）。"""
+    if host.IS_WIN:
+        return [str(ROOT / ".venv" / "Scripts" / "python.exe"), str(ROOT / "netdev_cli.py")]
+    return [str(ROOT / "netdev")]
 
 PROTOCOL = "2024-11-05"
-SERVER = {"name": "netdev", "version": "1.0.6"}
+# 版本号与 dist/installer/VERSION 保持一致（发布构建以那份为单一真源）。
+SERVER = {"name": "netdev", "version": "1.0.18"}
 
 # MCP 服务器“自我介绍”：客户端握手时会把它交给 AI，让 AI 知道本服务器是干什么的、
 # 什么时候该用、有什么硬规矩。（pi 侧由 pi-mcp-adapter 读取并在 AI 查 netdev 时展示）
@@ -99,7 +113,9 @@ def _pw(dev):
 def _open(dev):
     pw, src = _pw(dev)
     if dev.get("protocol") != "serial" and not pw and not dev.get("allow_no_credential"):
-        raise RuntimeError(f"拿不到 {dev['name']} 的密码：先执行 "
+        raise RuntimeError(f"拿不到 {dev['name']} 的密码：先执行 `netdev login {dev['name']}` 录入"
+                           if host.IS_WIN else
+                           f"拿不到 {dev['name']} 的密码：先执行 "
                            f"`security add-generic-password -a \"$USER\" -s "
                            f"{dev.get('password_keychain','netdev-'+dev['name'])} -w -U`")
     log = str(ROOT / "logs" / f"{dev['name']}_mcp_session.txt")
@@ -346,6 +362,10 @@ def _target(name):
 
 
 def _require(name):
+    if host.IS_WIN:
+        if not pane.bridge_alive(name):
+            raise RuntimeError(f"没有同屏会话。先执行：netdev shell {name}")
+        return
     if _tmux("has-session", "-t", "netops").returncode != 0:
         raise RuntimeError(f"没有同屏会话。先执行：netdev shell {name}")
     wins = _tmux("list-windows", "-t", "netops", "-F", "#{window_name}").stdout.split()
@@ -354,6 +374,13 @@ def _require(name):
 
 
 def t_screen_list(_):
+    if host.IS_WIN:
+        screens = pane.list_screens()
+        return {"sessions": [f"{s.get('name')}  {s.get('cols','?')}x{s.get('rows','?')}"
+                             + ("  (已死)" if s.get("dead") else "")
+                             for s in screens],
+                "attach_hint": "人在终端执行 netdev shell <设备名> 即可看到并接管同一块屏",
+                "exit_hint": "退出同屏：Ctrl+]（串口桥）/ Ctrl+C（临时连接）"}
     r = _tmux("list-panes", "-a", "-F",
               "#{session_name}:#{window_name}  #{pane_width}x#{pane_height}  #{pane_current_command}")
     return {"sessions": [ln for ln in r.stdout.strip().splitlines() if ln],
@@ -376,25 +403,37 @@ def t_screen_send(args):
     if risk == gates.WRITE:
         if not approval.ask(name, [args.get("text") or ""], kind="screen-send", timeout=120):
             return {"ok": False, "error": "人审未通过（拒绝 / 超时）—— 未发送任何字节"}
-    _tmux("send-keys", "-t", _target(name), "-l", args["text"])
-    if args.get("enter", True):
-        _tmux("send-keys", "-t", _target(name), "Enter")
-    time.sleep(float(args.get("wait", 1.5)))
-    pane = _tmux("capture-pane", "-p", "-J", "-t", _target(name), "-S",
-                 f"-{int(args.get('lines', 40))}").stdout
+    n_lines = int(args.get("lines", 40))
+    if host.IS_WIN:
+        pane.send_literal(name, args["text"])
+        if args.get("enter", True):
+            pane.send_key(name, "Enter")
+        time.sleep(float(args.get("wait", 1.5)))
+        screen_txt = "\n".join(pane.tail(name, n_lines))
+    else:
+        _tmux("send-keys", "-t", _target(name), "-l", args["text"])
+        if args.get("enter", True):
+            _tmux("send-keys", "-t", _target(name), "Enter")
+        time.sleep(float(args.get("wait", 1.5)))
+        screen_txt = _tmux("capture-pane", "-p", "-J", "-t", _target(name), "-S",
+                           f"-{n_lines}").stdout
     m = mirror.Mirror(name)
     m.send(f"[同屏] {args['text']}", gates.classify(args["text"]))
-    m.recv("\n".join([l for l in pane.splitlines() if l.strip()][-12:]), True)
+    m.recv("\n".join([l for l in screen_txt.splitlines() if l.strip()][-12:]), True)
     m.close()
-    return {"device": name, "sent": args["text"], "screen": pane, "log": str(m.log_path)}
+    return {"device": name, "sent": args["text"], "screen": screen_txt, "log": str(m.log_path)}
 
 
 def t_screen_read(args):
     name = args["device"]
     _require(name)
-    pane = _tmux("capture-pane", "-p", "-J", "-t", _target(name), "-S",
-                 f"-{int(args.get('lines', 40))}").stdout
-    return {"device": name, "screen": pane}
+    n_lines = int(args.get("lines", 40))
+    if host.IS_WIN:
+        screen_txt = "\n".join(pane.tail(name, n_lines))
+    else:
+        screen_txt = _tmux("capture-pane", "-p", "-J", "-t", _target(name), "-S",
+                           f"-{n_lines}").stdout
+    return {"device": name, "screen": screen_txt}
 
 
 def t_watch_tail(args):
@@ -451,18 +490,23 @@ def envelope(tool_name: str, args: dict, payload):
 def _netdev_cli(argv: list, timeout: int = 180, env_extra: dict | None = None):
     """调 netdev CLI，返回 (rc, stdout, stderr)。"""
     env = dict(os.environ)
-    _hb = pathlib.Path.home() / "homebrew" / "bin"
-    _extra = [str(p) for p in (_hb, pathlib.Path("/opt/homebrew/bin"), pathlib.Path("/usr/local/bin")) if p.exists()]
-    _base = env.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-    env["PATH"] = ":".join(_extra + ([_base] if _base else []))
+    if host.IS_WIN:
+        # Windows：PATH 分隔符是分号，且没有 Homebrew，保留系统 PATH 不动。
+        pass
+    else:
+        _hb = pathlib.Path.home() / "homebrew" / "bin"
+        _extra = [str(p) for p in (_hb, pathlib.Path("/opt/homebrew/bin"), pathlib.Path("/usr/local/bin")) if p.exists()]
+        _base = env.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        env["PATH"] = ":".join(_extra + ([_base] if _base else []))
     # 审批通道：转发给子进程（不然它找不到网页弹窗地址）
     if os.environ.get("NETDEV_APPROVAL_URL"):
         env["NETDEV_APPROVAL_URL"] = os.environ["NETDEV_APPROVAL_URL"]
     if env_extra:
         env.update(env_extra)
     try:
-        r = subprocess.run([CLI, *argv], capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=str(ROOT))
+        r = subprocess.run([*cli_argv(), *argv], capture_output=True, text=True,
+                           timeout=timeout, env=env, cwd=str(ROOT),
+                           creationflags=_NO_WINDOW)
         return r.returncode, r.stdout or "", r.stderr or ""
     except subprocess.TimeoutExpired:
         return 124, "", f"超时（{timeout}s）"

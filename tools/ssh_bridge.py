@@ -16,19 +16,24 @@
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import pathlib
-import pty
+import queue
 import re
-import select
 import signal
 import sys
-import termios
+import threading
 import time
-import tty
 
-sys.path.insert(0, os.path.expanduser("~/netops"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lib import host  # noqa: E402
+
+if not host.IS_WIN:
+    import fcntl
+    import pty
+    import select
+    import termios
+    import tty
 
 # ── 参数：<logfile> -- <ssh ...>
 argv = sys.argv[1:]
@@ -65,7 +70,6 @@ DEVICE_NAME = os.environ.get("NETDEV_DEVICE", "")
 
 # ── IP 高亮 + 输入回显著色（与其它桥共用 lib/colorize；人=蓝/AI=紫/系统=灰）
 # ★ 路径按【桥脚本所在仓】推导，不写死 ~/netops（同 serial_bridge 注释）
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from lib import colorize as _cz
     _echo = _cz.EchoPainter(device=DEVICE_NAME)
@@ -240,6 +244,197 @@ def emit(b: bytes):
     out(_echo.feed(b) if _paint_on and _echo else b)
 
 
+# ════════════════════════════════════════════════════════════════════
+# Windows 分支：pywinpty 承载 ssh（替代 pty.fork），stdin 泵线程喂
+# queue（替代 select），0.2s 节拍；所有着色/脱敏/自动登录逻辑共用。
+# POSIX 分支在下面，一行不改。
+# ════════════════════════════════════════════════════════════════════
+if host.IS_WIN:
+    import json as _json
+
+    def _win_rows_cols() -> tuple[int, int]:
+        """从 pane 注册表读尺寸（守护写），失败则 40x140。"""
+        try:
+            if DEVICE_NAME:
+                rp = pathlib.Path(__file__).resolve().parent.parent / "state" / "panes" / f"{DEVICE_NAME}.json"
+                reg = _json.loads(rp.read_text(encoding="utf-8"))
+                sz = str(reg.get("size", ""))
+                if "x" in sz:
+                    c_, r_ = sz.split("x", 1)
+                    return int(r_), int(c_)
+        except Exception:
+            pass
+        return 40, 140
+
+    rows_, cols_ = _win_rows_cols()
+    try:
+        from winpty import PtyProcess
+        ptyproc = PtyProcess.spawn(child_argv, dimensions=(rows_, cols_))
+    except Exception as e:
+        sys.stderr.write(f"[ssh_bridge] pty 启动失败: {type(e).__name__}: {e}\n")
+        raise SystemExit(1)
+
+    # 输入来自守护的喂送通道（本环境 stdin 管道写入被拦截）
+    from lib import pane as _pane_mod
+    _feed_port = int(os.environ.get("NETDEV_FEED_PORT", "0"))
+    if not _feed_port:
+        raise SystemExit("[ssh_bridge] 缺少 NETDEV_FEED_PORT")
+    q_in, _feed_sock = _pane_mod.feed_client(_feed_port)
+
+    # pywinpty 的 read() 是阻塞的 → 专用泵线程，读到的字节塞进 q_out；
+    # b"" 哨兵 = pty 已结束。
+    q_out: queue.Queue = queue.Queue()
+
+    def _pty_pump():
+        while True:
+            try:
+                s = ptyproc.read(8192)
+            except EOFError:
+                q_out.put(b"")
+                return
+            except Exception:
+                q_out.put(b"")
+                return
+            if s:
+                q_out.put(s.encode("utf-8", "replace"))
+
+    threading.Thread(target=_pty_pump, daemon=True).start()
+
+    def _pty_write(b: bytes) -> bool:
+        try:
+            ptyproc.write(b.decode("utf-8", "replace"))
+            return True
+        except Exception:
+            return False
+
+    _hdr = (f"\r\n[ssh 已接入] {' '.join(child_argv)}\r\n"
+            f"[人机同屏会话；退出 Ctrl+]   退格适配={mode_note}   "
+            f"IP高亮+输入着色={'开' if _paint_on else '关'}   "
+            f"自动登录={'开（'+PW_SRC+'）' if DEV_PW else '关（未找到凭据，请手工输密码）'}   "
+            f"日志: {logfile or '未开启'}]\r\n\r\n")
+    out(_hdr.encode())
+    log_raw(f"\n===== {time.strftime('%F %T')} ssh {' '.join(child_argv)}\n".encode())
+
+    _pending_since = [0.0]
+    _wd_last = [0.0]
+    injected = 0
+    tail = b""
+    _dead = False
+
+    def _win_finish():
+        try:
+            ptyproc.terminate()
+        except Exception:
+            pass
+        try:
+            ptyproc.close()
+        except Exception:
+            pass
+        if log:
+            try:
+                log.write(f"\n[session end {time.time()-START:.0f}s]\n".encode())
+                log.close()
+            except Exception:
+                pass
+        out("[ssh 桥已退出]\r\n".encode())
+
+    # ★ 2026-10-07 修（网页终端「输入很卡」，与 serial_bridge 同款全局优化）：
+    #   原节拍 0.2s —— 主循环每 200ms 才排空一次输入/输出队列，键击下发与回显
+    #   最多各等 0.2s（平均 ~100ms）。POSIX 版用 select(timeout=0.2)，有数据立刻醒；
+    #   Windows 版换成队列轮询 + 无条件 sleep(0.2)，等于给每次交互加固定延迟。
+    #   降到 10ms 后与串口通道一致（串口实测 median 150ms → 8.7ms）。
+    _TICK = 0.01
+    try:
+        while not _dead:
+            _now = time.time()
+            # 看门狗（只提醒，不主动断开——与 POSIX 同）
+            if _now - _wd_last[0] > 2.0:
+                _wd_last[0] = _now
+                if _LOGGED_IN[0] and _pending_since[0] and (_now - _pending_since[0]) > 90.0:
+                    _pending_since[0] = 0.0
+                    if not _WD_WARNED[0]:
+                        _WD_WARNED[0] = True
+                        out("\r\n[ssh_bridge] ⚠ 已 90 秒没有设备回显 —— 可能连接僵死，"
+                            "建议重连（netdev shell <设备> --restart 或界面上的「重连」）\r\n".encode())
+            # stdin 队列
+            while True:
+                try:
+                    d = q_in.get_nowait()
+                except queue.Empty:
+                    break
+                if not d:
+                    _dead = True
+                    break
+                if b"\x1d" in d:                     # Ctrl+]
+                    _dead = True
+                    break
+                d = drop_term_reply(d)
+                if not d:
+                    _pending_since[0] = time.time()
+                    log_raw(b"[drop] terminal reply fragment\n")
+                    continue
+                try:
+                    sd = fix_keys(d)
+                    if _tf is not None:
+                        _n = _tf.dropped_count(sd)
+                        sd = _tf.strip(sd)
+                        if _n:
+                            log_raw(("[丢弃终端应答 %d 字节]\n" % _n).encode())
+                    _pty_write(sd)
+                    if _paint_on and _echo:
+                        _echo.expect(sd)
+                except OSError as e:
+                    out(f"\r\n[ssh] 发送失败: {e}\r\n".encode())
+                    _dead = True
+                    break
+                _pending_since[0] = time.time()
+                log_raw(_input_for_log(d, "[input] ").encode())
+            # pty 输出：排空队列
+            got = False
+            while True:
+                try:
+                    chunk = q_out.get_nowait()
+                except queue.Empty:
+                    break
+                got = True
+                if not chunk:
+                    out("\r\n[ssh] 远端已断开\r\n".encode())
+                    _dead = True
+                    break
+                _pending_since[0] = 0.0
+                emit(chunk)
+                tail = (tail + chunk)[-256:]
+            if not got:
+                # 残片着色与自动登录互不依赖（着色关掉时自动登录也必须生效）
+                if _paint_on and _echo and _echo.pending():
+                    emit(_echo.flush())
+                if injected < 3 and YN_PROMPT.search(tail):
+                    _pty_write(b"yes\r")
+                    injected += 1
+                    tail = b""
+                    msg = "\r\n[主机密钥首见：已自动回 yes（以后不再问）]\r\n"
+                    out(msg.encode())
+                    log_raw(msg.encode())
+                elif DEV_PW and injected < 3 and PW_PROMPT.search(tail):
+                    time.sleep(0.15)
+                    _pty_write(DEV_PW.encode() + b"\r")
+                    injected += 1
+                    tail = b""
+                    msg = f"\r\n[已用{PW_SRC}凭据自动登录；要手工输密码就用 NETDEV_AUTOLOGIN=0]\r\n"
+                    out(msg.encode())
+                    log_raw(msg.encode())
+            if not ptyproc.isalive():
+                out("\r\n[ssh] 远端已断开\r\n".encode())
+                _dead = True
+            time.sleep(_TICK)
+    except Exception as e:
+        import traceback
+        out(f"\r\n[ssh] 异常: {type(e).__name__}: {e}\r\n".encode())
+        out(traceback.format_exc().encode())
+    finally:
+        _win_finish()
+    raise SystemExit(0)
+
 # ── 起 ssh 子进程（给它一个 pty，ssh 才认为是交互终端）
 pid, fd = pty.fork()
 if pid == 0:                                   # 子进程：执行 ssh
@@ -378,9 +573,11 @@ try:
                 break
             emit(data)
             tail = (tail + data)[-256:]
-        elif _paint_on and _echo and _echo.pending():
-            emit(_echo.flush())        # ★ 空闲兜底：扣住的 IP 残片/回显收色要吐出来
-                                         #  （ssh 桥原来没有这条 → 大输出块尾的 IP 永远不染）
+        else:
+            # ★ 空闲兜底：扣住的 IP 残片/回显收色要吐出来
+            #   （自动登录不许依赖着色开关——着色关掉时也必须能填密码）
+            if _paint_on and _echo and _echo.pending():
+                emit(_echo.flush())        # （大输出块尾的 IP 不染问题）
             # ── 自动登录：认出 ssh 的提示符就替你把密码填上（不打印密码）
             if injected < 3 and YN_PROMPT.search(tail):
                 os.write(fd, b"yes\r")

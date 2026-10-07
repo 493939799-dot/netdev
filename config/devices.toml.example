@@ -20,7 +20,7 @@
 #  ── 字段说明 ────────────────────────────────────────────────
 #    name          设备名（后续所有命令用它 referencing）
 #    protocol      ssh | telnet | serial
-#    host/port     ssh/telnet 必填；serial 填 /dev/cu.* 设备名
+#    host/port     ssh/telnet 必填；serial 填串口设备名（Windows: COM3；macOS: /dev/cu.usbserial-*）
 #    baud          串口速率；写 "auto" 会自动探测（推荐，见下）
 #    backspace     "auto"（自动适配）或 0/1 强制
 #    platform      留空 = 自动识别（发 display version 按 banner 判断）
@@ -50,14 +50,18 @@ tags         = ["模拟器", "非真机"]
 # 照上面的格式加。几条经验：
 #   · platform 留空即可，接入时会自动识别（华为/华三/锐捷/思科/迈普）
 #   · 串口 baud 写 "auto"：不同型号/固件速率不一样，写死容易一接就花屏
-#   · 拿不准先 `netdev serial-discover` 看有哪些 /dev/cu.*
+#   · 串口 port 也可以写 "auto"：只插了一条 USB-Console 线时自动认
+#     （多口适配器 / 主板自带调试口并存时，请显式写清用哪个口）
+#   · 拿不准先 `netdev serial-discover` 看有哪些串口
+#     （Windows = COM3 这样的 COM 口；macOS = /dev/cu.usbserial-*）
 #   · 型号带 SSH 的老设备可能只支持 SHA1 密钥交换，
 #     netmiko 侧已按平台自动降级，一般不用管
 #
 # [[device]]
 # name     = "switch-01"
 # protocol = "serial"
-# port     = "/dev/cu.usbserial-XXXX"    # ← 用 serial-discover 查，别照抄
+# port     = "COM3"                      # Windows：设备管理器里的 COM 口
+# # port   = "/dev/cu.usbserial-XXXX"    # macOS：用 serial-discover 查，别照抄
 # baud     = "auto"
 # username = "admin"
 # platform = ""                          # 留空 = 自动识别

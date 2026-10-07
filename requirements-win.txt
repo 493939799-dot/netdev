@@ -1,0 +1,23 @@
+# netdev 设备工具台 · Windows 依赖清单（源码树开发/自验用）
+#
+# 用法（Windows，在源码根目录）：
+#     python -m venv .venv
+#     .venv\Scripts\python.exe -m pip install -r requirements-win.txt
+#
+# 为什么需要单独一份：
+#   requirements.txt 是 macOS 原版那份（保持与上游逐行一致，便于回哺主仓），
+#   其中没有 pywinpty / keyring —— 这两个在 macOS 上既不存在也不需要。
+#   Windows 版必须补上：
+#     pywinpty  → pane-daemon 用 ConPTY 承载同屏会话（M2 核心）
+#     keyring   → 凭据入 Windows 凭据管理器（M1）
+#   只装 requirements.txt 的话，同屏会话与凭据后端都起不来。
+#
+# 与安装包的关系：
+#   dist/build_bundle.ps1 在打包时会把同样两行追加进安装包的
+#   payload\netops\requirements.txt，使安装包自包含。两处需保持一致。
+
+-r requirements.txt
+
+# ── Windows 专属 ──
+pywinpty
+keyring

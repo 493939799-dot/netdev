@@ -4,13 +4,13 @@
 
 [![CI](https://github.com/493939799-dot/netdev/actions/workflows/ci.yml/badge.svg)](https://github.com/493939799-dot/netdev/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Platform: macOS](https://img.shields.io/badge/platform-macos%20only-lightgrey.svg)
-![Python: 3.13](https://img.shields.io/badge/python-3.13-blue.svg)
+![Platform: macOS · Windows](https://img.shields.io/badge/platform-macos%20%C2%B7%20windows-lightgrey.svg)
+![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![Channel access: Serial / SSH / Telnet](https://img.shields.io/badge/接入-serial%20%C2%B7%20SSH%20%C2%B7%20Telnet-orange)
 
 > CI 徽章在第一次成功跑起来后才会变绿。
 
-一个面向 macOS 的网络设备调试终端 + AI 协作工具。它把串口 Console、SSH、Telnet 统一收敛到同一套命令行接口，并通过 tmux 实现「人机同屏」——你和 AI 看到的是同一块屏幕。
+一个跨 **macOS / Windows** 的网络设备调试终端 + AI 协作工具。它把串口 Console、SSH、Telnet 统一收敛到同一套命令行接口，并实现「人机同屏」——你和 AI 看到的是同一块屏幕。
 
 **核心原则**：所有设备操作（人工或 AI）都走同一条 CLI 路径；MCP 只负责参数翻译，绝不直接碰设备。护栏全部留在 CLI 里，AI 无法绕过。
 
@@ -21,30 +21,52 @@
 ## 界面
 
 **已接入设备** —— 点一下设备清单，同屏终端就开了；你在终端里敲的字，AI 读到的也是同一块屏。
-顶栏左边那组是**写策略三段滑动开关**：`REA`（只读） / `ASK`（确认，默认） / `ALL`（放行）——
-透明绿罩子滑到哪档就是哪个模式，点档位即刻对后端生效。
 
 ![已接入设备：设备清单 / 同屏终端 / AI 助手 / 状态 / 快照 / 审计护栏](docs/NETDEV-网络设备调试终端-已接入.png)
 
-**刚打开、还没接设备** —— 顶栏那一排是「写策略开关 / 后端 / 在线数 / AI 后端」，
+**刚打开、还没接设备** —— 顶栏那一排是「写策略 / 后端 / 在线数 / AI 后端」，
 出问题时先看它们，再看下面的审计栏。
 
 ![未接入设备：初始状态](docs/NETDEV-网络设备调试终端-未接入.png)
 
-> 两张截图都是仓库自带的**本机模拟器**（`mock-hw`，终端里是真实的华为 VRP 模拟回显），
-> 任何人都能一键复现（见下文「开箱即用」）。
-> 截图为内置**极简灰主题**（默认；另有黑客绿 / 极简白 / 水墨屏共 4 套）；
-> 已脱敏：终端状态栏里的本机局域网 IP 已抹除。
+> 「已接入」那张是一台**真实的华为 AR 路由器**（USB 串口接入，终端里是 `display version` /
+> NAT 会话等真实回显；状态面板判「异常」也是真事——这台实验路由器的出口确实不通）；
+> 「未接入」那张用的是仓库自带的**本机模拟器**（`mock-hw`），任何人都能一键复现。
+> 截图为内置 **minimal 浅色主题**（macOS 原生观感）；真机图已脱敏：
+> 串口序列号、本机局域网 IP 已打马赛克。
+
+---
+
+## Windows 版：像普通 exe 一样安装与使用
+
+Windows 版把「装完就能用」做成了图形向导：**解压 → 双击 `netdev-install.exe` → 选目录 → 开始安装**，
+装完在开始菜单与桌面留下带图标的快捷方式，双击即用，**全程不弹黑窗**。
+
+![Windows 安装向导：选安装目录、勾选开机自启 / 装完打开界面，安装日志实时滚动](docs/NETDEV-Windows-安装向导.png)
+
+**装完之后，日常入口是「netdev 工具台」** —— 一个无控制台的 WinForms 小窗口，
+每 3 秒自检一次服务（TCP + `/api/health` 双重确认，不只看 PID 文件），
+一眼看到服务在不在、地址、PID、版本、开机自启状态；六个按钮覆盖全部常见操作。
+
+![netdev 工具台：服务状态 + 打开网页界面 / 启动·重启服务 / 一键修复 / 刷新状态 / 查看日志 / 打开安装目录](docs/NETDEV-Windows-工具台.png)
+
+- **开机服务自己起来**：安装时写入用户级「启动」目录（非管理员账号也能用），
+  登录后隐藏启动、不弹控制台；工具台上直接显示自启是否生效。
+- **起不来就一键修复**：工具台的「一键修复」按钮（以及开始菜单里同名的独立快捷方式）
+  调用随包安装的 `一键体检.ps1 -Fix` —— 补齐配置、清掉占着端口的僵尸进程、重启服务、
+  补依赖、重建自启，跑完给结论。**启动器本身打不开时，这个快捷方式照样能用。**
+
+> 完整步骤见 [Windows 安装说明](dist/installer/README-Windows安装说明.txt)；
+> 安装包在 [Releases](https://github.com/493939799-dot/netdev/releases) 里下载。
+> 命令行用户不受影响：`netdev` / `netdev-mcp` 在 Windows 上同样可用（入口是 `netdev.cmd`）。
 
 ---
 
 ## 功能
 
 - **三通道接入**：串口 Console / SSH / Telnet
-- **人机同屏**：基于 tmux，人工与 AI 共享同一窗格
-- **TRAE 风格工作台**：深色玻璃质感界面；4 套主题即点即换（极简灰默认 / 黑客绿 / 极简白 / 水墨屏）
-- **四道写闸门**：黑名单分类 → 人工审批弹窗 → 强制备份 → 逐行下发并校验；
-  顶栏**写策略滑动开关**（REA 只读 / ASK 确认 / ALL 放行）一键切换，放宽需人批、5 小时自动回落
+- **人机同屏**：人工与 AI 共享同一窗格（macOS 用 tmux；Windows 用自带同屏守护 + 串口桥）
+- **四道写闸门**：黑名单分类 → 人工审批弹窗 → 强制备份 → 逐行下发并校验
 - **AI 助手走直连**：直连 OpenAI 兼容 API（DeepSeek / OpenAI / OpenRouter / 任意兼容网关），一把 Key 即用，零额外 CLI 依赖；也可整体关闭 AI
 - **AI 状态面板**：⟳ 快诊（13 项指标静默采集 + AI 结构化诊断：情况 → 建议）、
   🔍 深体检（AI 规划一组只读命令全跑一遍再诊断，约 1~3 分钟），设计详见 [docs/monitor-status-design.md](docs/monitor-status-design.md)
@@ -54,7 +76,14 @@
 
 ## 平台
 
-**macOS only**。当前依赖：tmux、osascript、security、launchctl、串口驱动（FTDI/CH340/CP210x）以及 macOS 特有的 `/dev/cu.*` 设备名。跨平台需要额外适配，不在当前范围内。
+**macOS 与 Windows 10/11 x64。**
+
+| 平台 | 依赖 | 同屏实现 |
+| --- | --- | --- |
+| macOS | tmux、osascript、security、launchctl、串口驱动（FTDI/CH340/CP210x）、`/dev/cu.*` | tmux |
+| Windows | Python 3.10~3.12（x64）、串口驱动（FTDI/CH340/CP210x）、`COMx` | 自带同屏守护（`tools/pane_daemon.py`）+ 串口桥，不依赖 tmux |
+
+Windows 的安装包自带图形向导与「netdev 工具台」，见上文 [Windows 版](#windows-版像普通-exe-一样安装与使用)。
 
 > 注：早期文档写的 `expect` 依赖是**误报**。全仓已核：串口/SSH/Telnet 桥均为纯 Python
 > （pyserial / paramiko），没有任何 `spawn` / `expect -c` 调用。
@@ -91,7 +120,7 @@
 点 🔍 深体检：AI 先规划一组**只读命令**（过写操作黑名单双重过滤，被拦的如实展示、绝不执行），
 静默逐条跑完，再基于真实回显出全面诊断 —— 适合「说不上哪里不对」的时候。
 
-![状态面板：AI 结构化诊断 —— 徽章 + 一句话总结 + 逐条「情况 → 建议」（本机模拟器实拍）](docs/NETDEV-状态面板-AI诊断.png)
+![状态面板：AI 结构化诊断 —— 徽章 + 一句话总结 + 逐条「情况 → 建议」，条目间横线分割（真实串口设备实拍）](docs/NETDEV-状态面板-AI诊断.png)
 
 完整设计：[docs/monitor-status-design.md](docs/monitor-status-design.md)。
 
@@ -165,6 +194,10 @@ AI 助手**只有一个后端：直连 OpenAI 兼容 API**。不依赖本机装�
 
 双击 `bin/设备工具台.command` 时也会**自动确保服务在跑**，菜单顶部实时显示服务状态。
 
+> **Windows 用户**：不用记这些命令 —— 打开「netdev 工具台」，服务状态一眼可见，
+> 「启动 / 重启服务」一个按钮搞定，起不来就点「一键修复」。
+> 命令行等价物是 `netdev.cmd ui` / `netdev.cmd ui restart`。
+
 **为什么以前老是「起不来」**——三个坑，现在都堵上了：
 
 | 坑 | 症状 | 现在的做法 |
@@ -178,9 +211,34 @@ AI 助手**只有一个后端：直连 OpenAI 兼容 API**。不依赖本机装�
 
 **服务日志**：`logs/ui-service.log`（启动横幅含 PID 与时间戳）；**PID 文件**：`logs/ui-service.pid`。
 
-## 两种安装方式
+## 安装方式
 
-### 方式一：下载安装包（推荐）
+### Windows：图形向导（推荐）
+
+从 [Releases](https://github.com/493939799-dot/netdev/releases) 下载 `netdev-windows-x64-installer.zip`，
+解压后**双击 `netdev-install.exe`**，在向导里选安装目录、勾选「开机自启 / 装完打开界面」，
+点「开始安装」即可（约 2~5 分钟）。目标机需预装 **Python 3.10~3.12（x64）**，
+安装时勾选 "Add python.exe to PATH"。
+
+装完：开始菜单 / 桌面「netdev 工具台」→ 打开网页界面 <http://127.0.0.1:8898>。
+卸载：`powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\netops\uninstall.ps1"`
+（默认保留 `config\` 与 `backups\`；加 `-Purge` 彻底删除）。
+
+<details>
+<summary>想自己从源码构建这个包？</summary>
+
+```powershell
+powershell -ExecutionPolicy Bypass -File dist/build_bundle.ps1 -Out .
+# 产物：netdev-windows-x64-installer.zip + netdev-windows-x64-installer.zip.sha256
+```
+
+`build_bundle.ps1` 会先调用 `dist/installer/build_exes.ps1`，用 Windows 自带的 .NET Framework
+编译器 `csc.exe` 把 `LauncherStub.cs` / `InstallerStub.cs` 编译成 `netdev-toolbox.exe` /
+`netdev-install.exe`（图标取自 `netdev.ico`），再连同 `install.ps1`、`一键体检.ps1` 一起打包。
+`.exe` 是编译产物，不进版本库。
+</details>
+
+### macOS：下载安装包（推荐）
 
 **[⬇ 下载 netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)**（约 33 MB）
 
@@ -219,7 +277,7 @@ uv pip install --target dist/deps --python 3.12 -r requirements.txt
 > 所以**生成依赖与构建必须用同一个 Python 小版本**，否则目标机加载 `_cffi_backend.so` 等会直接崩。
 </details>
 
-### 方式二：开发者就地运行
+### 开发者就地运行（macOS / Windows）
 
 > **前置**：需要 **Python 3.10+** 和 [uv](https://docs.astral.sh/uv/)。
 > macOS 自带的 `python3`（Xcode CLT，3.9）装不动 `requirements.txt` 里锁定版本的
@@ -248,21 +306,40 @@ uv pip install -r requirements.txt
 
 浏览器打开 http://127.0.0.1:8898。起不来时先跑 `./netdev ui status`，再看 [`网页服务：起不来怎么办`](#网页服务起不来怎么办)。
 
-> 装到非 `~/netops` 路径也可以：所有入口都按 `NETDEV_ROOT` 环境变量 / 脚本自身位置推导，
-> 不会硬编码家目录（`./netdev web repair` 生成的网页按钮同样按真实安装路径生成）。
+Windows 上等价（PowerShell；依赖清单换成 `requirements-win.txt`，命令行入口是 `netdev.cmd`）：
+
+```powershell
+cd C:\path\to\netops
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-win.txt
+.\.venv\Scripts\python.exe netdev_cli.py doctor
+.\.venv\Scripts\python.exe netdev_cli.py ui open
+```
+
+> 装到非 `~/netops`（macOS）/ `%USERPROFILE%\netops`（Windows）路径也可以：所有入口都按
+> `NETDEV_ROOT` 环境变量 / 脚本自身位置推导，不会硬编码家目录
+> （`netdev web repair` 生成的网页按钮同样按真实安装路径生成）。
 
 ## 目录结构
 
 ```
 .
-├── netdev              # 命令行入口
+├── netdev              # 命令行入口（macOS）
+├── netdev.cmd          # 命令行入口（Windows）
 ├── netdev_cli.py       # CLI 主程序
 ├── netdev_mcp.py       # MCP 桥（stdio / JSON-RPC）
 ├── ui/                 # 自带网页界面（8898）
 ├── lib/                # 核心库：gates、approval、creds、engine 等
-├── tools/              # 桥接脚本与工具
+├── tools/              # 桥接脚本与工具（含 Windows 同屏守护）
 ├── config/             # 配置真身（devices.toml、connections.json…）
-├── dist/               # 发行流水线：build_bundle.sh + install.sh + 离线依赖
+├── dist/               # 发行流水线
+│   ├── build_bundle.sh / install.sh       # macOS 打包 + 安装
+│   └── installer/                         # Windows 打包 + 安装
+│       ├── build_bundle.ps1 / install.ps1 # 打包脚本 / 安装脚本
+│       ├── LauncherStub.cs                # 工具台源码 → netdev-toolbox.exe
+│       ├── InstallerStub.cs               # 安装向导源码 → netdev-install.exe
+│       ├── netdev.ico                     # 应用图标（16~256 多尺寸）
+│       └── 一键体检.ps1                    # 体检 / 一键修复
 ├── backups/            # 快照与自动备份（用户数据，随安装保留）
 ├── logs/               # 运行留档
 └── live/               # 镜像流日志
@@ -296,7 +373,7 @@ uv pip install -r requirements.txt
 ```bash
 ./netdev selftest                                       # 端到端自检（打本机模拟器，不需要真设备）
 ./netdev doctor                                         # 环境 / 服务 / 串口 / 命令清单 / 日志
-python3 tests/test_ai_toolchain_and_cache.py           # 回归：AI 工具链一致性 + MCP 握手 + 采集缓存 + 平台识别（136 项）
+python3 tests/test_ai_toolchain_and_cache.py           # 回归：AI 工具链一致性 + MCP 握手 + 采集缓存 + 平台识别（135 项）
 python3 tests/test_approval_gates.py                   # 回归：写操作人审闸门（19 项，安全关键）
 python3 tests/test_mock_cmd.py                         # 回归：netdev mock 模拟器命令 + 行编辑语义（21 项）
 python3 tests/test_monitor.py                          # 回归：状态面板三层指标 / 探针解析 / 深体检闸门（90 项）
@@ -305,6 +382,9 @@ python3 tests/test_ui_lifecycle.py                     # 回归：网页服务�
 
 > 上面几项测试**全部离线**，不需要真设备、不需要网络、不需要凭据 ——
 > 仓库自带华为 VRP 模拟器（`tests/mock_vrp.py`）。CI 每次 push 都跑。
+>
+> Windows 上等价：`netdev.cmd selftest` / `netdev.cmd doctor`，
+> 测试用 `.\.venv\Scripts\python.exe tests\test_xxx.py`。
 
 `test_approval_gates.py` 守的是最要紧的一处：它是唯一决定"AI 能不能改设备"的地方。
 其中最关键的一条断言是 **「豁免开关打开时，真机仍然不免人审」** ——

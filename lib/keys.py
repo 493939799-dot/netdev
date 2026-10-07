@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import pathlib
 import re
-import select
 import time
 
-from . import paths as _paths   # 路径统一真源
+from . import host, paths as _paths   # 路径统一真源
+if not host.IS_WIN:
+    import select
 
 STATE = _paths.state_dir()
 STATE.mkdir(parents=True, exist_ok=True)
@@ -36,15 +37,18 @@ MODE_DESC = {
 
 
 # ───────────────────────────────────────────── 缓存
+# ★ 缓存里含中文（MODE_DESC/evidence），读写必须**显式 UTF-8**：
+#   用平台默认编码（中文 Windows 是 cp936）读写，一旦某次运行处在 UTF-8
+#   模式（入口脚本设了 PYTHONUTF8=1），就会写出/读入编码不一致的文件。
 def load_cache() -> dict:
     try:
-        return json.loads(CACHE.read_text())
+        return json.loads(CACHE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def save_cache(d: dict):
-    CACHE.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    CACHE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def cached_mode(device: str):
@@ -59,17 +63,36 @@ def remember(device: str, mode: str, evidence: str, port: str = ""):
 
 
 # ───────────────────────────────────────────── 探测
+def _read_once(ser, wait: float) -> bytes:
+    """等最多 wait 秒读一批；无数据返回 b""。
+
+    POSIX: select(fd, wait)；Windows: 轮询 in_waiting（串口 fd 不可 select）。
+    """
+    if host.IS_WIN:
+        end = time.time() + wait
+        while time.time() < end:
+            try:
+                if ser.in_waiting:
+                    return ser.read(8192) or b""
+            except Exception:
+                return b""
+            time.sleep(min(0.03, max(0.0, end - time.time())))
+        return b""
+    r, _, _ = select.select([ser.fileno()], [], [], wait)
+    if not r:
+        return b""
+    return ser.read(8192) or b""
+
+
 def _drain(ser, wait=0.35, echo=None) -> bytes:
     buf = b""
     end = time.time() + wait
     while time.time() < end:
-        r, _, _ = select.select([ser.fileno()], [], [], 0.1)
-        if r:
-            d = ser.read(8192)
-            if d:
-                buf += d
-                if echo:
-                    echo(d)
+        d = _read_once(ser, min(0.1, end - time.time()))
+        if d:
+            buf += d
+            if echo:
+                echo(d)
     return buf
 
 
@@ -78,15 +101,13 @@ def at_prompt(ser, timeout=6.0, echo=None) -> bool:
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
-        r, _, _ = select.select([ser.fileno()], [], [], 0.2)
-        if r:
-            d = ser.read(8192)
-            if d:
-                buf += d
-                if echo:
-                    echo(d)
-                if PROMPT.search(buf.rstrip()):
-                    return True
+        d = _read_once(ser, min(0.2, end - time.time()))
+        if d:
+            buf += d
+            if echo:
+                echo(d)
+            if PROMPT.search(buf.rstrip()):
+                return True
     return False
 
 

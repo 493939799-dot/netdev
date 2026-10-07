@@ -175,9 +175,9 @@ def test_host_shim_strip():
     #    样本用中性的家目录名，避免把作者本机路径写进开源仓库；
     #    关键是路径里**含 host 字样**但不含 shim 特征 —— 守的是"别拿关键词乱杀"
     runtime = "/home/u/.workbuddy/binaries/node/versions/22.22.2/bin"
-    env = {"PATH": f"{SHIM}/brokered-bin:{runtime}:/usr/bin:/bin"}
+    env = {"PATH": os.pathsep.join([f"{SHIM}/brokered-bin", runtime, "/usr/bin", "/bin"])}
     S._strip_host_shim(env)
-    got = (env.get("PATH") or "").split(":")
+    got = (env.get("PATH") or "").split(os.pathsep)
     check("PATH 里剥掉 shim 目录", f"{SHIM}/brokered-bin" not in got, str(got))
     check("PATH 里**保留** workbuddy 运行时目录（不能拿 workbuddy 当关键词乱杀）",
           runtime in got, str(got))
@@ -201,13 +201,18 @@ def test_host_shim_strip():
     old = dict(os.environ)
     try:
         os.environ["NODE_OPTIONS"] = f'--require="{SHIM}/node-language-shim.cjs"'
-        os.environ["PATH"] = f"{SHIM}/safe-bin:/usr/bin:/bin"
+        os.environ["PATH"] = os.pathsep.join([f"{SHIM}/safe-bin", "/usr/bin", "/bin"])
         e = S._env_with_node()
         check("_env_with_node 剥掉了 NODE_OPTIONS", "NODE_OPTIONS" not in e, str(e.get("NODE_OPTIONS")))
-        check("_env_with_node 剔掉了 safe-bin", f"{SHIM}/safe-bin" not in (e.get("PATH") or ""),
+        check("_env_with_node 剔掉了 safe-bin",
+              f"{SHIM}/safe-bin" not in (e.get("PATH") or "").split(os.pathsep),
               str(e.get("PATH")))
-        check("_env_with_node 补上了 ~/.npm-global/bin",
-              str(pathlib.Path.home() / ".npm-global/bin") in (e.get("PATH") or ""), str(e.get("PATH")))
+        if os.name == "nt":
+            # Win 分支保留系统 PATH（npm 全局目录 %APPDATA%\npm 由安装器保证）
+            check("_env_with_node 保留了系统 PATH", bool((e.get("PATH") or "").strip()), str(e.get("PATH")))
+        else:
+            check("_env_with_node 补上了 ~/.npm-global/bin",
+                  str(pathlib.Path.home() / ".npm-global/bin") in (e.get("PATH") or ""), str(e.get("PATH")))
     finally:
         os.environ.clear()
         os.environ.update(old)
@@ -222,7 +227,7 @@ def test_host_shim_strip():
     S._strip_host_shim(env)
     check("PYTHONPATH = 宿主 shim 目录（无尾斜杠）时整键删除", "PYTHONPATH" not in env, str(env))
 
-    env = {"PYTHONPATH": f"{SHIM}:/home/u/mylib"}
+    env = {"PYTHONPATH": os.pathsep.join([SHIM, "/home/u/mylib"])}
     S._strip_host_shim(env)
     check("PYTHONPATH 混用时只剔 shim 那一段（保留用户自己的）",
           env.get("PYTHONPATH") == "/home/u/mylib", str(env))
@@ -309,13 +314,19 @@ def test_bulk_delete_guard_translation():
     check("netdev CLI 不再裸调 _sh.rmtree", "_sh.rmtree" not in cli_src)
     check("HTTP 层显式兜住 SystemExit", "except (Exception, SystemExit)" in srv_src)
 
-    # ★ 根因修复：守护进程必须在 os.execv **之前**净化环境。
+    # ★ 根因修复：守护进程必须在拉起服务子进程**之前**净化环境。
     #   只净化"子进程的 env"是不够的 —— 钩子是在本进程启动阶段 import 进来的，撤不掉。
     dz = (ROOT / "ui" / "daemonize.py").read_text(encoding="utf-8")
     check("daemonize 引入了宿主钩子剥离", "strip_host_injection" in dz)
-    check("daemonize 在 os.execv 之前净化环境",
-          dz.index("strip_host_injection(os.environ)") < dz.index("os.execv("),
-          "顺序反了就等于没修")
+    if os.name == "nt":
+        # Win 无 os.execv：判据是 strip_host_injection(env) 在 Popen 之前。
+        check("daemonize 在 Popen 之前净化环境",
+              dz.index("strip_host_injection(env)") < dz.index("subprocess.Popen("),
+              "顺序反了就等于没修")
+    else:
+        check("daemonize 在 os.execv 之前净化环境",
+              dz.index("strip_host_injection(os.environ)") < dz.index("os.execv("),
+              "顺序反了就等于没修")
 
     # 界面：删除成功的提示不再倒 CLI 原始输出（\r 重绘 + ANSI 会拼成乱码）
     html = (ROOT / "ui" / "static" / "index.html").read_text(encoding="utf-8")
@@ -337,8 +348,10 @@ def _source_py_files() -> list[pathlib.Path]:
     拿不到 git（比如源码压缩包）时退回"排除已知产物目录"的走法。
     """
     try:
+        # git 按 UTF-8 输出路径；显式按 UTF-8 读，避免中文 Windows 的 cp936 默认编码
         r = subprocess.run(["git", "-c", "core.quotePath=false", "ls-files", "*.py"],
-                           cwd=str(ROOT), capture_output=True, text=True, timeout=20)
+                           cwd=str(ROOT), capture_output=True, text=True, timeout=20,
+                           encoding="utf-8", errors="replace")
         files = [ROOT / ln for ln in (r.stdout or "").splitlines()
                  if ln.strip() and (ROOT / ln).is_file()]
         if r.returncode == 0 and files:
@@ -379,7 +392,7 @@ def test_py_files_compile():
 # ======================================================================
 def _mcp_python() -> str:
     """优先用项目自带 venv 的解释器（与 netdev-mcp 包装脚本一致）。"""
-    venv = ROOT / ".venv" / "bin" / "python"
+    venv = ROOT / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
     return str(venv) if venv.exists() else sys.executable
 
 
@@ -590,7 +603,8 @@ def test_ai_toolchain():
                 _cli.ROOT = pathlib.Path(_td)
                 (_cli.ROOT / "logs").mkdir(parents=True)
                 _probe = _cli.ROOT / "_probe.txt"
-                _probe.write_text("v1\n", encoding="utf-8")
+                # ★ 必须写字节：Win 文本模式会把 \n 转成 \r\n，污染哈希对照
+                _probe.write_bytes(b"v1\n")
 
                 def _put_manifest(digest):
                     (_cli.ROOT / "logs" / f"ui-service-{_cli.UI_PORT}.code.json").write_text(
@@ -600,11 +614,11 @@ def test_ai_toolchain():
                 _put_manifest(_hl.sha256(b"v1\n").hexdigest())
                 check("陈旧自检：内容一致时闭嘴（不假报）",
                       _cli._ui_code_stale()[0] is False, str(_cli._ui_code_stale()))
-                _probe.write_text("v2\n", encoding="utf-8")          # 真改内容
+                _probe.write_bytes(b"v2\n")                          # 真改内容
                 _fired, _why = _cli._ui_code_stale()
                 check("陈旧自检：内容变了会开口，且给出补救命令",
                       _fired and "netdev ui restart" in _why, _why)
-                _probe.write_text("v1\n", encoding="utf-8")          # 只还原内容
+                _probe.write_bytes(b"v1\n")                          # 只还原内容
                 os.utime(_probe, None)                               # 再碰一下 mtime
                 check("陈旧自检：只碰 mtime 不报（这正是它被改成哈希版的原因）",
                       _cli._ui_code_stale()[0] is False, str(_cli._ui_code_stale()))
@@ -775,9 +789,21 @@ def test_active_state_is_green():
           "#3a3a3a" in rule(".st.off{"), rule(".st.off{"))
 
     # ★ 浅色主题必须自带 --st-on，否则掉回 :root 的荧光绿（白底上刺眼、无报错）
+    # 注：CSS 里可能有 `[data-theme="ink"],[data-theme="minimal"]{...}` 这类**多选择器合并块**，
+    # 它的 "{...}" 是空的，没有 --st-on；必须跳过它去找**单独**的属性块（带换行 + 主题变量）。
     for th in ("minimal", "ink"):
-        seg = html[html.index(f'[data-theme="{th}"]{{'):]
-        seg = seg[:seg.index("}")]
+        p = 0
+        seg = ""
+        while True:
+            i = html.index(f'[data-theme="{th}"]{{', p)
+            seg = html[i:]
+            end = seg.index("}")
+            candidate = seg[:end+1]
+            # 单独的属性块：含 \n 且不带 `,`（多选择器）才认
+            if "\n" in candidate and "," not in candidate.split("{",1)[0]:
+                seg = candidate
+                break
+            p = i + 1
         check(f"浅色主题 {th} 自带 --st-on（否则白底上是荧光绿）",
               "--st-on" in seg, seg[:120])
     # 注意：文件里有**两个** :root 块（基础变量一个、--st-* 语义色一个），

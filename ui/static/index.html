@@ -1340,7 +1340,19 @@ term.onData(d=>{
 term.onResize(({rows,cols})=>{ if(SID) api('/api/term/resize',{sid:SID,rows,cols}).catch(()=>{}); });
 addEventListener('resize',()=>{ try{fitAddon.fit();}catch(e){} });
 
-async function openTerm(dev){
+/* ★ 2026-10-07：开终端并发去重。
+   openTerm 里「先关旧 SID」是 await 之前的判断 —— 并发调用时全部通过，
+   于是同一台设备堆出 N 个 TermSession（实测同一秒 4 个、内存积到 7 个）。
+   每个会话都订阅同一个 pane，开的时候还各自敲 3 次回车"唤醒"设备 ——
+   屏上就是一整屏提示符，用户看着就是"卡住"。这里把并发调用串成一条链。 */
+let _OPENING = null;
+function openTerm(dev){
+  const prev = _OPENING || Promise.resolve();
+  const cur = prev.catch(()=>{}).then(()=>openTerm1(dev));
+  _OPENING = cur.catch(()=>{});
+  return cur;
+}
+async function openTerm1(dev){
   try{ fitAddon.fit(); }catch(e){}
   // 开终端前先让后端清一遍残留（面板 ✕ 关掉的那些会话不会自己消失）
   try{ await api('/api/term/cleanup',{device:dev},15000); }catch(e){}
@@ -1352,11 +1364,10 @@ async function openTerm(dev){
     r = await api('/api/term/open',{device:dev, rows:term.rows, cols:term.cols}, 90000);
   }catch(e){
     term.write(`\x1b[31m开终端抛错：${esc(String((e && e.message) || e))}\x1b[0m\r\n`);
-    audit('FAIL',dev,'openTerm 异常'); return;
+    audit('FAIL',dev,'openTerm 异常'); return false;
   }
-  if(!r){ term.write('\x1b[31m开终端失败：没有返回数据\x1b[0m\r\n'); audit('FAIL',dev,'无返回'); return; }
-  if(r.__err__){ term.write(`\x1b[31m开终端失败：${esc(r.__err__)}\x1b[0m\r\n`); audit('FAIL',dev,r.__err__); return; }
-  if(r.__err__||r.error){ term.write(`\x1b[31m开终端失败：${esc(r.__err__||r.error)}\x1b[0m\r\n`); audit('FAIL',dev,r.__err__||r.error); return; }
+  if(!r){ term.write('\x1b[31m开终端失败：没有返回数据\x1b[0m\r\n'); audit('FAIL',dev,'无返回'); return false; }
+  if(r.__err__||r.error){ term.write(`\x1b[31m开终端失败：${esc(r.__err__||r.error)}\x1b[0m\r\n`); audit('FAIL',dev,r.__err__||r.error); return false; }
   SID=r.sid; CURDEV=dev;
   $('termTitle').textContent = `netops:${r.window} · 人机同屏（真实 tmux 窗格）`;
   audit('OPEN',dev,`终端已开 sid=${r.sid} window=${r.window}`);
@@ -1365,6 +1376,10 @@ async function openTerm(dev){
   ES.addEventListener('out',  e=>{term.write(b64d(e.data)); termBusy();});
   ES.addEventListener('end',  e=>{ term.write('\r\n\x1b[33m[会话已结束]\x1b[0m\r\n'); audit('INFO',dev,'终端会话结束'); });
   ES.onerror = ()=>{ audit('WARN',dev,'终端流断开（可点「重连」）'); };
+  // ★ 2026-10-06：开/切到某设备的终端后，把 AI 会话也对齐到它 ——
+  //   否则 AI 还停在上一台设备的会话里，发命令仍落到旧设备（用户实测）。
+  try{ await aiAlignDevice(dev); }catch(e){}
+  return true;
 }
 
 /* 📐 诊断：把终端尺寸相关的数字直接打在终端里（不用开开发者工具） */
@@ -1588,6 +1603,8 @@ async function submitAdd(){
       + '<br><span class="m">'+esc(String(r.stdout||'').replace(/\n/g,' ').slice(0,220))+'</span>','ai');
     loadDevices();
       loadConns();
+    // ★ 2026-10-06：接入成功即把 AI 会话对齐到这台新设备（见 aiAlignDevice）
+    try{ await aiAlignDevice(key); }catch(e){}
   } else {
     const msg = errMsg(r);
     // 2026-09-27 产品逻辑修正：向导里填的若是「已存在同名连接」，
@@ -1597,18 +1614,20 @@ async function submitAdd(){
       const key = body.name || g('afName');
       say('系统','<span class="m">'+esc(key)+' 已在连接簿里，直接接入。</span>','ai');
       const done2 = busyOn($('addGo'), '接入中…');
-      let rr2;
-      try{ rr2 = await api('/api/term/open', {device:key, rows:40, cols:140}, 90000); }
+      // ★ 2026-10-07：改走 openTerm —— 原来这里直接调 /api/term/open，既不关旧 SID
+      //   也不更新 SID/EventSource：后端确实开了新会话，前端终端面板却还挂在旧会话上
+      //   （看着像"点了没反应/卡住"），旧会话也永不关闭 → 会话越积越多。
+      let ok2 = false;
+      try{ ok2 = await openTerm(key); }
       finally{ done2(); }
-      if(termOk(rr2)){
+      if(ok2){
         modalAdd.classList.remove('show');
         audit('WRITE','-','接入已存在的 '+key);
         say('系统','🔌 已接入 <b>'+esc(key)+'</b>（连接簿里已有，直接开终端）','ai');
         loadDevices(); loadConns();
       }else{
-        const m2 = errMsg(rr2);
-        audit('FAIL','-','接入 '+key+' 失败：'+m2.slice(0,70));
-        say('系统','<span class="bad">接入失败：</span>'+esc(m2),'ai');
+        audit('FAIL','-','接入 '+key+' 失败');
+        say('系统','<span class="bad">接入失败：</span>请看终端里的原因或审计栏。','ai');
       }
       return;
     }
@@ -1845,19 +1864,17 @@ async function manageBook(){
       const _t0 = Date.now();
       const done = async ()=>{ const _d=600-(Date.now()-_t0);
         if(_d>0) await new Promise(r=>setTimeout(r,_d)); _done0(); };
-      let rr;
-      try{ rr = await api('/api/term/open',{device:tgt, rows:40, cols:140}, 90000); }
+      // ★ 2026-10-07：改走 openTerm（同上）—— 原来直接调 /api/term/open，
+      //   会话只增不减，且终端面板不会切到这台设备（看着像"点了没反应"）。
+      let _ok2 = false;
+      try{ _ok2 = await openTerm(tgt); }
       finally{ done(); }
-      // 失败必须带原因 —— 只写「（失败）」等于把排查线索丢了
-      // （用户就遇到过：审计栏连续三条「接入 xxx（失败）」，完全不知道错在哪）
-      const _mk = termOk(rr) ? '' : String(rr.__err__||rr.error||rr.stderr||rr.stdout||'（无输出）').replace(/\s+/g,' ').slice(0,120);
-      const _ok2 = termOk(rr);
-      audit(_ok2?'WRITE':'FAIL','-', '接入 '+x.name + (_ok2?'':'（失败）：'+_mk));
-      say('系统', termOk(rr)
+      audit(_ok2?'WRITE':'FAIL','-', '接入 '+x.name + (_ok2?'':'（失败）'));
+      say('系统', _ok2
         ? '🔌 已接入 <b>'+esc(x.name)+'</b> —— 设备列表出现条目、通道已占用。'
-        : '<span class="bad">接入失败：</span>'+esc(_mk||'(无输出)'), 'ai');
+        : '<span class="bad">接入失败：</span>请看终端里的原因或审计栏。', 'ai');
       loadDevices(); loadConns();
-      if(termOk(rr)){ setTimeout(()=>loadDevices(), 900); }
+      if(_ok2){ setTimeout(()=>loadDevices(), 900); }
       await manageBook();          // 立刻重画列表 → 已接入的变成"● 已接入"
     };
     const cp=row.querySelector('.cred-pw');
@@ -2211,14 +2228,19 @@ async function aiSwitch(i){
   AIES = null; AIMSG = null;
   sessRender();
   aiSessSave();
+  // ★ 2026-10-06：切会话先清空面板 —— 服务端会把该会话最近的事件回放进来，
+  //   不清就会把上一个会话的对话和它混在一起（多会话并存后必然发生）。
+  aiOut.innerHTML='';
   // 重新订阅这个会话的流
   AIES = new EventSource(`/api/ai/stream?aid=${encodeURIComponent(AID)}`);
   AIES.addEventListener('ev', e=>{ try{ onAiEvent(JSON.parse(new TextDecoder().decode(b64d(e.data)))); }catch(err){} });
   AIES.addEventListener('end', ()=>{ if(AIES){try{AIES.close();}catch(e){} } AIES=null; });
   say('系统','<span class="m">已切到会话 <b>'+esc(AI_SESS[i].name)+'</b>（上下文独立）。</span>','ai');
 }
-async function aiNewSession(){
-  const dev = CURDEV || '';
+async function aiNewSession(devOpt){
+  // ★ 2026-10-06：允许显式指定设备（接入新设备时自动建它专属的会话）。
+  //   不传/传非字符串（如事件对象）时退回当前选中设备，保持既有调用点不变。
+  const dev = (typeof devOpt === 'string' ? devOpt : (CURDEV || ''));
   const name = sessNameFor(dev);
   const p = say('系统','<span class="m">正在新建会话 <b>'+esc(name)+'</b>（首次约需数秒）…</span>','ai');
   // backend 只有一个值（direct）；仍旧传下去是为了让服务端能回一条「旧值已下线」的提示
@@ -2238,12 +2260,31 @@ async function aiNewSession(){
     +` · 工具 <b>${esc(r.tools||'?')}</b> · ${r.ready?'<span class="k">就绪</span>':'<span class="w">初始化中</span>'}`
     +(r.notice?`<br><span class="w">${esc(r.notice)}</span>`:'');
   audit('INFO','-',`AI 会话新建 name=${name} aid=${AID}`);
+  // ★ 2026-10-06：先关掉上一条流 —— 多会话并存后，旧流不关会继续把上一个会话的
+  //   事件混进当前面板（原来靠服务端"开新会话先收旧的"掩盖了这个问题）。
+  try{ if(AIES) AIES.close(); }catch(e){}
+  AIES = null; AIMSG = null;
+  aiOut.innerHTML='';        // 新会话从空白开始（见 aiSwitch 处说明）
   AIES = new EventSource(`/api/ai/stream?aid=${encodeURIComponent(AID)}`);
   AIES.addEventListener('ev', e=>{ try{ onAiEvent(JSON.parse(new TextDecoder().decode(b64d(e.data)))); }catch(err){} });
   AIES.addEventListener('end', ()=>{ if(AIES){try{AIES.close();}catch(e){} } AIES=null; });
   sessRender();
   aiSessSave();
   return AID;
+}
+/* ★ 2026-10-06：把 AI 会话对齐到「刚接入/选中」的设备。
+   背景（用户实测）：接入新设备后 AI 仍停在旧设备的会话里，而会话在【创建时】
+   就焊死了设备 ⇒ 发命令仍落到旧设备上，用户感觉"AI 不听话、执行不了"。
+   规则：已有该设备的会话 → 切过去；没有 → 新建一个绑该设备的会话。
+   边界：一个会话都没有时不动 —— 避免"只是看一眼设备"就悄悄拉起 AI 后端（要 Key）。 */
+async function aiAlignDevice(dev){
+  if(!dev) return;
+  if(AI_CUR < 0 || !AI_SESS.length) return;              // 还没在用 AI：不主动开
+  const cur = AI_SESS[AI_CUR];
+  if(cur && (cur.device||'') === dev) return;            // 已经在该设备的会话里
+  const idx = AI_SESS.findIndex(s => (s.device||'') === dev);
+  if(idx >= 0){ await aiSwitch(idx); return; }           // 有现成的 → 切过去
+  await aiNewSession(dev);                               // 没有 → 建一个专属会话
 }
 async function aiCloseSession(){
   if(AI_CUR < 0) return say('系统','<span class="m">当前没有会话。</span>','ai');
@@ -2471,12 +2512,17 @@ async function aiSend(){
   let aid=await aiOpen(); if(!aid) return;
   let r=await api('/api/ai/send',{aid,message:_msg});
   if(!r || !r.ok){
-    // 会话失效 —— 最常见原因是 UI 后端被重启过（会话存在后端内存里）。
-    // 自愈：丢掉旧会话，自动重开一个，再把这条消息发出去。
+    // 会话失效 —— 最常见原因是 UI 后端被重启过（会话存在后端内存里），
+    // 也可能是空闲太久被回收。自愈：把这个失效条目【换掉】成一个新会话
+    // （设备沿用原会话绑定的那台），再把这条消息发出去。
+    // 注意：必须换掉条目 —— 否则 aiOpen() 会把同一个死 aid 原样还回来，重试仍失败。
+    const _dev0 = _sess ? (_sess.device||'') : '';
     if(AIES){ try{AIES.close();}catch(e){} AIES=null; }
     AID=null; AIMSG=null;
-    say('系统','<span class="w">会话已失效（后端重启过），正在自动重开…</span>','ai');
-    aid=await aiOpen();
+    if(AI_CUR>=0) AI_SESS.splice(AI_CUR,1);
+    AI_CUR = AI_SESS.length-1;
+    say('系统','<span class="w">会话已失效（后端重启过 / 空闲回收），正在自动重开…</span>','ai');
+    aid=await aiNewSession(_dev0);
     if(aid) r=await api('/api/ai/send',{aid,message:_msg});
   }
   if(!r || !r.ok){ say('系统','<span class="bad">发送失败</span>','ai'); aiBusy(false); }

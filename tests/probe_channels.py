@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -20,18 +21,25 @@ import time
 import urllib.request
 
 # ── 路径全部由脚本自身位置推导（2026-10-03 修）────────────────────────
-# 原来这里硬编码了本机的 tmux 与 netdev 绝对路径：
-# 换一台机器 / 换用户名，这个探针直接全灭，而且报错是「文件不存在」，
-# 看不出是路径写死。改成 ROOT + shutil.which 后任意安装位置都能跑。
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from lib import host  # noqa: E402
+
 # 串口目标设备名。**不要写死成某台真机的名字** —— 既泄露身份，别人也跑不了。
 # 默认用仓库自带的本机模拟器；跑自己的真机：export NETDEV_PROBE_SERIAL=<设备名>
 SERIAL_DEV = os.environ.get("NETDEV_PROBE_SERIAL", "mock-hw")
 
-NETDEV = str(ROOT / "netdev")
+# netdev 调用：Windows 走 venv python + netdev_cli.py（无 shell 脚本）；
+# POSIX 走仓里的 netdev 入口。
+if host.IS_WIN:
+    NETDEV = [str(ROOT / ".venv" / "Scripts" / "python.exe"), str(ROOT / "netdev_cli.py")]
+else:
+    NETDEV = [str(ROOT / "netdev")]
 TMUX = shutil.which("tmux") or "tmux"
-# netdev 入口脚本自己会补 PATH，这里给一个干净的最小环境
-_MIN_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+# 子进程环境：Windows 继承当前环境（含 NETDEV_MOCK_PASSWORD）；
+# POSIX 给干净的最小环境（入口脚本自己补 PATH）。
+_MIN_ENV = ({**os.environ, "PYTHONUTF8": "1"} if host.IS_WIN
+            else {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
 
 B = "http://127.0.0.1:8898"
 RESULTS: list[tuple[str, str, str, str]] = []      # (通道, 场景, 结果, 备注)
@@ -64,7 +72,15 @@ def run_devices():
 
 
 def _tmux(*a):
-    return subprocess.run([TMUX, *a], capture_output=True, text=True)
+    return subprocess.run([TMUX, *a], capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def kill_pane(win: str):
+    if host.IS_WIN:
+        from lib import pane as _pane
+        _pane.kill(win)
+    else:
+        _tmux("kill-window", "-t", f"netops:{win}")
 
 
 def wait_prompt(win: str, timeout: float = 25.0) -> str:
@@ -72,7 +88,11 @@ def wait_prompt(win: str, timeout: float = 25.0) -> str:
     t0 = time.time()
     box = ""
     while time.time() - t0 < timeout:
-        box = _tmux("capture-pane", "-p", "-J", "-t", f"netops:{win}").stdout
+        if host.IS_WIN:
+            from lib import pane as _pane
+            box = _pane.tail(win, 200)
+        else:
+            box = _tmux("capture-pane", "-p", "-J", "-t", f"netops:{win}").stdout
         tail = [l for l in box.splitlines() if l.strip()][-1:] or [""]
         if any(k in tail[0] for k in ("<Huawei>", "[Huawei]", "#", ">", "$")):
             return box
@@ -83,14 +103,14 @@ def wait_prompt(win: str, timeout: float = 25.0) -> str:
 
 def read_screen(dev: str, lines: int = 40) -> str:
     """用 netdev 官方通道读屏（比 tmux capture-pane 可靠：不受可见区限制）。"""
-    r = subprocess.run([NETDEV, "screen-read", dev, "--lines", str(lines)],
-                       capture_output=True, text=True, timeout=60, env=_MIN_ENV)
+    r = subprocess.run(NETDEV + ["screen-read", dev, "--lines", str(lines)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=_MIN_ENV)
     return r.stdout + r.stderr
 
 def send_via_netdev(dev: str, cmd: str) -> str:
     """用 netdev 官方通道发命令（等价于 AI 的 screen_send），比 tmux send-keys 可靠。"""
-    r = subprocess.run([NETDEV, "screen-send", dev, cmd, "--yes"],
-                       capture_output=True, text=True, timeout=60, env=_MIN_ENV)
+    r = subprocess.run(NETDEV + ["screen-send", dev, cmd, "--yes"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=_MIN_ENV)
     return r.stdout + r.stderr
 
 
@@ -98,7 +118,7 @@ def send_via_netdev(dev: str, cmd: str) -> str:
 def probe(chan: str, dev: str, kind: str):
     print(f"\n\033[36m━━━ {chan} · {dev} ━━━\033[0m")
     # 先清掉该设备的旧窗格（旧桥可能处于卡死状态，实测踩到过）
-    _tmux("kill-window", "-t", f"netops:{dev}")
+    kill_pane(dev)
     time.sleep(2)
 
     # T1 接入 / 开终端（人机同屏窗格）
@@ -191,9 +211,14 @@ def probe_serial_conflict():
         rec("串口", "S4 MCP t_serial 被拦", False, f"导入失败 {e}")
 
     # 桥是否还活着（拦截后不该受影响）
-    e2 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
-                        capture_output=True, text=True).stdout.strip()
-    rec("串口", "S5 拦截后桥安然无恙", e2 == "0", f"pane_dead={e2 or '?'}")
+    if host.IS_WIN:
+        from lib import pane as _pane
+        e2ok = _pane.bridge_alive(SERIAL_DEV)
+        rec("串口", "S5 拦截后桥安然无恙", e2ok, f"alive={e2ok}")
+    else:
+        e2 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
+        rec("串口", "S5 拦截后桥安然无恙", e2 == "0", f"pane_dead={e2 or '?'}")
 
     # 串口写操作必须走 apply（run 通道拒绝写）
     r = _req("/api/netdev/run", {"device": SERIAL_DEV, "command": "vlan 3999"})
@@ -216,8 +241,13 @@ def probe_handoff():
 
     # H1 手动敲一条 → 应出现在屏上（AI 读得到同一块屏）
     marker = "display esn"
-    subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", marker], capture_output=True)
-    subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
+    if host.IS_WIN:
+        from lib import pane as _pane
+        _pane.send_literal(win, marker)
+        _pane.send_key(win, "Enter")
+    else:
+        subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", marker], capture_output=True)
+        subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
     cap = wait_prompt(win, 25) + read_screen(SERIAL_DEV, 60)
     rec("切换", "H1 手动敲命令 → 屏可见", "ESN of device" in cap, marker)
 
@@ -241,13 +271,23 @@ def probe_handoff():
             except Exception as e: errs.append(str(e))
             time.sleep(0.6)
     th = threading.Thread(target=reader); th.start()
-    subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", "display clock"], capture_output=True)
-    subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
+    if host.IS_WIN:
+        from lib import pane as _pane
+        _pane.send_literal(win, "display clock")
+        _pane.send_key(win, "Enter")
+    else:
+        subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "-l", "display clock"], capture_output=True)
+        subprocess.run([tm, "send-keys", "-t", f"netops:{win}", "Enter"], capture_output=True)
     th.join()
     wait_prompt(SERIAL_DEV, 20)
-    e3 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
-                        capture_output=True, text=True).stdout.strip()
-    rec("切换", "H4 并发（AI 读 + 手动写）不炸", e3 == "0" and not errs, f"pane_dead={e3} errs={len(errs)}")
+    if host.IS_WIN:
+        from lib import pane as _pane
+        e3ok = _pane.bridge_alive(SERIAL_DEV)
+        rec("切换", "H4 并发（AI 读 + 手动写）不炸", e3ok and not errs, f"alive={e3ok} errs={len(errs)}")
+    else:
+        e3 = subprocess.run([tm, "list-panes", "-t", f"netops:{SERIAL_DEV}", "-F", "#{pane_dead}"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
+        rec("切换", "H4 并发（AI 读 + 手动写）不炸", e3 == "0" and not errs, f"pane_dead={e3} errs={len(errs)}")
 
 
 # ─────────────────────────── 重复与删除重接 ───────────────────────────

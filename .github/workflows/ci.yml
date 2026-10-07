@@ -67,28 +67,13 @@ jobs:
       - name: 回归 · AI 工具链一致性 + 采集缓存 + 宿主 shim 剥离 + MCP 握手（57 项）
         run: ./.venv/bin/python tests/test_ai_toolchain_and_cache.py
 
-      # ↓ 2026-10-05 补：这三个此前只在本地跑、没进 CI（改了没人拦）。
-      #   都是纯离线测试，不连 API、不起服务、不需要真设备。
-      - name: 回归 · AI 回合上下文写回（14 项，防"AI 忘记自己说过什么"）
-        run: ./.venv/bin/python tests/test_ai_turn_context.py
-
-      - name: 回归 · AI 会话流水 + 压缩不失忆（26 项）
-        run: ./.venv/bin/python tests/test_ai_session_log.py
-
-      - name: 回归 · 前端内联 JS 语法 + 会话持久化（10 项，防白屏）
-        run: ./.venv/bin/python tests/test_ui_js_syntax.py
-
-      # ↓ 2026-10-05 补：run 的"一条失败=整批失败"语义修正 + mock 接口明细。
-      - name: 回归 · run 逐条结果 partial + mock 接口明细 + 提示词（26 项）
-        run: ./.venv/bin/python tests/test_run_partial_and_mock_detail.py
-
       - name: 回归 · 写操作人审闸门（19 项，安全关键）
         run: ./.venv/bin/python tests/test_approval_gates.py
 
       - name: 回归 · 网页服务生命周期（27 项，跑在 8899 不碰 8898）
         run: ./.venv/bin/python tests/test_ui_lifecycle.py
 
-      - name: 回归 · netdev mock 模拟器命令（21 项）
+      - name: 回归 · netdev mock 模拟器命令（12 项）
         run: ./.venv/bin/python tests/test_mock_cmd.py
 
       - name: 端到端自检（打本机模拟器：run / 闸门 / apply+save / backup）

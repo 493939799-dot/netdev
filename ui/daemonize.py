@@ -51,16 +51,38 @@ DEFAULT_LOGFILE = ROOT / "logs" / "ui-service.log"
 #   详见 lib/hostenv.py 的文件头。
 try:
     sys.path.insert(0, str(ROOT))
+    from lib import host as host_module           # noqa: E402
     from lib.hostenv import strip_host_injection   # noqa: E402
 except Exception:                                  # pragma: no cover
     strip_host_injection = None                    # 拿不到就退化成"不处理"，不阻断启动
+    try:
+        from lib import host as host_module       # noqa: E402
+    except Exception:
+        class _H:
+            IS_WIN = sys.platform == "win32"
+
+            @staticmethod
+            def pid_alive(p):
+                try:
+                    os.kill(p, 0)
+                    return True
+                except OSError:
+                    return False
+
+        host_module = _H
 
 
 def _alive(pid: int) -> bool:
+    return host_module.pid_alive(pid)
+
+
+def _terminate_win(pid: int) -> bool:
+    """终止 Windows 进程（等价 SIGKILL）。优先 taskkill /T 连子进程一起收。"""
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, timeout=10)
+        return not _alive(pid)
+    except Exception:
         return False
 
 
@@ -84,20 +106,27 @@ def status(port: int, pidfile: pathlib.Path) -> int:
     print(f"进程存活: {'是' if ok else '否'}")
     print(f"端口 {port}: {'已监听' if port_open(port) else '未监听'}")
     if not ok and port_open(port):
-        print("提示：端口被别的进程占着 —— 可能是一份没写 PID 文件的旧实例，用 lsof -nP -iTCP:%d 查。" % port)
+        hint = ("netstat -ano | findstr :%d" % port) if host_module.IS_WIN else \
+               ("lsof -nP -iTCP:%d" % port)
+        print("提示：端口被别的进程占着 —— 可能是一份没写 PID 文件的旧实例，用 %s 查。" % hint)
     return 0 if (ok and port_open(port)) else 1
 
 
 def stop(port: int, pidfile: pathlib.Path) -> int:
     pid = read_pid(pidfile)
     if pid and _alive(pid):
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(20):
-            if not _alive(pid):
-                break
-            time.sleep(0.2)
-        if _alive(pid):
-            os.kill(pid, signal.SIGKILL)
+        if host_module.IS_WIN:
+            # Windows 没有 SIGTERM；先 CTRL_BREAK 通知（服务进程未必处理），
+            # 直接 taskkill /F 强收。
+            _terminate_win(pid)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                if not _alive(pid):
+                    break
+                time.sleep(0.2)
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
         print(f"已停止 PID {pid}")
     else:
         print("按 PID 文件没找到进程")
@@ -106,6 +135,90 @@ def stop(port: int, pidfile: pathlib.Path) -> int:
     except Exception:
         pass
     return 0
+
+
+def _start_win(port: int, bind_host: str, pidfile: pathlib.Path, logfile: pathlib.Path) -> int:
+    """Windows 真守护启动：新进程组 + 无窗口，脱离调用方会话。
+
+    与 POSIX double-fork 语义对齐：父/调用终端退出不连坐（Windows 本就不连坐子进程）；
+    stdout/stderr 进日志文件；PID 写 pidfile；随后**轮询**到服务真的应答为止。
+    ★ 不带 DETACHED_PROCESS：venv 转发器 + DETACHED 会给 base python 弹可见控制台。
+    """
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    python = host_module.venv_python(ROOT)
+    if not python.exists():
+        python = pathlib.Path(sys.executable)
+    argv = [str(python), str(HERE / "server.py"), "--port", str(port), "--host", bind_host]
+
+    # ★ 2026-10-07 修（同 lib/pane.py）：去掉 DETACHED_PROCESS。venv 的
+    #   .venv\Scripts\python.exe 是转发器，带 DETACHED 时会给它拉起的
+    #   base python 新开一个**可见**控制台（CREATE_NO_WINDOW 被吞掉）。
+    #   只留 CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW 即无窗口；
+    #   脱离父会话/父终端退出不连坐这两点由「Windows 不连坐子进程」保证。
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
+    flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+    env = dict(os.environ)
+    if strip_host_injection is not None:
+        strip_host_injection(env)
+
+    # ★ 2026-10-07：把子进程 stdio 编码钉成 UTF-8。日志文件虽按 UTF-8 打开，但子进程
+    #   Python 不看父进程的打开方式 —— 它按 Windows 本地编码（中文机 GBK）解释自己的
+    #   stdout。server.py 启动横幅里的 ▮（U+25AE）编不进 GBK → UnicodeEncodeError，
+    #   且它发生在 serve_forever() 之前 → 服务根本起不来（日志只剩 traceback，端口没监听）。
+    #   实测踩到（ui-service.log 2026-10-07）。server.py 内另有 errors=replace 兜底。
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    # ★ 2026-10-06：目录刚 mkdir 完立刻建/开新文件，可能撞上 Windows Defender
+    #   对新目录的扫描锁（实测 ui.log PermissionError → 服务没起 → PID 文件
+    #   没写 → test_ui_lifecycle 连锁失败）。与安装脚本同一套退避约定。
+    logf = None
+    for _ms in (0, 600, 1200, 1800):
+        if _ms:
+            time.sleep(_ms / 1000)
+        try:
+            logf = open(str(logfile), "a", encoding="utf-8", errors="replace")
+            break
+        except PermissionError:
+            continue
+    if logf is None:
+        print(f"✘ 日志文件打不开（Defender 扫描锁？重试 4 次仍失败）：{logfile}")
+        return 1
+    try:
+        p = subprocess.Popen(
+            argv, cwd=str(ROOT), env=env,
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+            creationflags=flags, close_fds=True)
+    except Exception as e:
+        logf.close()
+        print(f"✘ 启动失败：{type(e).__name__}: {e}")
+        return 1
+    pidfile.write_text(str(p.pid) + "\n")
+
+    deadline = time.time() + float(os.environ.get("NETDEV_UI_START_TIMEOUT", "120"))
+    t0 = time.time()
+    while time.time() < deadline:
+        if port_open(port, bind_host):
+            break
+        if p.poll() is not None:
+            print(f"✘ 服务进程提前退出（code={p.returncode}）—— 看日志：{logfile}")
+            try:
+                print(logfile.read_text(encoding="utf-8", errors="replace")[-1500:])
+            except Exception:
+                pass
+            return 1
+        time.sleep(0.3)
+    if port_open(port, bind_host):
+        print(f"✔ netdev-ui 已在后台运行  http://{bind_host}:{port}   PID {p.pid}")
+        print(f"  日志：{logfile}")
+        print(f"  停止：netdev ui stop   （等价于 python {HERE / 'daemonize.py'} --stop）")
+        return 0
+    print(f"✘ 启动后未能连上（等了 {time.time() - t0:.0f} 秒仍无应答）—— 看日志：{logfile}")
+    _terminate_win(p.pid)
+    return 1
 
 
 def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) -> int:
@@ -117,6 +230,8 @@ def start(port: int, host: str, pidfile: pathlib.Path, logfile: pathlib.Path) ->
 
     logfile.parent.mkdir(parents=True, exist_ok=True)
     pidfile.parent.mkdir(parents=True, exist_ok=True)
+    if host_module.IS_WIN:
+        return _start_win(port, host, pidfile, logfile)
     python = ROOT / ".venv" / "bin" / "python"
     if not python.exists():
         python = pathlib.Path(sys.executable)

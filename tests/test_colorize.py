@@ -9,6 +9,7 @@
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -84,6 +85,13 @@ class TestEchoPainter(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="netdev-colorize-")
         self.marks = os.path.join(self.tmp, "echo-marks.json")
         self.ep = cz.EchoPainter(device="huawei", marks=self.marks)
+
+    def tearDown(self):
+        # ★ 必须清理：本用例每个测试方法都会 setUp 一次，不删就会在
+        #   tempfile.gettempdir() 落在 CWD 的环境里（TEMP/TMP 为空或相对路径）
+        #   不断往当前目录堆 netdev-colorize-* —— 实测已堆出 26 个，
+        #   并被 build_bundle.ps1 扫进安装包 payload（见 06-接管与完善记录 OPT-12）。
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def mark(self, text, src="ai", device="huawei"):
         cz._write_marks_file(self.marks, [

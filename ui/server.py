@@ -20,24 +20,44 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
 import http.server
 import json
 import os
 import pathlib
-import pty
 import queue
 import re
 import secrets
 import shutil
-import signal
-import struct
 import subprocess
 import sys
-import termios
 import threading
 import time
 import urllib.parse
+
+# ★ 2026-10-07：输出编码兜底（同 netdev_cli.py）。
+#   本服务作为后台守护进程启动时，stdout 被重定向成日志文件；子进程 Python 不看
+#   父进程的打开方式，而是按 Windows 本地编码（中文机 GBK）解释自己的 stdout。
+#   下面的启动横幅会打印 ▮（U+25AE），一编码不上就 UnicodeEncodeError —— 而它发生在
+#   srv.serve_forever() **之前**，会让整个服务起不来（日志只剩 traceback，端口没监听）。
+#   这里只把 errors 改成 replace：编不出的字符降级为 ?，绝不因为一个装饰符号让服务启动失败。
+#   正规入口（netdev.cmd / 启动器 / daemonize）仍会设 PYTHONUTF8=1 走 UTF-8，这只是兜底。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is None:          # pythonw.exe 下为 None
+        continue
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+# POSIX-only 模块：Windows 上没有，条件导入（TermSession 的 POSIX 分支才用）
+if os.name == "posix":
+    import fcntl
+    import pty
+    import signal
+    import struct
+    import termios
+else:
+    fcntl = pty = signal = struct = termios = None
 
 HOME = pathlib.Path.home()
 # 2026-10-03：ui/server.py 是**直接跑的**（`python ui/server.py`），此时 sys.path[0]
@@ -48,7 +68,7 @@ _ROOT_SELF = pathlib.Path(
 ).expanduser().resolve()
 if str(_ROOT_SELF) not in sys.path:
     sys.path.insert(0, str(_ROOT_SELF))
-from lib import hostenv as _H, paths as _P   # noqa: E402  路径统一真源 + 宿主钩子剥离
+from lib import host, hostenv as _H, paths as _P   # noqa: E402  路径统一真源 + 宿主钩子剥离
 ROOT = _P.ROOT
 STATIC = pathlib.Path(__file__).resolve().parent / "static"
 # 版本号单一真源：dist/installer/VERSION（发布流水线写它）。
@@ -84,18 +104,40 @@ def find_tmux() -> str | None:
 TMUX = find_tmux()
 
 
+# ★ 2026-10-06：抑制「子进程弹出控制台窗口」。
+#   UI 服务由 daemonize.py 以 CREATE_NO_WINDOW（自身没有控制台）拉起。从这种
+#   进程里再拉起 python.exe / powershell 这类**控制台程序**时，Windows 会给它
+#   **新建一个控制台窗口** —— 界面上就莫名弹出一个黑框终端（用户实测：接入设备、
+#   AI 执行命令时都弹，很影响观感）。统一给这些子进程加 CREATE_NO_WINDOW；
+#   POSIX 下该值为 0（等于默认，无影响）。
+_NO_WINDOW = 0x08000000 if host.IS_WIN else 0
+
+
+def netdev_argv(*extra: str) -> list:
+    """netdev CLI argv 前缀。
+
+    Windows：仓里没有 netdev 这个 shell 入口 → venv python 跑 netdev_cli.py；
+    POSIX：直接跑仓里的 netdev 脚本。
+    """
+    if host.IS_WIN:
+        return [str(ROOT / ".venv" / "Scripts" / "python.exe"),
+                str(ROOT / "netdev_cli.py"), *extra]
+    return [str(ROOT / "netdev"), *extra]
+
+
+def netdev_entry_exists() -> bool:
+    return (ROOT / "netdev_cli.py").exists() if host.IS_WIN else (ROOT / "netdev").exists()
+
+
 def netdev_json(args: list[str], timeout: int = 20):
     """调 netdev CLI 并解析 JSON。失败返回 None（绝不抛给调用方）。"""
-    cli = ROOT / "netdev"
-    if not cli.exists():
+    if not netdev_entry_exists():
         return None
     try:
         # ★ 用干净环境：剥掉宿主注入的 Node / Shell shim（见 _strip_host_shim）。
-        #   shim 会在 PATH 里塞 brokered-bin / safe-bin 包装器，把 mkdir / rm
-        #   换成受管版本 —— netdev CLI 自己要建 pid、快照、回收区目录，
-        #   被换成受管版本后错误码与语义都不可依赖（实测踩过，见文件头注释）。
-        r = subprocess.run([str(cli), *args], capture_output=True, text=True,
-                           timeout=timeout, env=_env_with_node())
+        r = subprocess.run(netdev_argv(*args), capture_output=True, text=True,
+                           timeout=timeout, env=_env_with_node(),
+                           creationflags=_NO_WINDOW)
         out = (r.stdout or "").strip()
         if not out:
             return None
@@ -105,19 +147,14 @@ def netdev_json(args: list[str], timeout: int = 20):
 
 
 def raw_netdev(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
-    cli = ROOT / "netdev"
     # ★ 网页审批通道：把 UI 自己的地址带给 netdev CLI 子进程，
     #   让它审批走「网页弹窗」（/api/ask）而不是 macOS 原生 osascript 弹窗。
-    #   之前漏了这里 —— 界面里点「下发配置」时 approval 读到空的
-    #   NETDEV_APPROVAL_URL，就会回退到系统弹窗（用户 2026-09-30 反馈）。
-    # ★ 2026-10-03：改用 _env_with_node()（= os.environ 先剥宿主 shim 再补 PATH），
-    #   别再把带 shim 的原始环境原样传给 netdev CLI。
     env = _env_with_node()
     if UI_BASE:
         env["NETDEV_APPROVAL_URL"] = UI_BASE
     try:
-        r = subprocess.run([str(cli), *args], capture_output=True, text=True,
-                           timeout=timeout, env=env)
+        r = subprocess.run(netdev_argv(*args), capture_output=True, text=True,
+                           timeout=timeout, env=env, creationflags=_NO_WINDOW)
         return r.returncode, r.stdout or "", r.stderr or ""
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -181,7 +218,11 @@ def _env_with_node() -> dict:
     """
     env = _strip_host_shim(dict(os.environ))
     extra = [str(HOME / ".npm-global/bin"), "/usr/local/bin", "/opt/homebrew/bin"]
-    env["PATH"] = ":".join(extra + [env.get("PATH", "")])
+    if host.IS_WIN:
+        # Windows：POSIX 路径加了也没用，只保留系统 PATH（os.pathsep 分隔）
+        env["PATH"] = env.get("PATH", "")
+    else:
+        env["PATH"] = ":".join(extra + [env.get("PATH", "")])
     return env
 
 
@@ -250,6 +291,7 @@ class TermSession:
         self._client_tty: str | None = None   # 自己那个 tmux client 的 tty
         self.master: int | None = None
         self.proc: subprocess.Popen | None = None
+        self.sub_ctrl = None            # Win：pane.subscribe 返回的 Control
         self.subs: set[queue.Queue] = set()
         self.backlog = bytearray()
         self.lock = threading.Lock()
@@ -259,6 +301,8 @@ class TermSession:
 
     # ── 起会话 ──
     def start(self, rows: int = 40, cols: int = 140) -> None:
+        if host.IS_WIN:
+            return self._start_win(rows, cols)
         if not TMUX:
             raise RuntimeError("找不到 tmux（同屏终端依赖它）")
         # ★ 2026-09-26 改回【直接 attach netops】，不再建 ui-* 临时会话。
@@ -298,6 +342,43 @@ class TermSession:
             pass
         threading.Thread(target=self._reader, daemon=True).start()
 
+    # ── Windows：起会话 = ensure pane-daemon + subscribe（无 pty/tmux）──
+    def _start_win(self, rows: int, cols: int) -> None:
+        from lib import pane
+        rows = max(5, min(300, int(rows)))
+        cols = max(20, min(500, int(cols)))
+        if not pane.ensure(self.dev, timeout=60):
+            raise RuntimeError(f"同屏会话起不来：{self.dev}")
+        try:
+            pane.resize(self.dev, rows, cols)
+        except Exception:
+            pass
+
+        def _sink(data: bytes) -> None:
+            if not data:                    # b"" 哨兵 = 桥死了
+                self.alive = False
+                with self.lock:
+                    for q in list(self.subs):
+                        try:
+                            q.put_nowait(None)
+                        except queue.Full:
+                            pass
+                return
+            with self.lock:
+                self.backlog += data
+                if len(self.backlog) > self.BACKLOG_MAX:
+                    del self.backlog[: len(self.backlog) - self.BACKLOG_MAX // 2]
+                for q in list(self.subs):
+                    try:
+                        q.put_nowait(data)
+                    except queue.Full:
+                        pass
+
+        self.sub_ctrl = pane.subscribe(self.dev, _sink, include_tail=True)
+        if self.sub_ctrl is None:
+            raise RuntimeError(f"订阅同屏会话失败：{self.dev}")
+        self.alive = True
+
     # ── pty 尺寸 ──
     @staticmethod
     def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -309,7 +390,16 @@ class TermSession:
             pass
 
     def resize(self, rows: int, cols: int) -> None:
-        """调整终端尺寸。
+        """调整终端尺寸。"""
+        if host.IS_WIN:
+            self.last_active = time.time()
+            try:
+                from lib import pane
+                pane.resize(self.dev, rows, cols)
+            except Exception:
+                pass
+            return
+        """POSIX 分支历史文档：
 
         ★ 2026-09-26 修正（终端最大化后底部大片空白）：
         tmux 的窗格尺寸 = 所有连着的 client 里的【最小值】。
@@ -383,11 +473,20 @@ class TermSession:
                 except queue.Full:
                     pass
 
-    # ── 写 pty（键盘输入）──
+    # ── 写键盘输入（POSIX 写 pty；Win 走 daemon 喂送通道）──
     def write(self, data: bytes) -> None:
+        self.last_active = time.time()
+        if host.IS_WIN:
+            if not self.alive:
+                return
+            try:
+                from lib import pane
+                pane.send_literal(self.dev, data)
+            except Exception:
+                self.alive = False
+            return
         if self.master is None or not self.alive:
             return
-        self.last_active = time.time()
         try:
             os.write(self.master, data)
         except OSError:
@@ -408,6 +507,16 @@ class TermSession:
 
     def close(self) -> None:
         self.alive = False
+        if host.IS_WIN:
+            # 退订即可；daemon 与桥是常驻的，留给设备本身（别处可能在用）
+            if self.sub_ctrl is not None:
+                try:
+                    self.sub_ctrl.close()
+                except Exception:
+                    pass
+                self.sub_ctrl = None
+            self.alive = False
+            return
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGHUP)
@@ -469,8 +578,60 @@ def self_win(sess) -> str:
 #        于是 ui-* 临时会话和 tmux client 一路累积（实测攒到 4 个）。
 #        多 client 会互相拖累窗格尺寸，还会让新终端 attach 到混乱状态。
 #   做法：开终端前先清理该设备相关的残留；服务启动时也清一次。
+def drop_term_sessions(dev: str = "", window: str = "", keep_sid: str = "",
+                       notify: bool = True) -> list[str]:
+    """收掉匹配的 TermSession，返回被收掉的 sid 列表。
+
+    ★ 2026-10-07 加。为什么必须有这一层：
+      前端有【三处】会调 /api/term/open（设备列表点击、连接簿「接入」、
+      向导里"已存在同名连接"的兜底）。其中 openTerm() 里「先关旧 SID」是
+      await 之前的判断 —— 并发调用时全部通过，于是同一台设备堆出 N 个
+      TermSession（实测同一秒 4 个、内存里积到 7 个）。每个会话都订阅同一个
+      pane，open 时还各自敲 3 次回车"唤醒"设备 —— 屏上就是一整屏提示符，
+      用户看着就是"终端卡住了"。
+      所以后端兜底：同一设备（同 window）只留一个会话。
+
+    notify=True 时给旧会话的订阅者推 None 哨兵，让前端 SSE 收到 event:end，
+    界面能显示「[会话已结束]」而不是无声冻结。
+    """
+    dropped: list[str] = []
+    with SESS_LOCK:
+        for sid in [k for k, v in SESSIONS.items()
+                    if k != keep_sid
+                    and ((window and getattr(v, "window", "") == window)
+                         or (dev and getattr(v, "dev", "") == dev))]:
+            old = SESSIONS.pop(sid, None)
+            if old is None:
+                continue
+            dropped.append(sid)
+            if notify:
+                try:
+                    with old.lock:
+                        for q in list(old.subs):
+                            try:
+                                q.put_nowait(None)
+                            except queue.Full:
+                                pass
+                except Exception:
+                    pass
+            try:
+                old.close()
+            except Exception:
+                pass
+    return dropped
+
+
 def cleanup_term_sessions(dev: str = "", keep_sid: str = "") -> dict:
     """杀掉该设备相关的 ui-* 临时会话（不动 netops 本体）。返回清理明细。"""
+    if host.IS_WIN:
+        # 无 tmux client/会话概念：摘掉已死的，再收掉该设备【还活着】的残留。
+        # ★ 2026-10-07：原来只摘死会话 —— 于是前端那句「开终端前先清残留」
+        #   在 Windows 上等于没做，活跃残留（连接簿「接入」留下的那些）一路堆积。
+        with SESS_LOCK:
+            for sid in [k for k, v in SESSIONS.items() if not getattr(v, "alive", False)]:
+                SESSIONS.pop(sid, None)
+        dropped = drop_term_sessions(dev=dev, keep_sid=keep_sid) if dev else []
+        return {"killed": dropped, "detached": []}
     if not TMUX:
         return {"killed": [], "detached": []}
     killed, detached = [], []
@@ -618,6 +779,12 @@ DEBUG_SYSTEM_PROMPT = """你是【网络设备调试助手】，正在协助一�
 
 AI_SESSIONS: dict = {}
 AI_LOCK = threading.Lock()
+# ★ 2026-10-06：允许多会话并存（每台设备一个），只保留最近活跃的若干个以防极端堆积。
+#   历史：原来 /api/ai/open 一律「开新会话先收掉旧的」——那是 pi / WorkBuddy
+#   「借 CLI 当引擎」时代的遗产（每个会话带常驻进程/线程，不收会堆积）。直连后端
+#   是纯内存对象 + 每轮一个短命线程，多会话没有堆积问题；而旧逻辑会让
+#   「接入新设备 → 切到它的会话」无从谈起（旧会话已被清）。
+_AI_MAX_SESSIONS = 10
 
 # ── AI 会话流水（append-only JSONL，2026-10-05 加）──────────────────────
 #   为什么必须有：对话上下文是【内存态】且会被压缩，于是用户问
@@ -684,7 +851,6 @@ def ai_log_sessions() -> list[dict]:
     except Exception:
         pass
     return out
-
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1224,7 +1390,7 @@ class DirectSession:
                 #        在它自己的上下文里【是真的】—— 不是幻觉，是被我们删了。
                 #     ② 它会重复回答已答过的问题、重复做已做过的检查；
                 #        写操作场景下不记得刚提交过什么变更 → 有重复下发风险。
-                #   与 1168 行的「带工具 assistant 写回」对称：两种结束方式都要落上下文。
+                #   与上面的「带工具 assistant 写回」对称：两种结束方式都要落上下文。
                 #   ⚠ 这里【不能】清空 self._turn_text —— finally 里的 turn_end
                 #   流水要用它记录 assistant 全文（清了就记成空串）。
                 _final = "".join(self._turn_text)
@@ -1481,6 +1647,12 @@ def mon_cmds(platform: str | None, dev: str = "",
 
 
 def _tmux_windows() -> set:
+    if host.IS_WIN:
+        try:
+            from lib import pane
+            return {s["window"] for s in pane.list_screens()}
+        except Exception:
+            return set()
     if not TMUX:
         return set()
     try:
@@ -1492,13 +1664,19 @@ def _tmux_windows() -> set:
 
 
 def _tmux_live_windows() -> set:
-    """活窗格集合（pane_dead==0）。
+    """活窗格集合（桥活着）。
 
     为什么单列：_tmux_windows() 是【全量】窗口名（含死窗格）——
     僵尸清理必须看到死的才能杀；但「设备在线/监控通道决策」若认死窗格
     会出假象：窗格桥已死、串口早没了，还被当成"前台占用"走同屏，
     采回来一堆 Python 堆栈（2026-09-30 huawei 实测踩到）。
     """
+    if host.IS_WIN:
+        try:
+            from lib import pane
+            return {s["window"] for s in pane.list_screens() if not s.get("dead")}
+        except Exception:
+            return set()
     if not TMUX:
         return set()
     try:
@@ -2213,11 +2391,11 @@ def deepcheck_diag_prompt(dev: str, plan: list, raws: dict, platform: str | None
 
 def _deepcheck_run_cmd(dev: str, window: str, via_screen: bool, cmd: str) -> str:
     """执行单条只读命令：直连优先（静默）；串口被占走同屏。"""
-    cli = str(ROOT / "netdev")
+    cli = netdev_argv()
     if via_screen:
         try:
-            subprocess.run([cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
-                           capture_output=True, timeout=20)
+            subprocess.run([*cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
+                           capture_output=True, timeout=20, creationflags=_NO_WINDOW)
         except Exception as e:
             return f"<err> 下发失败：{e}"
         time.sleep(1.6)
@@ -2336,7 +2514,7 @@ def collect_metrics(dev: str) -> dict:
     # 通道决策：只有【串口 + 前台窗格占用】才被迫走同屏；其余一律静默直连
     via_screen = bool(proto == "serial" and screen_held)
     via_note = ("同屏（串口被前台占用，物理独占）" if via_screen else "直连（静默）")
-    cli = str(ROOT / "netdev")
+    cli = netdev_argv()
     platform = _platform_of(dev)
     auto_detected = False
     # ★ 开箱即用：platform 留空（用户没标厂商）时，先发一条 display version
@@ -2395,8 +2573,8 @@ def collect_metrics(dev: str) -> dict:
         if via_screen:
             for key, cmd in work.items():
                 try:
-                    subprocess.run([cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
-                                   capture_output=True, timeout=20)
+                    subprocess.run([*cli, "screen-send", window, cmd, "--yes", "--src", "sys"],
+                                   capture_output=True, timeout=20, creationflags=_NO_WINDOW)
                 except Exception:
                     pass
                 cmds.append(cmd); used[key] = cmd
@@ -2442,8 +2620,8 @@ def collect_metrics(dev: str) -> dict:
                     continue
                 if via_screen:
                     try:
-                        subprocess.run([cli, "screen-send", window, cand, "--yes", "--src", "sys"],
-                                       capture_output=True, timeout=20)
+                        subprocess.run([*cli, "screen-send", window, cand, "--yes", "--src", "sys"],
+                                       capture_output=True, timeout=20, creationflags=_NO_WINDOW)
                     except Exception:
                         pass
                     _wait_prompt(window, (cand.split() or [""])[0])
@@ -2534,7 +2712,11 @@ def serial_ports() -> list:
     _rc, out, _e = raw_netdev(["serial-discover"], timeout=40)
     ports = []
     for line in strip_ansi(out).splitlines():
-        m = re.match(r"\s*(/dev/\S+)\s+(.*)$", line)
+        if host.IS_WIN:
+            # 形如 "  COM3  可打开（9600-8N1）  USB Serial Device (COM3)"
+            m = re.match(r"\s*(COM\d+)\s+(.*)$", line)
+        else:
+            m = re.match(r"\s*(/dev/\S+)\s+(.*)$", line)
         if m:
             info = re.sub(r"\s+", " ", m.group(2)).strip()
             ports.append({"path": m.group(1), "info": info[:80]})
@@ -2648,10 +2830,10 @@ def interface_detail(dev_name: str) -> dict:
         return "\n".join(out2)
 
     def _send(cmd):
-        cli = str(ROOT / "netdev")
+        cli = netdev_argv()
         try:
-            subprocess.run([cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
-                           capture_output=True, timeout=20)
+            subprocess.run([*cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
+                           capture_output=True, timeout=20, creationflags=_NO_WINDOW)
         except Exception:
             pass
         time.sleep(1.0)
@@ -2783,7 +2965,7 @@ def metric_one(dev_name: str, key: str) -> dict:
     cmd = _METRIC_CMDS.get(key)
     if not cmd:
         return {"error": f"未知指标 {key}"}
-    cli = str(ROOT / "netdev")
+    cli = netdev_argv()
     # 1) 清历史（否则屏上的旧内容会混进来）
     try:
         subprocess.run([TMUX, "clear-history", "-t", f"{TMUX_SESSION}:{win}"],
@@ -2792,8 +2974,8 @@ def metric_one(dev_name: str, key: str) -> dict:
         pass
     # 2) 发命令（走同屏，屏幕可见）
     try:
-        subprocess.run([cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
-                       capture_output=True, timeout=30)
+        subprocess.run([*cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
+                       capture_output=True, timeout=30, creationflags=_NO_WINDOW)
     except Exception as e:
         return {"error": f"下发失败：{e}"}
     # 3) 等输出稳定再读 —— 固定 sleep 会读到半截。
@@ -2915,9 +3097,13 @@ def disconnect_device(dev: str) -> dict:
     window = info.get("window") or dev
     killed = False
     try:
-        r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
-                           capture_output=True, timeout=8)
-        killed = r.returncode == 0
+        if host.IS_WIN:
+            from lib import pane as _pane
+            killed = _pane.kill(window)
+        else:
+            r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
+                               capture_output=True, timeout=8)
+            killed = r.returncode == 0
     except Exception:
         pass
     # 顺手清掉可能残留的 client
@@ -3222,10 +3408,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "note": c.get("note"), "window": c.get("name") or c.get("id"),
                          "username": c.get("username"), "official": False})
         wins = _tmux_live_windows()       # ★ 只认活窗格：死窗格不该标"已接入/在线"
+        win_set = set(wins)
         for d in devs:
             win = d.get("window") or d.get("name")
-            d["window_live"] = win in wins
-            d["connected"] = win in wins          # ★ 「已接入」= 有【活】同屏窗格
+            live = win in win_set
+            # ★ 2026-10-06 修：连接簿的串口条目，CLI 建的窗格名是 serial-{端口}
+            #   （netdev_cli.py 按 _sanitize("serial-" + entry["device"]) 命名），
+            #   与连接名无关。只按连接名匹配 → 串口设备明明在线、界面却显示
+            #   "未接入"（AR111-S 真机 COM3 实测踩到）。
+            if not live and d.get("device"):
+                live = ("serial-" + str(d["device"])) in win_set
+            d["window_live"] = live
+            d["connected"] = live         # ★ 「已接入」= 有【活】同屏窗格
             # 挂上凭据（明文，供界面里直接看；AI 侧看不到）
             c = self._cred_of(str(d.get("id") or d.get("name") or ""), str(d.get("name") or ""))
             d["cred_service"] = c["service"]
@@ -3250,6 +3444,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         f"要新接入请点顶栏「＋」。"}, 404)
         window = info.get("window") or dev
         target = info.get("target") or dev   # 临时目标用设备名开窗
+        # ★ 2026-10-07 修：同一设备只留一个终端会话。
+        #   前端三处调 term/open，且 openTerm 的"先关旧 SID"是 await 前的判断 ——
+        #   并发时全部通过 → 同设备堆出 N 个会话（实测同一秒 4 个、内存积到 7 个）。
+        #   每个会话都订阅同一个 pane，还会各自敲 3 次回车"唤醒"设备，
+        #   屏上就是一整屏提示符 + 输入像"卡住"。这里开新会话前按设备收掉旧的。
+        _dropped = drop_term_sessions(dev=dev, window=window)
+        if _dropped:
+            print(f"[term/open] 去重：{dev} 收掉旧会话 {len(_dropped)} 个 {_dropped}",
+                  flush=True)
         # ★ 串口：开窗时统一用 @auto，让桥自己探测波特率。
         #   原因：netdev 登记里的 baud 只能量整数（--baud 不接受 auto），常写成默认 9600，
         #   而真机可能是 115200 —— 波特率不对就是“屏幕无输出/满屏乱码”（已实测踩到）。
@@ -3264,7 +3467,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         #     对不上，反而导致"窗格没建立起来"的误报。
         #     正确做法是让【连接簿里的 baud = auto】（已改），走设备名开窗即可。
         # 该设备还没有同屏窗格 → 请 netdev 建一个（它会自己处理串口独占/桥）
-        if TMUX:
+        # Windows：TermSession.start() 自己会 pane.ensure，不需要这里预建
+        if not host.IS_WIN and TMUX:
             r = subprocess.run([TMUX, "list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"],
                                capture_output=True, text=True, timeout=8)
             # ★ 2026-09-26 修（用户报"点 SSH 不能自动连接"）：
@@ -3297,9 +3501,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 #   并且【轮询到窗格真的跑起桥为止】—— 原来超时了也无条件返回 sid，
                 #   于是"tmux 会话都不存在 / 设备连不上"也报成功，
                 #   界面显示"已接入"但列表里没有（用户实测踩到）。
-                _spawn = subprocess.Popen([str(ROOT / "netdev"), "shell", target, "--restart"],
+                _spawn = subprocess.Popen(netdev_argv("shell", target, "--restart"),
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          text=True, start_new_session=True)
+                                          text=True, start_new_session=True,
+                                          creationflags=_NO_WINDOW)
                 _ok = False
                 for _ in range(100):                # 最多等 20s（设备登录慢时够用）
                     time.sleep(0.2)
@@ -3336,8 +3541,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             for _i in range(3):
                 time.sleep(0.7)
-                subprocess.run([TMUX, "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"],
-                               capture_output=True, timeout=6)
+                if host.IS_WIN:
+                    from lib import pane as _pane
+                    _pane.send_key(window, "Enter")
+                else:
+                    subprocess.run([TMUX, "send-keys", "-t", f"{TMUX_SESSION}:{window}", "Enter"],
+                                   capture_output=True, timeout=6)
         except Exception:
             pass
         time.sleep(0.6)
@@ -3367,16 +3576,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not s:
             return self._json({"error": "会话不存在"}, 404)
         s.resize(rows, cols)
-        # 记下"设置完之后 tmux 里实际是多少"
-        try:
-            r = subprocess.run([TMUX, "list-windows", "-t", TMUX_SESSION, "-F",
-                                "#{window_name}=#{window_width}x#{window_height}"],
-                               capture_output=True, text=True, timeout=6)
-            line = next((x for x in (r.stdout or "").split() if self_win(s) in x), "")
-            with open(str(ROOT / "logs" / "resize.log"), "a", encoding="utf-8") as fp:
-                fp.write(f"\t\t→ 设置后 tmux: {line or '(取不到)'}\n")
-        except Exception:
-            pass
+        # POSIX：记下"设置完之后 tmux 里实际是多少"（Win 无 tmux，跳过）
+        if not host.IS_WIN:
+            try:
+                r = subprocess.run([TMUX, "list-windows", "-t", TMUX_SESSION, "-F",
+                                    "#{window_name}=#{window_width}x#{window_height}"],
+                                   capture_output=True, text=True, timeout=6)
+                line = next((x for x in (r.stdout or "").split() if self_win(s) in x), "")
+                with open(str(ROOT / "logs" / "resize.log"), "a", encoding="utf-8") as fp:
+                    fp.write(f"\t\t→ 设置后 tmux: {line or '(取不到)'}\n")
+            except Exception:
+                pass
         return self._json({"ok": True})
 
     def _api_term_cleanup(self, b: dict):
@@ -3417,15 +3627,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not cfg["ok"]:
             return self._json({"error": cfg["note"],
                                "hint": "在界面 ⚙ 设置里粘贴 API Key 即可启用 AI 助手"}, 400)
-        # 界面上只有一个 AI 面板 ⇒ 开新会话前先收掉旧的，别让线程一路堆积
+        # ★ 2026-10-06：不再「开新会话先收掉旧的」——见 _AI_MAX_SESSIONS 处的说明。
+        #   多会话并存（每台设备一个），只在超出上限时按「最久未活跃」淘汰。
         with AI_LOCK:
-            old_sessions = list(AI_SESSIONS.values())
-            AI_SESSIONS.clear()
-        for o in old_sessions:
-            try:
-                o.close()
-            except Exception:
-                pass
+            overflow = len(AI_SESSIONS) - _AI_MAX_SESSIONS + 1
+            if overflow > 0:
+                _victims = sorted(AI_SESSIONS.items(), key=lambda kv: kv[1].last_active)[:overflow]
+                for _vaid, _vsess in _victims:
+                    AI_SESSIONS.pop(_vaid, None)
+                for _vaid, _vsess in _victims:
+                    try:
+                        _vsess.close()
+                    except Exception:
+                        pass
         aid = secrets.token_urlsafe(9)
         s = DirectSession(aid, model=b.get("model") or "", cwd=b.get("cwd") or None,
                           tools=b.get("tools") or "read+netdev")
@@ -3636,8 +3850,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not dev:
                 return self._json({"error": "请选择串口设备"}, 400)
             args += ["--device", dev]
-            # 注意：netdev 的 --baud 【只收整数】，传 'auto' 会 argparse 报错（已实测）。
-            # 前端下拉里有 auto 选项 ⇒ auto 就不传，让 netdev 用默认（自动探测）。
+            # baud 写 auto 时不必显式传：netdev 侧 --baud 默认就是 auto（自动探测）。
+            # 前端下拉里有 auto 选项 ⇒ auto 就不传，交给默认值。
             _b = str(b.get("baud") or "").strip().lower()
             if _b and _b != "auto":
                 args += ["--baud", _b]
@@ -3688,7 +3902,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not dev:
                 return self._json({"error": "请选择串口设备"}, 400)
             args += ["--device-port", dev]
-            # 同上：--baud 只收整数，'auto' 会报错 ⇒ 不传
+            # 同上：auto 走 netdev 默认（自动探测）
             _b = str(b.get("baud") or "").strip().lower()
             if _b and _b != "auto":
                 args += ["--baud", _b]
@@ -3731,11 +3945,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 注意：netdev conn rm 【不接受 --yes】——硬加会 argparse 报错（已实测）。直接删即可。
         rc, out, err = raw_netdev(["conn", "rm", key], timeout=60)
         killed = False
-        if rc == 0 and window and TMUX:
+        if rc == 0 and window and (host.IS_WIN or TMUX):
             with screen_lock(key):
-                r2 = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
-                                    capture_output=True, timeout=8)
-                killed = r2.returncode == 0
+                if host.IS_WIN:
+                    from lib import pane as _pane
+                    killed = _pane.kill(window)
+                else:
+                    r2 = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
+                                        capture_output=True, timeout=8)
+                    killed = r2.returncode == 0
         return self._json({"ok": rc == 0, "stdout": strip_ansi(out)[-400:],
                            "pane_killed": killed, "pane": window,
                            "stderr": strip_ansi(err)[-300:]})
@@ -3763,9 +3981,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         busy = {}
         for p in serial_ports():
             try:
-                rr = subprocess.run(["/usr/sbin/lsof", "-t", p["path"]],
-                                    capture_output=True, text=True, timeout=8)
-                busy[p["path"]] = bool((rr.stdout or "").strip())
+                if host.IS_WIN:
+                    # 无 lsof：直接试着打开 COM 口，打不开=被占
+                    try:
+                        import serial as _ser
+                        s = _ser.Serial(p["path"], 9600, timeout=0.2); s.close()
+                        busy[p["path"]] = False
+                    except Exception:
+                        busy[p["path"]] = True
+                else:
+                    rr = subprocess.run(["/usr/sbin/lsof", "-t", p["path"]],
+                                        capture_output=True, text=True, timeout=8)
+                    busy[p["path"]] = bool((rr.stdout or "").strip())
             except Exception:
                 busy[p["path"]] = None
         return self._json({"panes": rows, "serial_busy": busy})
@@ -3777,6 +4004,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "缺少 window"}, 400)
         if w not in _tmux_windows():
             return self._json({"error": f"窗格不存在：{w}"}, 404)
+        if host.IS_WIN:
+            from lib import pane as _pane
+            return self._json({"ok": _pane.kill(w), "killed": w})
         r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{w}"],
                            capture_output=True, timeout=8)
         return self._json({"ok": r.returncode == 0, "killed": w})
@@ -3805,6 +4035,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         killed = []
         for w in list(_tmux_windows()):
             if w in keep or not self._looks_autogen(w):
+                continue
+            if host.IS_WIN:
+                from lib import pane as _pane
+                if _pane.kill(w):
+                    killed.append(w)
                 continue
             r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{w}"],
                                capture_output=True, timeout=8)
@@ -3881,11 +4116,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         info = resolve_device(name)
         window = info.get("window") or ""
         killed = False
-        if window and TMUX:
+        if window and (host.IS_WIN or TMUX):
             with screen_lock(name):
-                r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
-                                   capture_output=True, timeout=8)
-                killed = r.returncode == 0
+                if host.IS_WIN:
+                    from lib import pane as _pane
+                    killed = _pane.kill(window)
+                else:
+                    r = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
+                                       capture_output=True, timeout=8)
+                    killed = r.returncode == 0
         return self._json({"ok": True, "freed": name, "pane_killed": killed, "pane": window})
 
     # ── 真删除：从 devices.toml 移除 + 连带清窗格 ──
@@ -3898,11 +4137,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         window = info.get("window") or ""
         r = remove_device(name)
         killed = False
-        if r.get("ok") and window and TMUX:
+        if r.get("ok") and window and (host.IS_WIN or TMUX):
             with screen_lock(name):
-                rr = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
-                                    capture_output=True, timeout=8)
-                killed = rr.returncode == 0
+                if host.IS_WIN:
+                    from lib import pane as _pane
+                    killed = _pane.kill(window)
+                else:
+                    rr = subprocess.run([TMUX, "kill-window", "-t", f"{TMUX_SESSION}:{window}"],
+                                        capture_output=True, timeout=8)
+                    killed = rr.returncode == 0
         return self._json({"ok": bool(r.get("ok")), "removed": name,
                            "backup": r.get("backup"), "error": r.get("error"),
                            "pane_killed": killed, "pane": window})
@@ -4319,9 +4562,13 @@ def idle_reaper() -> None:
                     s.close()
                 except Exception:
                     pass
-        with AI_LOCK:      # AI 会话：空闲 30 分钟且无订阅者就收掉（进程有成本）
+        # AI 会话：空闲 6 小时且无订阅者才收掉。
+        # ★ 2026-10-06：原来是 30 分钟 —— 但多会话并存后，非当前会话本来就没有
+        #   订阅者（前端切走时会关掉它的流），30 分钟就被回收会让"切回某台设备的
+        #   会话"落空。数量上限已由 _AI_MAX_SESSIONS 兜底，这里只收"真废弃"的。
+        with AI_LOCK:
             dead_ai = [aid for aid, s in AI_SESSIONS.items()
-                       if not s.subs and now - s.last_active > 1800]
+                       if not s.subs and now - s.last_active > 21600]
             for aid in dead_ai:
                 s = AI_SESSIONS.pop(aid)
                 try:
@@ -4345,10 +4592,10 @@ def main() -> int:
     #   的审批全部静默回退到 macOS 原生弹窗（用户实测反馈）。
     os.environ["NETDEV_APPROVAL_URL"] = UI_BASE
 
-    if not TMUX:
+    if not host.IS_WIN and not TMUX:
         print("⚠ 没找到 tmux：终端同屏不可用（其他功能仍在）", file=sys.stderr)
-    if not (ROOT / "netdev").exists():
-        print(f"⚠ 没找到 {ROOT/'netdev'}：设备清单与命令透传将不可用", file=sys.stderr)
+    if not netdev_entry_exists():
+        print(f"⚠ 没找到 netdev CLI：设备清单与命令透传将不可用", file=sys.stderr)
 
     n = cleanup_stale()
     if n:
@@ -4360,7 +4607,10 @@ def main() -> int:
     # Python 会整块缓冲，日志文件长时间是空的，出问题无从查起（2026-10-01 实测踩到）。
     print(f"▮ netdev-ui 已启动  http://{a.host}:{a.port}   PID {os.getpid()}   "
           f"{time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
-    print(f"  tmux={TMUX or '未找到'}  设备窗格会话={TMUX_SESSION}  静态目录={STATIC}", flush=True)
+    if host.IS_WIN:
+        print(f"  同屏后端=pane-daemon（localhost TCP）  静态目录={STATIC}", flush=True)
+    else:
+        print(f"  tmux={TMUX or '未找到'}  设备窗格会话={TMUX_SESSION}  静态目录={STATIC}", flush=True)
     # 记下本进程加载的代码指纹 —— 供 `netdev ui status` / `netdev doctor`
     # 判断「服务跑的代码是不是比磁盘上的旧」（改完源码忘了重启，实测踩过）。
     _write_code_manifest(a.port)

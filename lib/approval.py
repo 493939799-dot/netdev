@@ -20,7 +20,7 @@ import time
 # 这里会去读 ~/netops/state/policy.json —— 读不到就静默回落成 "ask"，
 # 看着"安全"，实际上**用户的策略和审计流水都写到了另一个目录**。
 # 现在与全项目共用 lib/paths.py 的解析结果（唯一真源）。
-from . import paths as _paths
+from . import host, paths as _paths
 
 ROOT = _paths.ROOT
 POLICY = _paths.state_dir() / "policy.json"
@@ -186,6 +186,85 @@ def _selftest_sim_bypass(device: str) -> bool:
     return _is_local_sim(device)
 
 
+def _ask_win_dialog(msg: str, title: str, timeout: int) -> tuple[bool, str]:
+    """Windows 原生审批弹窗（user32.MessageBoxW），返回 (是否允许, 原因)。
+
+    语义对齐 macOS osascript 版（红线：fail-closed 不许放松）：
+      · 默认焦点在「否」（MB_DEFBUTTON2），人只能主动点「是」才放行；
+      · 超时：看门狗线程按标题找到弹窗，直接点「否」→ 拒绝；
+      · 无 GUI / 调用失败 → 拒绝。
+    """
+    import ctypes
+    import threading
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    # MB_YESNO=0x4, MB_ICONWARNING=0x30, MB_DEFBUTTON2=0x100,
+    # MB_TOPMOST=0x40000, MB_SETFOREGROUND=0x10000, MB_TASKMODAL=0x2000
+    FLAGS = 0x4 | 0x30 | 0x100 | 0x40000 | 0x10000 | 0x2000
+    IDYES, IDNO = 6, 7
+
+    result = {"id": 0}
+    timed_out = {"v": False}
+    box_ready = threading.Event()
+
+    def _box():
+        try:
+            user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR,
+                                           wintypes.LPCWSTR, wintypes.UINT]
+            user32.MessageBoxW.restype = ctypes.c_int
+            box_ready.set()
+            result["id"] = user32.MessageBoxW(0, msg, title, FLAGS)
+        except Exception:
+            result["id"] = 0
+
+    t = threading.Thread(target=_box, daemon=True)
+    t.start()
+    box_ready.wait(2.0)
+
+    def _watchdog():
+        # 超时后按标题找本进程的弹窗，点「否」按钮（控件 ID=7，不受语言影响）
+        t.join(max(1, int(timeout)))
+        if not t.is_alive():
+            return
+        timed_out["v"] = True
+        found = []
+
+        def _enum(hwnd, _):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == title and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        for hwnd in found:
+            btn = user32.GetDlgItem(hwnd, IDNO)
+            if btn:
+                BM_CLICK = 0x00F5
+                user32.SendMessageW(btn, BM_CLICK, 0, 0)
+        t.join(5)
+        if t.is_alive():
+            for hwnd in found:
+                WM_COMMAND = 0x0111
+                user32.PostMessageW(hwnd, WM_COMMAND, IDNO, 0)
+            t.join(3)
+
+    wd = threading.Thread(target=_watchdog, daemon=True)
+    wd.start()
+    t.join(timeout + 10)
+
+    rid = result["id"]
+    if rid == IDYES:
+        return True, "人点了允许"
+    if timed_out["v"]:
+        return False, f"超时未点({int(timeout)}s)"
+    if rid == IDNO:
+        return False, "人点了拒绝"
+    return False, "弹窗失败/无 GUI"
+
+
 def ask(device: str, lines: list, *, kind: str = "screen-send", timeout: int = DEFAULT_TIMEOUT) -> bool:
     """弹原生弹窗问人。返回 True 仅当人点了「允许」。"""
     lines = [str(x) for x in (lines or [])]
@@ -208,6 +287,12 @@ def ask(device: str, lines: list, *, kind: str = "screen-send", timeout: int = D
         return w
 
     msg = _message(device, lines, kind)
+    if host.IS_WIN:
+        t0 = time.time()
+        ok, why = _ask_win_dialog(msg, "netdev 写操作审批（人审）", int(timeout))
+        _audit(device, lines, "ALLOW" if ok else "DENY", time.time() - t0,
+               "dialog" if ok else f"dialog:{why}")
+        return ok
     short = msg.split("\n")[0]
     script = (
         'set msg to ' + json.dumps(msg, ensure_ascii=False) + "\n"

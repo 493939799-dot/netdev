@@ -37,6 +37,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from lib import host  # noqa: E402
 
 PORT = 8899                      # 刻意避开线上 8898
 HOST = "127.0.0.1"
@@ -50,6 +51,11 @@ def check(name: str, cond: bool, detail: str = ""):
     print(f"  {'OK ' if cond else 'NG '} {name}" + (f"  -- {detail}" if detail and not cond else ""))
 
 
+def _venv_py() -> str:
+    cand = ROOT / (".venv/Scripts/python.exe" if host.IS_WIN else ".venv/bin/python")
+    return str(cand) if cand.exists() else sys.executable
+
+
 def _port_open(port: int = PORT) -> bool:
     import socket
     with socket.socket() as s:
@@ -58,11 +64,7 @@ def _port_open(port: int = PORT) -> bool:
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return host.pid_alive(pid)
 
 
 def _health(port: int = PORT) -> dict | None:
@@ -97,7 +99,7 @@ def test_daemonize(tmp: pathlib.Path):
     print("\n一、daemonize 守护语义（起 → 健康 → 幂等 → 真脱离 → 停）")
     pidf, logf = tmp / "ui.pid", tmp / "ui.log"
     daemon = ROOT / "ui" / "daemonize.py"
-    py = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
+    py = _venv_py()
 
     def run(*args):
         # 2026-10-03：显式给足等待，不依赖默认值。
@@ -105,10 +107,14 @@ def test_daemonize(tmp: pathlib.Path):
         # subprocess 自己的 timeout，否则还没等服务起来就被测试先掐死。
         # GitHub 的 macOS ARM runner 冷启动实测要 30 秒以上（本机 <1.2s）。
         env = dict(os.environ)
+        # 与安装版入口（netdev.cmd 设 PYTHONUTF8=1）保持一致：
+        # 父进程按 UTF-8 解码、子进程按 UTF-8 输出，成对出现才不会互相误解码。
+        env["PYTHONUTF8"] = "1"
         env["NETDEV_UI_START_TIMEOUT"] = os.environ.get("NETDEV_UI_START_TIMEOUT", "150")
         p = subprocess.run([py, str(daemon), "--port", str(PORT), "--host", HOST,
                             "--pidfile", str(pidf), "--logfile", str(logf), *args],
-                           capture_output=True, text=True, timeout=240, env=env)
+                           capture_output=True, text=True, timeout=240, env=env,
+                           encoding="utf-8", errors="replace")
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
 
     try:
@@ -120,21 +126,31 @@ def test_daemonize(tmp: pathlib.Path):
         check("start 返回 0", rc == 0, out[-300:])
         check("端口已监听", _wait(_port_open), out[-300:])
         check("PID 文件已写入", pidf.exists())
-        pid = int(pidf.read_text().strip()) if pidf.exists() else 0
+        pid = int(pidf.read_text(encoding="utf-8").strip()) if pidf.exists() else 0
         check("进程存活", _alive(pid), f"pid={pid}")
         check("健康检查 200", _health() is not None, "GET /api/health")
-        check("日志有启动横幅", logf.exists() and "netdev-ui 已启动" in logf.read_text(errors="replace"))
+        # ★ 显式 UTF-8：日志由 ui/daemonize.py 以 encoding="utf-8" 写入，
+        #   这里若用平台默认编码（中文 Windows 是 cp936）读会变乱码，
+        #   断言「netdev-ui 已启动」必然失败。
+        check("日志有启动横幅",
+              logf.exists() and "netdev-ui 已启动" in logf.read_text(encoding="utf-8", errors="replace"))
 
         # ── 真脱离：这是「关终端就死」的根因判据 ──────────────────────
-        # double-fork + setsid 之后，服务与调用方**不在同一进程组**。
-        # nohup & 做不到这一点（它留在原进程组，父会话结束就被连坐）。
-        same_pg = os.getpgid(pid) == os.getpgid(os.getpid())
-        check("已脱离调用方进程组（关终端不掉）", not same_pg,
-              f"服务 pgid={os.getpgid(pid)} 调用方 pgid={os.getpgid(os.getpid())}")
+        if host.IS_WIN:
+            # Win 无 getpgid：daemonize 用 CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW
+            # 启动（★ 不再带 DETACHED_PROCESS——venv 转发器 + DETACHED 会给
+            # base python 弹可见控制台），启动器退出而服务仍存活 = 已脱离。
+            check("已脱离调用方会话（关终端不掉）", _alive(pid),
+                  "CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW，启动器已退出")
+        else:
+            # double-fork + setsid 之后，服务与调用方**不在同一进程组**。
+            same_pg = os.getpgid(pid) == os.getpgid(os.getpid())
+            check("已脱离调用方进程组（关终端不掉）", not same_pg,
+                  f"服务 pgid={os.getpgid(pid)} 调用方 pgid={os.getpgid(os.getpid())}")
 
         # ── 幂等：已经在跑就别重复起 ──────────────────────────────────
         rc2, out2 = run()
-        pid2 = int(pidf.read_text().strip())
+        pid2 = int(pidf.read_text(encoding="utf-8").strip())
         check("重复 start 返回 0", rc2 == 0, out2[-300:])
         check("重复 start 被识别为已在跑", "已在监听" in out2 or "已在后台运行" in out2, out2[-300:])
         check("重复 start 没有换进程（PID 不变）", pid2 == pid, f"{pid} -> {pid2}")
@@ -160,6 +176,7 @@ def test_cli(tmp: pathlib.Path):
     pidf, logf = tmp / "cli.pid", tmp / "cli.log"
     env = dict(os.environ)
     env.update({
+        "PYTHONUTF8": "1",          # 同上：与 netdev.cmd 的入口行为对齐
         "NETDEV_UI_PORT": str(PORT),
         "NETDEV_UI_HOST": HOST,
         "NETDEV_UI_PIDFILE": str(pidf),
@@ -167,11 +184,12 @@ def test_cli(tmp: pathlib.Path):
         # 同上：等待上限必须小于 subprocess 的 timeout
         "NETDEV_UI_START_TIMEOUT": os.environ.get("NETDEV_UI_START_TIMEOUT", "150"),
     })
-    py = str(ROOT / ".venv/bin/python") if (ROOT / ".venv/bin/python").exists() else sys.executable
+    py = _venv_py()
 
     def ui(*args):
         p = subprocess.run([py, str(ROOT / "netdev_cli.py"), "ui", *args],
-                           capture_output=True, text=True, timeout=240, env=env)
+                           capture_output=True, text=True, timeout=240, env=env,
+                           encoding="utf-8", errors="replace")
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
 
     try:
@@ -198,9 +216,12 @@ def test_cli(tmp: pathlib.Path):
         # 真脱离也要在 CLI 路径上成立（CLI → daemonize，链路一致）
         ui()
         _wait(lambda: _health() is not None)
-        pid = int(pidf.read_text().strip())
-        check("CLI 起的实例同样脱离进程组",
-              not (os.getpgid(pid) == os.getpgid(os.getpid())), f"pid={pid}")
+        pid = int(pidf.read_text(encoding="utf-8").strip())
+        if host.IS_WIN:
+            check("CLI 起的实例同样脱离会话", _alive(pid), f"pid={pid}")
+        else:
+            check("CLI 起的实例同样脱离进程组",
+                  not (os.getpgid(pid) == os.getpgid(os.getpid())), f"pid={pid}")
     finally:
         ui("stop")
 

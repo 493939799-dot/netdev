@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 # 路径统一由 lib/paths.py 解析（2026-10-03 新增）。
 # 原来这里写死 `home() / "netops"`，装到别处就读不到设备清单 —— 全新克隆必挂。
+from . import host
 from . import paths as _paths
 
 ROOT = _paths.ROOT
@@ -127,9 +128,25 @@ class SerialSession:
         if port == "auto" or not port:
             port = discover_serial_port()
         if not port:
-            raise RuntimeError("未找到可用串口设备（/dev/cu.usbserial-* 等）")
+            raise RuntimeError("未找到可用串口设备（Windows 看设备管理器里的 COM 口；"
+                               "macOS 看 /dev/cu.usbserial-*）")
         self.port = port
-        self.ser = serial.Serial(port, int(dev.get("baud", 9600)),
+        # 波特率：清单写 auto/空 时先解析成实际值（缓存优先，没缓存现场探一次）。
+        # 2026-10-06 修：原来直接 int(dev.get("baud", 9600)) —— 写 "auto" 会 int() 抛错，
+        # 缺省 9600 又会让真机 115200 静默按 9600 起（表现为「串口无任何回显」）。
+        _baud = dev.get("baud")
+        if str(_baud).strip().lower() in ("", "auto", "none"):
+            _baud = serial_baud_cache_get(port)
+            if not _baud:
+                try:
+                    _baud, _ = probe_serial_baud(port)
+                except Exception:
+                    _baud = None
+            if not _baud:
+                _baud = 115200
+            self.dev = dict(dev)
+            self.dev["baud"] = int(_baud)
+        self.ser = serial.Serial(port, int(_baud),
                                  bytesize=8, parity="N", stopbits=1,
                                  timeout=0.2, write_timeout=3)
         # settle：收完数据后静默多久算"结束"。串口设备吐字有停顿，
@@ -605,13 +622,15 @@ def guard_serial_exclusive(dev: dict) -> None:
             pass
 
     if name and _tmux_holds_serial(name):
+        _how = ("先在网页界面断开该同屏会话（netdev ui → 会话管理）"
+                if host.IS_WIN else "先退出桥（tmux attach -t netops，按 Ctrl+]）")
         raise RuntimeError(
             f"✘ {name} 正在人机同屏会话中（netops:{name}），串口被桥占着。\n"
             f"   直连会与桥抢字节，导致桥崩溃 —— 这就是「串口莫名断开」的根因。\n"
             f"   正确做法：\n"
             f"     ① 走同屏会话（推荐）：netdev screen-send {name} \"display ...\"\n"
             f"     ② 读屏：netdev screen-read {name}\n"
-            f"     ③ 确实要直连：先退出桥（tmux attach -t netops，按 Ctrl+]）"
+            f"     ③ 确实要直连：{_how}"
         )
 
 
@@ -680,6 +699,26 @@ def connect(dev: dict, password: str | None = None, session_log: str | None = No
 
 
 def discover_serial_port():
+    """自动发现一个可用串口，返回设备名；没有则 None。
+
+    跨平台：Windows 走 pyserial 枚举 COM 口，POSIX 走 /dev/cu.* 通配。
+    （2026-10-06 补 Windows 分支：原来只 glob /dev/cu.*，Windows 上恒为 None，
+      于是 devices.toml 里写 `port = "auto"` 的串口设备——含
+      `netdev device-add serial --auto` 生成的——一接入就报
+      「未找到可用串口设备」，而机器上明明插着 COM3。）
+    """
+    if host.IS_WIN:
+        ports = host.serial_ports()
+        if not ports:
+            return None
+        # 优先挑 USB 转串口（设备 Console 基本都走 USB 适配器）；
+        # 主板自带的 COM1 往往是调试口，排后面。
+        _usb = ("usb", "serial", "ch340", "cp210", "ftdi", "prolific", "silicon")
+        def _rank(it):
+            dev_name, desc = it
+            d = (desc or "").lower()
+            return (0 if any(k in d for k in _usb) else 1, dev_name)
+        return sorted(ports, key=_rank)[0][0]
     import glob
     pats = ["/dev/cu.usbserial*", "/dev/cu.usbmodem*", "/dev/cu.SLAB_USBtoUART*",
             "/dev/cu.wchusbserial*", "/dev/tty.usbserial*"]
@@ -786,6 +825,24 @@ def serial_baud_cache_put(port, baud):
         f.write_text(_json.dumps(data, ensure_ascii=False, indent=1) + "\n")
     except Exception:
         pass
+
+
+def serial_display(dev: dict):
+    """串口设备给人看的 (端口, 波特率)：清单里写 auto 时尽量解析成实际值。
+
+    为什么需要（2026-10-06 修）
+        `port = "auto"` / `baud = "auto"` 是设计允许的（USB 转串口换口后不必改清单），
+        但 `netdev list` 与网页端原来把清单原值直接显示成「串口 auto @9600」——
+        真机上设备明明在 COM3 @115200，用户看到会以为没认到设备。
+        这里解析成实际端口/波特率；解析不到再退回 auto（不编造）。
+    """
+    port = str(dev.get("port") or "").strip()
+    if port.lower() in ("", "auto"):
+        port = discover_serial_port() or "auto"
+    baud = dev.get("baud")
+    if str(baud).strip().lower() in ("", "auto", "none"):
+        baud = serial_baud_cache_get(port) or "auto"
+    return port, baud
 
 
 def probe_serial_baud_wake(port, candidates=(115200, 9600, 38400, 57600, 19200), timeout=0.9):

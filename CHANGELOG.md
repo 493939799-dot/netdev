@@ -8,166 +8,459 @@
 
 ---
 
-## [未发布]
+## [1.0.18] - 2026-10-07
 
-## [1.0.6] - 2026-10-06
+### 修复：SSH / Telnet 通道「输入很卡」——节拍未与串口对齐（`tools/ssh_bridge.py`、`tools/telnet_bridge.py`）
 
-### 界面整体换肤为 TRAE 风格 + 交互打磨（v2→v19）
+- **背景**：v1.0.17 把「输入很卡」按串口通道（`serial_bridge.py`）修了，
+  但**同款问题在 SSH / Telnet 桥里一模一样存在**——三种接入方式共用同一套
+  Windows 主循环写法（队列轮询 + 无条件 `sleep(0.2)`），串口改了，另两条没改，
+  用户接 SSH/Telnet 设备时手感依旧发黏。属于"只修了一条腿"。
+- **真因**：`ssh_bridge.py` / `telnet_bridge.py` 的 Windows 主循环节拍仍是 `0.2s` ——
+  每 200ms 才排空一次输入队列 / `recv` 一次设备 socket，键击下发与回显
+  最多各等 0.2s（平均 ~100ms）。POSIX 版用 `select(timeout=0.2)`，有数据立刻醒，
+  所以这个固定延迟同样只在 Windows 出现。
+- **修复**：两条桥的节拍统一降到 `0.01s`，与串口通道完全对齐。
+- **实测（本机模拟器，端到端回显延迟）**：
 
-**主题/视觉**
-- 按设计交接包（DESIGN_SPEC + reference 基准页面）逐组件对齐：品牌标识、
-  设备竖卡、chip、AI 输入条、快照按钮组、点阵眼形背景（新 `ui/static/dotmatrix.js`，
-  生成脚本 `tools/gen_backdrop.py`）。
-- 「透但锐利」玻璃面板：`--panel-glass: rgba(17,17,17,.86)` 且 **backdrop-filter 关闭**
-  （磨砂感的唯一来源就是 blur）；CRT 扫描线整体移除（元素/CSS/动画/设置项）。
+  | 通道 | 修复前 median | 修复后 median | 降幅 |
+  |---|---|---|---|
+  | 串口 | 150ms | 8.7ms | ~94% |
+  | Telnet | 281.1ms | 4.8ms | ~98% |
+  | SSH | 281ms | 34.4ms | ~88% |
+
+  （SSH 因加密/握手往返，绝对值高于 Telnet，但相对自身降幅一致。）
+- **CPU 复核**：10ms 节拍下桥进程空闲占用 **0.00%**（非忙等空转，靠阻塞 `recv`
+  与 `sleep` 让出 CPU）。
+
+### 修复：`ssh_bridge.py` / `telnet_bridge.py` 误带 UTF-8 BOM，触发全仓编译守门失败
+
+- **现象**：`test_ai_toolchain_and_cache` 的「仓内 49 个 .py 全部可编译」项报
+  `SyntaxError: invalid non-printable character U+FEFF`。
+- **真因**：两条桥文件在编辑中被写入了 UTF-8 BOM（`EF BB BF`）。`py_compile`
+  会剥 BOM 所以看不出来，但测试用 `compile(path.read_text(encoding="utf-8"))`
+  ——BOM 作为 `U+FEFF` 字符进到源码里就成了非法字符。
+- **修复**：剥离两条桥（仓库 + 安装副本）的 BOM，与 `serial_bridge.py` 等保持一致
+  （`.py` 一律不带 BOM）。
+
+### 验证
+- 回归全绿（13 套件 / 413+ 断言）：`test_pane_strip_ansi` 12/12、`test_monitor` 90/90、
+  `test_ui_js_syntax` 10/10、`test_ui_lifecycle` 27/27、`test_ai_toolchain_and_cache` 136/136、
+  `test_ai_turn_context` 14/14、`test_host` 12/12、`test_colorize` 21/21、`test_mock_cmd` 21/21、
+  `test_ai_session_log` 26/26、`test_mcp_hotreload` 通过、`test_approval_gates` 18/18、
+  `test_run_partial_and_mock_detail` 26/26。
+- 三通道节拍一致性：`serial_bridge` / `ssh_bridge` / `telnet_bridge` 均 `_TICK = 0.01`。
+- `/api/health` → `{"ok": true, "tmux": false, "sessions": 1, "version": "1.0.18"}`。
+
+## [1.0.17] - 2026-10-07
+
+### 修复：网页终端「输入很卡」（回显固定延迟 + 每次按键新建连接）
+
+**A. 串口桥主循环节拍 200ms → 10ms（`tools/serial_bridge.py`）**
+- **现象**：在网页终端里敲键、回车，回显要"顿"一下才出来，手感发黏。
+- **真因**：Windows 版主循环是 `in_waiting` 轮询 + **无条件 `sleep(0.2)`** ——
+  每 200ms 才看一次串口，设备回显（你敲的字符、回车后的提示符）最多要等
+  0.2s 才被读走转发到网页，平均 ~100ms。POSIX 版用 `select(timeout=0.2)`，
+  有数据立刻醒，所以只有 Windows 有这个固定延迟。
+- **修复**：节拍降到 10ms（Python 3.11+ 在 Windows 用高精度定时器，10ms 是准的）；
+  原来"每轮都做"的孤儿判定（`OpenProcess`）降到每秒一次，避免空转开销。
+
+**B. 控制口每请求新建 TCP 连接 → 每设备复用长连接 + 关 Nagle（`lib/pane.py`）**
+- **真因**：`send_literal` / `send_key` / `bridge_alive` 每次调用都 `control()` ——
+  新建 TCP 连接 + 一次 `alive` 往返，用完即关。Windows 上"新建连接 + 首个往返"
+  约一半会撞上 10~26ms 的延迟尖峰（实测新建 p50 1.4ms / 27-of-60 >10ms / 峰值 25.7ms）。
+- **修复**：每台设备缓存一条长连接（`_Link`），请求在锁内串行化，连接失效
+  （守护重启/被杀）自动重连一次；`Control` 建连即置 `TCP_NODELAY`（关 Nagle，
+  避免与延迟 ACK 撞出 10~40ms 偶发停顿）。事件流（subscribe）仍走独占连接，不受影响。
+- **实测**：复用长连接 p50 **0.18ms**（0-of-60 >10ms），对比新建连接 p50 1.4ms。
+
+### 修复：`netdev ui restart` / `stop` 崩溃（`AttributeError: 'NoneType'`）
+
+- **现象**：`netdev ui restart` 报 `AttributeError: 'NoneType' object has no attribute
+  'splitlines'`（`_ui_kill_orphan`），服务没能重启。
+- **真因**：`_ui_kill_orphan` 用 `netstat -ano -p TCP` 找占端口的进程。**带控制台**
+  运行时 netstat 输出英文 `Active Connections`；**无控制台**（`CREATE_NO_WINDOW`，
+  正是本 CLI 的常态）时它按系统代码页输出**中文** `活动连接`（GBK）。而本 CLI 入口设了
+  `PYTHONUTF8=1`，`text=True` 于是按 UTF-8 解码 → 读线程抛 `UnicodeDecodeError`
+  （`byte 0xbb in position 2`）→ `subprocess.run` 的 `stdout` 变成 `None` → `.splitlines()` 崩。
+- **修复**：`netdev_cli.py` 新增 `_SYS_TEXT`（Windows：`encoding="mbcs", errors="replace"`），
+  统一用于读系统命令输出（`netstat` / 两处 `powershell`），并对 `out` 补空值兜底；
+  `_ui_daemon` 读自家 Python 子进程输出补 `errors="replace"`。
+- **连带修复**：接入串口设备前的孤儿桥清理 `_cleanup_windows_stale_serial_bridges`
+  也是同一模式（PowerShell 输出含中文路径的 GBK 字节）—— 修复前读线程崩溃、输出被静默吞成空，
+  **孤儿桥永远清不掉**（下一次接入报 `PermissionError 13`）。
+
+### 验证
+- netstat 解码：无控制台时 `活动连接` 正确解出，`LISTENING` 行正常解析（18 行）。
+- 孤儿清理路径复现：删 PID 文件后 `ui restart` → `已停掉占用 8898 的旧进程 PID 15296` → `✔ 已启动`（无崩溃）。
+- 回归：`test_ui_js_syntax` 10/10、`test_ui_lifecycle` 27/27、`test_monitor` 90/90、`test_ai_toolchain_and_cache` 136/136 全绿。
+- `/api/health` → `{"ok": true, "tmux": false, "sessions": 0, "version": "1.0.17"}`。
+
+## [1.0.16] - 2026-10-07
+
+### 修复：网页终端「卡住」——同一设备堆会话 + 开终端屏空白
+
+**A. 同一设备堆出多个终端会话（会话泄漏）**
+- **现象**：终端屏上是一整屏 `<AR111-S>` 提示符、反复的
+  `Error: Unrecognized command found at '^' position`，输入像没反应。
+- **真因**：前端有【三处】调 `/api/term/open`，其中连接簿「接入」和向导兜底
+  两处**直接调接口** —— 不关旧 SID、也不更新 `SID`/`EventSource`，于是后端开了新会话
+  而前端面板还挂在旧会话上（"点了没反应"），旧会话永不关闭；`openTerm` 里
+  「先关旧 SID」又写在 `await` 之前，并发时全部通过。实测同一秒开 4 个会话、
+  内存积到 7 个。而每次 `term/open` 都会往设备敲 **3 次回车**唤醒提示符 ——
+  会话越多，屏上提示符越多，看着就越像"卡死"。
+- **修复**：`ui/server.py` 新增 `drop_term_sessions()`，`/api/term/open` 开新会话前
+  按设备收掉旧会话（并给其订阅者推哨兵，前端显示「[会话已结束]」而不是无声冻结）；
+  `cleanup_term_sessions()` 的 Windows 分支补上"收活跃残留"；
+  前端两处改走 `openTerm()`，`openTerm` 增加并发去重。
+
+**B. 订阅时整屏快照（tail）被当成应答吞掉 → 打开终端是空屏**
+- **真因**：客户端 `pane.subscribe()` 用 `Control.request()` 收应答，而它**只读一行**；
+  守护端 `pane_daemon.py` 的 `subscribe` 却先发 `{"event":"data", tail}`、再发
+  `{"ok":true}` —— tail 那一行被当成应答丢弃。于是订阅瞬间整屏历史就没了，
+  只有之后的新输出才出现；设备空闲时屏上永远空白。
+- **修复**：守护端改为**先回 `{"ok":true}` 再发 tail**。
+
+### 验证
+- `pane.subscribe(include_tail=True)` 订阅即拿到整屏（快照 301 字节；修复前为 0）。
+- `/api/term/stream` 首个事件即为 `event: snap` 且带数据（修复前 12 秒零事件）。
+- 同一设备连开两次：`SESSIONS` 只剩 1 个，日志有「去重：huawei 收掉旧会话 1 个」。
+- 输入往返：`display clock` 正常回显；重连后设备屏干净（桥横幅 + 串口自检 + 提示符，无乱码墙）。
+- 回归：`test_ui_js_syntax` 10/10、`test_ui_lifecycle` 27/27、`test_monitor` 90/90、`test_ai_toolchain_and_cache` 136/136 全绿。
+- `/api/health` → `{"ok": true, "tmux": false, "sessions": 1, "version": "1.0.16"}`。
+
+## [1.0.15] - 2026-10-07
+
+### 修复：三个「一个装饰符号搞挂正事」的编码崩溃 + 开机自启状态自相矛盾
+
+**A. 输出编码兜底（netdev_cli.py / ui/server.py）**
+- **现象**：中文 Windows 上，stdout 若不是控制台（被重定向成管道 / 日志文件），
+  Python 用本地编码（GBK）。CLI 到处打印 `✔ / ✘`，服务启动横幅打印 `▮`（U+25AE）
+  —— 编不进 GBK 就抛 `UnicodeEncodeError`。CLI 那条以退出码 1 失败（用户实测
+  「点『启动 / 重启服务』报 服务未能启动」）；**服务那条更致命**：横幅打印发生在
+  `srv.serve_forever()` **之前**，一崩整个服务就起不来（日志只剩 traceback，端口没监听）。
+- **修复**：两处都在模块加载时把 `stdout/stderr` 的 `errors` 改成 `replace` ——
+  编码得出的照常（中文不乱），编不出的降级为 `?`，绝不因为一个装饰符号让命令 / 服务失败。
+- **真因提示**：这不是「显示不好看」，是「功能被装饰性字符拖垮」；
+  `UnicodeEncodeError` 离真因（输出目标不是控制台）很远。
+
+**B. 子进程 stdio 钉成 UTF-8（ui/daemonize.py）**
+- **为什么**：日志文件虽按 UTF-8 打开，但子进程 Python **不看父进程的打开方式** ——
+  它按 Windows 本地编码（GBK）解释自己的 stdout。daemonize 拉起服务时显式给子进程设
+  `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`，日志里的中文与横幅才是可读 UTF-8。
+
+**C. 工具台启动器补编码环境并重编译（LauncherStub.cs → netdev-toolbox.exe）**
+- 启动器直接拉 venv 的 `python.exe`（不走 netdev.cmd），子进程 stdio 默认 GBK；
+  给子进程显式设同款两个变量，与 `netdev.cmd` 行为一致。
+- **注意**：源码改了但 exe 是旧编译 —— 本轮一并**重编译**，确认二进制里含该字符串。
+
+**D. 开机自启状态口径统一（netdev_cli.py）**
+- **现象**：工具台显示「已启用」，`netdev ui status` 却说「未装」—— 同一件事两个答案。
+- **真因**：`ui status` 的 `_ui_status_lines()` 只查 macOS LaunchAgent（`UI_PLIST`），
+  没做 Windows 分支；而 `doctor` 与启动器查的是 Windows Startup 快捷方式。
+- **修复**：抽出 `_win_startup_lnk()` / `_win_autostart_state()`，`doctor` 与 `ui status`
+  共用；`ui install / uninstall` 补 Windows 分支（建 / 删 Startup 快捷方式，pythonw 隐藏启动）。
+
+### 验证
+- 强制 GBK + 管道跑 `ui status`：退出码 0，`✔` 降级为 `?`（不再抛异常）。
+- 强制 GBK 起服务（8899）：HTTP 200，无 traceback；重启后日志横幅为干净 UTF-8。
+- `ui status` / `doctor` / 工具台三处一致：已装（Startup 快捷方式）/ 已启用。
+- 回归：`test_ui_lifecycle` 27/27、`test_monitor` 90/90、`test_ai_toolchain_and_cache` 136/136 等全绿。
+
+## [1.0.14] - 2026-10-07
+
+### 产品化：像正常 exe 应用一样安装与使用（本轮由「要开源」驱动）
+
+**A. 新增「netdev 工具台」图形启动器（netdev-toolbox.exe）**
+- **为什么**：命令行用户敲 `netdev ui` 没问题，但普通用户双击 `.cmd` 会弹黑窗、
+  看到一屏报错会以为装坏了。开源后第一印象尤其重要。
+- **是什么**：WinForms 单窗口、`/target:winexe` 全程无控制台。每 3 秒自检一次服务
+  （TCP + `/api/health` 双重确认，不看 PID 文件），显示「服务运行中 / 未运行」、
+  地址、PID、版本、开机自启状态；提供「打开网页界面 / 启动·重启服务 / 一键修复 /
+  刷新状态 / 查看日志 / 打开安装目录」六个按钮。
+
+**B. 「一键修复」入口（集成进启动器 + 独立快捷方式）**
+- 启动器上的「一键修复」按钮直接调用随包安装的 `一键体检.ps1 -Fix`，复用同一套
+  修复逻辑（补齐配置、清占端口僵尸进程、重启服务、补依赖、重建自启）。
+- 另外在开始菜单放了独立的「一键修复」快捷方式：即使启动器本身起不来，
+  也能双击它体检并修复。
+
+**C. 图形安装向导（netdev-install.exe 由控制台改为 WinForms）**
+- **为什么**：原版安装器是控制台 exe，双击弹黑窗、中文可能乱码。
+- **是什么**：可选安装目录、可勾选「开机自启 / 装完打开界面」；实时把 install.ps1
+  的输出滚进日志框，并按「N/8」步骤推进进度条；结束时给出明确结论。子 PowerShell
+  的输出编码被强制为 UTF-8，日志不再乱码。
+
+**D. 开始菜单 / 桌面快捷方式 + 应用图标**
+- 安装时创建「netdev 网络设备工具台」开始菜单分组（工具台 + 一键修复）与桌面快捷方式，
+  指向无控制台的 `netdev-toolbox.exe`；「设置 → 应用」的 DisplayIcon 也改用启动器图标。
+- 图标为多尺寸 `netdev.ico`（16~256），网页 favicon 同步更新；卸载时一并清除快捷方式。
+
+**E. 随包分发**
+- `一键体检.ps1`、`一键体检.cmd`、`netdev-toolbox.exe`、`netdev.ico` 随安装包分发，
+  `install.ps1` 第 2b 步装进安装目录；`build_bundle.ps1` 会先编译图形程序再打包。
+  （「一键修复」入口 = 开始菜单快捷方式指向 `一键体检.cmd -Fix`：`.cmd` 内容是纯 ASCII，
+  用 `%~n0.ps1` 定位同名脚本，避免 cmd.exe 按 OEM 代码页解析中文路径时乱码。）
+
+**F. 开源仓文档同步**
+- README（中 / 英）补上 Windows 章节：图形安装向导与「netdev 工具台」截图、
+  开机自启与「一键修复」说明、平台 / 依赖对照表；徽章改为 macOS · Windows，
+  目录结构补 `netdev.cmd` 与 `dist/installer/`。
+- `.gitignore` 排除 Windows 图形程序编译产物（`dist/installer/*.exe`）；
+  图标 `netdev.ico` 是资产（exe 图标 + 网页 favicon 来源），保留进仓。
+
+## [1.0.13] - 2026-10-07
+
+### 接入时仍弹终端窗口 + 已接入设备不出现在「设备」栏（本轮由用户实测驱动）
+
+**A. 接入设备时仍会弹出一个终端窗口（已修，补上 v1.0.11 的漏网路径）**
+- **真因**：`.venv\Scripts\python.exe` 是「转发器」——真正跑代码的是它再拉起的
+  base python（`%LOCALAPPDATA%\Programs\Python\Python3xx\python.exe`）。
+  v1.0.11 给子进程加的 `CREATE_NO_WINDOW` 挡得住普通进程，却挡不住**带
+  `DETACHED_PROCESS`** 的 venv 转发器：5 组组合实测（`cons_test`）显示
+  `DETACHED_PROCESS` 会让转发器给 base python 新建一个**可见**控制台，
+  `CREATE_NO_WINDOW` 被吞掉。而拉起「同屏会话守护 / 网页服务」这两处恰好都用了
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` ⇒ 每次接入都弹窗。
+- **修法**：这两处去掉 `DETACHED_PROCESS`，只留
+  `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`（`lib/pane.py::start_daemon`、
+  `ui/daemonize.py::_start_win`）。「脱离终端、关终端不掉」不受影响——Windows
+  本就不连坐子进程（实证：桥进程正是在守护死后继续活着的），回归测试
+  `test_ui_lifecycle` 的「已脱离调用方会话」一项继续通过。
+
+**B. 设备明明接入了，却不出现在左侧「设备」栏（已修）**
+- **真因**：桥（serial_bridge）**独占串口**。守护被强杀/崩溃后，它拉起的桥会脱管
+  继续跑、继续握着 COMx；下一次接入时新桥 `serial.Serial(...)` 直接
+  `PermissionError(13, 拒绝访问)` 秒退 ⇒ 守护还活着但 `alive=false` ⇒
+  `/api/devices` 的 `window_live=false` ⇒ 界面按「只显示已接入」把它整条过滤掉。
+  （`live/huawei.pane.log` 里就是一串 PermissionError 13；`state/panes/huawei.json`
+  指向新守护，真正干活的是上一代守护遗留的孤儿桥。）
+- **修法**（三层）：
+  1. `lib/pane.py::ensure()` 在「桥死了要原地重开」和「守护不在要新拉」两条路径上，
+     先 `_kill_stale_bridges(name)` 清掉本设备的孤儿桥（命令行含本设备专有的
+     `live\<name>.screen.log`、且父链上没有活守护的桥进程 → `taskkill /T /F`），
+     释放串口后再起新桥。
+  2. `kill()` 加固：守护不应答时不再「只删注册表就返回」，改为强杀整棵进程树 +
+     清孤儿桥；优雅 kill 后若守护仍活着也兜底强杀。
+  3. 结构性防复发：`tools/pane_daemon.py` 把桥放进一个
+     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job 对象——守护一死句柄关闭，
+     桥（连同其子进程）被系统连坐杀掉，从此不会再留孤儿桥。
+- 踩坑记录：清理逻辑第一版用 `subprocess.run(..., text=True)` 取进程表，进程命令行里的
+  中文触发 `UnicodeDecodeError` 被 `except` 吞掉 → 空表 → 静默不清理。改为
+  「按字节收 + `errors='replace'` 解码」并让 PowerShell 以 UTF-8 输出。
+
+**C. 同步**
+- `tests/test_ui_lifecycle.py` 中关于 `DETACHED_PROCESS` 的说明随实现更新。
+
+## [1.0.12] - 2026-10-07
+
+### 补齐「卸载入口」与「开机自启」两处交付缺口（本轮由用户实测驱动）
+
+**A. 「设置 → 应用」/「控制面板 → 程序和功能」里看不到 netdev，无从卸载（已修）**
+- **真因**：安装器只写了用户 PATH 和启动目录，**从未写过 Uninstall 注册表项**。
+  「程序和功能」那张列表就是照注册表列出来的 —— 没写，自然没有条目，
+  用户只能自己翻安装目录找 `uninstall.ps1`。
+- **修法**：`install.ps1` 安装时写
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\netdev`
+  （`DisplayName` / `DisplayVersion` / `Publisher` / `InstallLocation` / `DisplayIcon` /
+  `InstallDate` / `EstimatedSize` / `UninstallString` / `QuietUninstallString` /
+  `NoModify` / `NoRepair`）。本机是**免管理员**安装（写不了 HKLM），故用 HKCU ——
+  Win10/11 的「应用和功能」会按用户列出 HKCU 项。
+  `uninstall.ps1` 新增第 3 步对称清除该键，卸载后不留死条目。
+
+**B. 每次开机不会自动启动 / 登录时闪一个黑色控制台窗口（已修）**
+- **真因**：开机自启是一个指向 `netdev.cmd` 的 Startup 快捷方式。`netdev.cmd` 是**批处理**，
+  登录时由 `cmd.exe` 执行 ⇒ 必然闪一个控制台窗口（即用户看到的「调出终端页面」）；
+  而一旦启动失败，报错只打在那一闪而过的窗口里，`ui-service.log` **一行都不留** ——
+  失败完全静默，用户只能得出「它没自启」的结论。
+- **修法**：快捷方式改为直接指向 `.venv\Scripts\pythonw.exe`，参数
+  `"<prefix>\netdev_cli.py" ui`。`pythonw.exe` **无控制台**：登录不再闪窗；
+  真正的服务进程仍由 `daemonize.py` 以
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` 起，行为不变。
+  启动是否成功以 `logs\ui-service.log` 的时间戳为准（可对着开机时间核）。
+- 同源修复：`一键体检.ps1` 第 9 项现在会**区分**「已装但指向旧控制台入口」，
+  并可用 `-Fix` 重建为隐藏启动。
+
+**C. 本机为非管理员账户：安装器不能建计划任务**
+- 实测 `Register-ScheduledTask` 与 `schtasks /create /sc onlogon` 均返回 `Access is denied`，
+  HKLM 亦不可写。故自启只能走 Startup 目录 + HKCU 卸载入口；
+  若确需「无论是否登录都运行」的计划任务，须以管理员身份另行安装。
+
+## [1.0.11] - 2026-10-06
+
+### 接入设备时不再弹黑框终端；AI 会话自动跟随设备（本轮由用户实测驱动）
+
+**A. 接入设备 / AI 执行命令时会莫名弹出黑色控制台窗口（已修）**
+- **真因**：网页服务由 `ui/daemonize.py` 以 `DETACHED_PROCESS` 拉起（自身**没有**控制台）。
+  Windows 下从一个没有控制台的进程再拉起 `python.exe` / `powershell` 这类**控制台程序**时，
+  系统会给它**新建一个控制台窗口** —— 界面上就闪出一个黑框终端（用户实测：接入设备、
+  AI 执行命令时都弹，很影响观感）。
+- **修法**：网页服务**直接**拉起的子进程统一加 `CREATE_NO_WINDOW`
+  （`_NO_WINDOW` 常量，POSIX 下为 0、等于默认无影响）——
+  涉及 `ui/server.py`（`netdev_*` 调用 / `screen-send` / `shell --restart`）、
+  `netdev_cli.py`（`powershell` 探测、模拟器直起等）、`netdev_mcp.py`（工具调用）。
+- **为何只改这一层就够**：子进程一旦带了（隐藏的）控制台，它再往下拉的子进程会**继承**
+  该控制台，不会各自新开窗口。所以只需覆盖「网页服务的直接子进程」即可全链路无窗口。
+- 同屏守护与桥（`lib/pane.py`、`tools/pane_daemon.py`）本就用
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`，保持不变。
+
+**B. 接入新设备后，AI 助手仍停在旧设备的会话里，发命令落到旧设备（已修）**
+- **真因**：AI 会话在**创建时**就与设备焊死，但接入/切换设备时**没有任何「会话对齐」动作**，
+  于是新设备接进来后 AI 还在旧设备的上下文里 —— 用户感觉「AI 不听话、命令执行不了」。
+- **修法**：前端新增 `aiAlignDevice(dev)`，在**所有**「接入 / 开终端」的出口统一调用：
+  已有该设备的会话 → 切过去；没有 → 新建一个绑该设备的会话；
+  `aiNewSession` 支持显式传设备名（不传时退回当前选中设备，老调用点不变）。
+  一个会话都没有时不动作 —— 避免「只是看一眼设备」就悄悄拉起 AI 后端（要 API Key）。
+
+**C. 多会话并存（支撑 B 的必要改动）**
+- **真因**：原实现「开新会话先收掉旧的」⇒ 一次 F5 或一次新建 = 一次失忆；
+  且 B 一旦为新设备新建会话，就会把旧会话顶掉。
+- **修法**：改为**多会话并存** —— 上限 `_AI_MAX_SESSIONS = 10`，超限按最近活跃 **LRU 淘汰**；
+  AI 空闲回收阈值放宽到 **6 小时**（原值过短，切设备来回就丢上下文）；
+  切换/新建会话时**显式关闭旧 EventSource 并清空面板**，避免两个会话的事件混进同一面板。
+
+## [1.0.10] - 2026-10-06
+
+### 串口自动发现在 Windows 上真正生效（v1.0.9 出包后改的源码补齐进包）
+
+**A. 清单里写 `port = "auto"` 的串口设备，一接入就报「未找到可用串口设备」（已修）**
+- **真因**：`lib/engine.py` 的 `discover_serial_port()` 只 `glob /dev/cu.*`
+  （macOS 的写法），Windows 上恒为 `None` —— 机器上明明插着 COM3。
+  而 `netdev device-add serial --auto` 生成的条目正是 `port = "auto"`。
+- **修法**：Windows 走 `pyserial` 枚举（`host.serial_ports()`），并按描述优先挑
+  USB 转串口（CH340 / CP210 / FTDI / Prolific 等）；主板自带调试口（COM1）排后面。
+- **实测**：本机 COM1 + COM3(USB Serial Port) 并存时，自动认到 COM3。
+
+**B. `port = "auto"` 没被解析成具体端口就交给串口桥 → 开不了口（已修）**
+- **真因**：桥（`serial_bridge`）只认具体端口名，给它 `"auto"` 会直接失败；
+  且 CLI 侧「孤儿桥清理 + 双桥拦截」都依赖端口名，`auto` 时全被跳过
+  —— 旧桥仍握着口，新桥 `PermissionError 13`。
+- **修法**：`tools/pane_daemon.py` 与 `netdev_cli.py` 在把端口交给桥之前，
+  先 `discover_serial_port()` 解析成具体端口；解析不到才明确报错。
+
+**C. 串口相关报错仍是 macOS 口径（已修）**
+- `tools/serial_bridge.py`：占用排查提示按平台分流
+  （Windows 提示关掉串口助手/PuTTY/SecureCRT，或设备管理器里「禁用→启用」该 COM 口；
+  macOS 才用 `lsof`）。
+- `lib/conn_store.py`：串口缺 `--device` 的报错，Windows 举例 `COM3`、macOS 举例 `/dev/cu.usbserial-XXXX`。
+
+**D. 配置模板补 Windows 串口说明（已补）**
+- `config/devices.toml.example`：补 `port` 可写 `auto`、`netdev serial-discover`
+  在 Windows 看的是 `COM3` 这类 COM 口、显式写口与 auto 的取舍。
+
+**E. 源码克隆后 `netdev doctor` 的「配置真身」恒红（已修）**
+- **真因**：安装包会显式建 `config/state`，源码安装（`git clone`）没有这一步，
+  而 doctor 要求它存在 → 全新克隆这一项恒红（功能其实全好）。
+- **修法**：`lib/paths.py` 的 `bootstrap()` 补建 `config/state`（与安装脚本一致）。
+
+**F. 重装一次，用户加的设备清单全没了（数据丢失，已修）**
+- **真因**：macOS 安装包把 `安装根/devices.toml` 建成**指向 `config/devices.toml` 的软链**，
+  读写其实是同一份。Windows 建不了软链，安装器改成「`config → 安装根` 复制一份」，
+  根目录那份就成了**独立副本**；而 `lib/paths.py` 偏偏「安装根优先」：
+  · 用户按报错提示去改 `config/devices.toml` → 程序读的却是安装根那份，**改了没用**；
+  · `netdev device-add` 写进安装根那份，重装时安装器又用 `config → 安装根` 覆盖它
+    → **用户加的设备被抹掉**。
+- **修法**：`lib/paths.py` 的 `cfg()` 改成 **`config/` 优先**（与 macOS 软链语义对齐，
+  读写都走真身）；`dist/installer/install.ps1` 增加升级收编 ——
+  重装时若安装根那份更新（≤1.0.9 时它是活文件），先搬回 `config/` 再镜像，
+  老版本用户升级不会丢设备。
+
+**G. 串口波特率被写死 9600：接入先自检切档、`netdev list` 显示错速率（已修）**
+- **真因**：`netdev device-add` / `netdev conn add` 的 `--baud` 只收整数（默认 9600），
+  而配置模板与网页端下拉都推荐 `auto` —— `--baud auto` 直接 argparse 报错。
+  于是生成/登记的串口条目一律写死 9600：真机实际 115200 时，接入要先自检再切档，
+  `netdev list` 与网页端还一直显示「串口 auto @9600」，看着像没认到设备。
+- **修法**：`--baud` 改为接受「数字或 auto」，串口默认 `auto`；
+  `lib/conn_store.py` 同步支持存 `auto`；新增 `lib/engine.py:serial_display()`，
+  `netdev list`（文本 + JSON）与网页端把 `port`/`baud` 的 `auto` 解析成实际值
+  （本机实测显示「串口 COM3 @115200」，不再显示 auto @9600）。
+
+**H. 同屏桥（pane-daemon）仍按旧速率起：state/界面显示 9600（已修）**
+- **真因**：`tools/pane_daemon.py` 起串口桥时写 `baud = self.dev.get("baud", 9600)` ——
+  清单写 `auto` 时虽能把 `"auto"` 透传给桥（桥会自检），但默认值 9600 会让
+  **老清单/连接簿里的数字 9600** 被静默沿用：真机 115200 时接入先自检切档，
+  `state/panes/<设备>.json` 与网页端还一直显示 `serial_bridge COM3@9600`。
+- **修法**：起桥前把 `auto/空/none` 解析成**上次探测到的缓存速率**
+  （`engine.serial_baud_cache_get(port)`）；无缓存才传 `auto` 让桥自检并回写缓存。
+  与 `netdev list`/网页端（`serial_display()`）同一套解析口径，三处显示一致。
+
+**I. 直连串口（`netdev run/connect`）仍按 9600 起：`auto` 端口名被当真端口（已修）**
+- **真因**：`port = "auto"` 是**非空字符串**，`d.get("port") or discover_serial_port()`
+  把它当成真端口名直接用 → `probe_serial_baud("auto")` 打不开 → 静默回落 9600；
+  `SerialSession` 再 `int("auto")` 抛错（或按 9600 起）。
+  真机 COM3 @115200 就报「串口无任何回显：确认设备已上电 / 波特率 9600 / 线接的是 Console 口」
+  —— 与「设备没插」的表现一模一样，极难自查（本机真机实测踩到）。
+- **修法**：新增 `netdev_cli._resolve_serial_auto()`，在 `resolve_target()` /
+  `_shell_inner()`（开窗命令）/ 防双桥分支 / 连接簿分支统一把 `port`/`baud` 的
+  `auto` 落成实际值（端口先落成 `COM3`，再用缓存/探测定速率）；
+  `lib/engine.py:SerialSession.__init__` 也自行解析 `auto`（MCP 直连路径的同一道闸）。
+- **实测**：`netdev run huawei "display clock"` → 自动认到 COM3 @115200，
+  回读 `2026-10-05 22:05:40 <AR111-S>`，不再报 9600 无回显。
+
+## [1.0.9] - 2026-10-06
+
+### 两处 Windows 侧修复补齐进包（v1.0.8 出包后改的源码未随包交付）
+
+**A. 串口设备明明在线、界面却显示「未接入」（已修）**
+- **真因**：`ui/server.py` 判定设备是否「已接入」时，只用**连接名**去比对活窗格名。
+  但 CLI 给串口设备建的窗格名是 `serial-{端口}`（`_sanitize("serial-" + device)`），
+  与连接名无关 —— 于是串口设备明明在线，界面仍显示「未接入」。
+- **复现**：AR111-S 真机 COM3 接入后，设备行状态与实际不符。
+- **修法**：`window_live` / `connected` 判定追加 `serial-{device}` 窗格名匹配；
+  同时把 `wins` 先转 `set` 避免逐条线性查找。
+
+**B. 服务启动时日志文件打不开 → 服务没起（已修）**
+- **真因**：`ui/daemonize.py` 新建日志目录后立刻打开日志文件，可能撞上 Windows
+  Defender 对新目录的扫描锁（`PermissionError`）→ 服务没起、PID 文件没写，
+  下游 `test_ui_lifecycle` 连锁失败。
+- **修法**：与安装脚本同一套退避约定（4 次重试 0/600/1200/1800ms）；
+  4 次仍失败则明确报错返回 1，不再静默。
+
+## [1.0.8] - 2026-10-06
+
+### 同步 macOS 主仓 v1.0.5 / v1.0.6（AI 可靠性 + TRAE 全局换肤）
+
+**AI 会话：说完就忘 / 刷新失忆（两个 P0，已修）**
+- **每轮回复写回上下文**：纯文本回复原先只推给前端流，不落 `messages`
+  —— AI 转头就否认自己刚说过的话。现正常/异常/中止路径都写回（中止也
+  保住已产出文本；空回复不塞空消息；`_stored` 标记防重复写）。
+- **刷新不再失忆**：会话列表原先只活在内存，一次 F5 = 一次失忆（服务端
+  「开新会话先收旧」连坐清空上下文）。现 `[{name,aid,device}]` 存
+  localStorage，启动时 `/api/ai/list` 核对活会话后恢复订阅（历史事件回放）。
+- **会话流水（append-only JSONL）**：`logs/ai-session/<aid>/session.jsonl`
+  记录用户输入 / 工具调用 / 结果 / 回复 / compact，`netdev ai log` 可查。
+- **上下文压缩 `compact`**：旧对话压成结构化摘要，保留最近 4 条原文；
+  摘要生成失败会**如实说明**并指向流水文件，不许模型凭记忆断言。
+
+**`run` 的「一条失败 = 整批失败」语义修正**
+- CLI 加 `--json`：`{ok, partial, n_ok, n_total, commands:[{command, ok, output, error}]}`
+  逐条回结果；`netdev_mcp.t_run` 逐条标 ok 并新增 `partial`（部分成功）。
+- 界面把 `partial` 显示为**琥珀色「部分成功」**，不再一律红叉；
+  成功命令的回显不再被清空。
+- 系统提示词同步校准：设备绑定、前提冲突先澄清、禁止绝对断言、
+  指向流水文件自查。
+
+**模拟器补齐（mock_vrp）**
+- `display interface <名>` 明细、`display vlan <id>` 精确查询（不存在则
+  明确报错，不再回全表）、`display clock` 按本机时间实时生成。
+
+**界面整体换肤为 TRAE 风格（对齐 macOS v1.0.6）**
+- `index.html` 采用主仓 v1.0.6 实现：设计令牌体系（黑底 #070707 +
+  TRAE 绿 #3DDC84 + 三级灰阶文字）、「透但锐利」玻璃面板、点阵眼形
+  背景新 `ui/static/dotmatrix.js`；CRT 扫描线 / 矩阵雨整体移除。
 - 主题收敛为 4 个：**极简灰（默认）** / 黑客绿 / 极简白 / 水墨屏；
-  琥珀橙、冰蓝、赛博紫、深空蓝、赤陶橙删除，存过的旧值自动归一。
-- 活动状态统一语义绿 `--st-on`；AI/采集忙态改为标题「光晕呼吸」（网状动态图标废弃）。
-
-**布局**
-- 顶栏 64→48px；卡片缝隙全面收紧（托盘 padding 归零，列间缝实测 4px）；
-  底排三卡（状态/快照/审计）统一 240px 高 → 六卡片横平竖直。
-
-**写策略开关**
-- 顶栏「写策略」徽章+弹窗菜单 → **REA / ASK / ALL 三段滑动开关**（透明绿罩子，
-  0.22s 缓动），点档位直调 `/api/policy`；「放宽需人批」的人审闸门原样保留。
-
-**修复**
-- 状态/审计卡最大化只剩半截：`.h240` 固定高在 `.max`（fixed）下仍生效 →
-  `section.win.max` 加 `height:auto!important`。
-- **终端「单字变双字」**（Safari/输入法影子副本）：新增「无键影守卫」——
-  单可打印字符若 200ms 内无物理 keydown 且同字符刚被转发过 → 判影子丢弃；
-  真实按键（含长按重复）与 IME 唯一副本均不受影响；另加 onData 取踪器，
-  终端栏 📐 可打印最近 40 条按键轨迹用于后续取证。
+  琥珀橙 / 冰蓝 / 赛博紫 / 深空蓝 / 赤陶橙删除。
+- 顶栏「写策略」徽章 → **REA / ASK / ALL 三段滑动开关**（直调
+  `/api/policy`）；AI / 状态忙态改为标题「光晕呼吸」。
+- xterm 16 色按主题适配；状态/快照/审计三卡 240px 统一。
+- 点阵背景修「无声冻结」：`dotmatrix.js` 不再跟随
+  `prefers-reduced-motion` —— 工程师机器常开「最佳性能」（Windows 视觉
+  效果 = 最佳性能即触发 reduce），背景被冻结成静态一帧、用户以为坏了；
+  动效开关收归设置面板「背景点阵眼形」复选框（该开关本来就有）。
 
 **测试**
-- AI 工具链守卫断言随忙态机制更新（136 项全过）；全量 10 个测试文件 rc=0。
-
-## [1.0.5] - 2026-10-05
-
-### run 的「一条命令失败 = 整批失败」语义修正 + mock 接口明细补齐
-
-**A. `netdev_run` 多命令时，一条失败就把整批标成失败（已修）**
-`netdev run` 一直只把「整批 ok」交给上层：`cmd_run` 里 `ok_all` 只要有一条命令
-`not r.ok` 就置 False，`netdev_mcp.t_run` 再把这个整批 ok **复制给每一条命令**，
-并把成功命令的 `output` 一并清空。后果：AI 看到 `ok:false` 就以为"整批失败"、
-连成功命令的回显也拿不到；界面按整批 ok 打红叉，明明大部分命令成功。
-实测触发：`netdev_run` 里带一条模拟器不认的命令（如 `display interface GigabitEthernet0/0/0`）
-→ 整批红叉。现改为**逐条**回结果：
-- CLI 加 `--json`，输出 `{ok, partial, n_ok, n_total, commands:[{command, ok, output, error}]}`；
-- `t_run` 解析后逐条标 ok，并新增 `partial`（部分成功）；
-- 界面把 `partial` 显示成**琥珀色「部分成功」**，不再一律红叉；
-- 同屏路径原先硬编码 `m.recv(body, ok=True)`（设备报错也标成功），
-  现凭回显判定（`Unrecognized command` / `Error:` 等）。
-
-**B. mock 缺接口明细命令（已补）**
-`tests/mock_vrp.py` 原来只有 `display interface brief`，任何接口**明细**查询
-（`display interface GigabitEthernet0/0/0`、`display interface vlanif 1`）
-都落到末尾的 `Unrecognized command` —— 实测 AI 想查「GE0/0/1 为什么 down」时撞墙，
-只能如实回"该模拟器不认此命令"。本次补：`display interface <名>` 明细、
-`display port vlan`、`display vlan <id>` 精确查询（不存在则明确报
-`Error: The specified VLAN does not exist.`，不再回全表）。
-
-**D. 闲聊时可能伪造设备回显（已加约束）**
-讲故事/举例时，AI 可能生成 `%LINK-3-UPDOWN:` 这类日志行、`display interface brief`
-的完整表格 —— 即使标了"虚构"，格式也与真实日志无法一眼区分，工程师事后可能误当记录。
-提示词新增第 8 条：闲聊/举例不得生成看起来像真实设备回显的内容；需要举例时用文字描述
-或明确标注"这是我编的示例"；并【绝不】把示例数据伪装成设备读到的结果。
-
-**守门测试**：新增 `tests/test_run_partial_and_mock_detail.py`（26 项），已接入 CI。
-
-### mock 时钟不再是死字符串 + 提示词「前提澄清」校准
-
-**B. mock 的 `display clock` 是硬编码死字符串（已修）**
-`tests/mock_vrp.py` 里 `display clock` **永远**返回 `2026-09-16 14:04:14` ——
-整个文件没有任何 `datetime` / `time` 调用。后果（AI 端实测）：
-连续两次读数**分秒一模一样**，AI 据此判断「时钟看起来不走（可能是 mock 的静态回显，
-也可能是真卡住了，我无法从回显区分）」—— 它的观察是对的，白白消耗注意力；
-且模拟器日期永远停在过去。现改为按本机时间实时生成。
-
-**C. 提示词的「前提冲突先澄清」过度触发（已校准）**
-上一版为治"AI 否认自己讲过的话"而加的自证纪律，在上下文写回修好之后产生了副作用：
-真实的"历史冲突"少了，AI 转而**到处找前提来澄清**。实测：用户只发一句「你好」，
-它就搬出「设备清单里 mock-hw 的标签是『模拟器 / 非真机』，和『真机』的前提不一致」——
-而**用户从没提过"真机"**。此后每一条回答都要再提醒一遍。
-
-本次校准：
-- 明确「**会话内**你的对话历史是完整的」，可以据它回答"我刚才讲过什么" ——
-  旧版把整个上下文一律描述为"不可靠"，反而让它不敢用自己刚看过的内容；
-- 「前提澄清」改成**有条件的**：只在用户**明确引用了一段你上下文里没有的历史**时才澄清，
-  并**明令禁止凭空构造用户没提过的前提**；
-- 设备标签「模拟器 / 非真机」**只说一次**（首次涉及该设备时），此后不重复。
-
-### ★ P0：AI 的每一轮回复都是"说完就忘"（上下文从不写回）
-
-**背景（用户实测报障）**：AI 刚讲完一个故事，被问「刚才你给我讲故事了吗」时
-**以确定语气否认**，还给出了一个像证据的错答案：「我当时的动作是调用 `netdev_list`
-去列设备，**没有输出任何故事内容**」。
-
-**真因不是幻觉，是被我们自己删了。** `ui/server.py` 的 `_turn()` 里，
-`self.messages` 只在两处写入：**user 消息**，以及**带 `tool_calls` 的 assistant 消息**。
-纯文本结束时直接 `break` —— 于是 **AI 每一轮的解释 / 结论 / 警告都不进入上下文**，
-它的"自我记忆"里只剩下"调过什么工具"。
-
-- **决定性旁证**：那轮对话里 AI 主动说了「**先说设备，再说故事**」。它不是加戏 ——
-  它的上下文里，用户第 1 轮「给我讲个故事」**从未被回应**（那条拒绝的回复没写回），
-  它以为还欠一个故事，于是补上。
-- **对调试的实际危害**：① 重复回答已答过的问题、重复做已做过的检查；
-  ② 被问「你刚才判定什么」时答不上来，且它引用的"依据"**恰好是错的**
-  （但就它自己的上下文而言是真的）；③ **写操作场景**：不记得自己刚提交过什么变更
-  → 有**重复下发**风险。
-- **修**：纯文本结束时把回复写回 `self.messages`；`finally` 补存异常 / 中止路径
-  （按了停止的那一轮同样不该消失），用 `_stored` 标志去重。
-- **注意**：不能顺手清空 `_turn_text` —— `turn_end` 流水要用它记录 assistant 全文。
-- **测试**：`tests/test_ai_turn_context.py` 14 项。**已验证守门能力**：临时禁用修复后
-  14 项里 7 项变红（含「第二轮能看见第一轮的回复」这条核心断言）。
-
-**顺带修 CI 覆盖漏洞**：`.github/workflows/ci.yml` 此前只跑 4 个测试文件，
-本文件 + `test_ai_session_log.py` + `test_ui_js_syntax.py` 都只在本地跑、没人拦。已补上。
-
-### AI 助手可追溯性：会话流水落盘 + 压缩不再是"无痕失忆"
-
-**背景（用户实测报障）**：与 AI 助手的对话里出现过「先顺着提问编了一个故事、
-后以绝对语气否认自己讲过」的两连。逐行核查后确认：**不是模型不诚实，是产品
-没给它记忆和自证**——问题在于两条 P0 缺陷叠加。
-
-**P0-1 压缩按钮在撒谎（已修）**
-`DirectSession.compact()` 旧实现是「丢弃旧消息 + 塞一句占位符」——界面文案
-却承诺"压成结构化摘要"。用户触发压缩后，两轮对话被无痕抹掉，AI 再被问到
-"你刚才说过什么"时，它的上下文里**真的没有**，于是断然否认。
-现在：① 尽力让模型生成**真摘要**（失败则如实写明"未生成摘要，原文见流水"）；
-② 保留最近 **4** 条原文（旧实现只留 2 条）；③ 压缩事件本身落流水（丢弃了几条、
-摘要多长）。
-
-**P0-2 AI 自己的行为零留档（已修）**
-设备侧一直有镜像日志 / 审批流水 / 快照，但 `self.messages` 是纯内存——
-AI 说了什么、调了哪个工具、传了什么参数，**无处可查**。
-现在：每轮对话 append-only 落 `logs/ai-session/<aid>/session.jsonl`，
-含 `session_start / user / tool_call(名称+参数+结果长度) / turn_end / compact /
-error / session_end`，全部带时间戳。新增查询入口：
-
-```
-netdev ai log              # 列会话 + 显示最近一个的流水（人类可读）
-netdev ai log --list       # 只列会话（时间/条数/设备/模型）
-netdev ai log --aid X --last 100 --json
-```
-
-**提示词补「自证纪律」三条**（此前只约束了"设备事实"，漏了"对话事实"）：
-禁止对"是否发生过某事"做绝对断言；被问到自身历史先找证据（设备查实时回显、
-对话查流水）；用户提问前提与上下文冲突时**先澄清，不顺着前提生成内容**。
-
-**刷新不再等于失忆**
-会话列表原来只活在前端内存，刷新后 `aiOpen()` 会新建会话，而服务端
-「开新会话先收掉旧的」⇒ 一次 F5 = 一次失忆。现在前端把会话（name/aid/device）
-存 localStorage，启动时用新增的 `GET /api/ai/list` 核对服务端还活着的会话：
-还在就恢复订阅（服务端回放最近事件重建界面），不在才新建。浏览器实测：
-刷新后会话与上下文俱在；服务端已死的会话会被正确丢弃、不误报。
-
-**顺带**：新增 `tests/test_ui_js_syntax.py` 守住两件事——前端内联 JS 必须
-语法通过（单文件无构建，语法错 = 用户白屏，实测踩过 `else` 悬空事故）、
-会话持久化的三个函数必须成对存在。
-
----
+- 新增 4 个：AI 会话流水 / 每轮写回 / run partial+mock 明细 / 前端 JS 语法
+  与持久化三件套。全量 13 个测试文件（venv python）rc=0 全过
+  （136+14+26+26+10+18+21+90+27+…）。
 
 ### 终端着色：IP 高亮修漏 + 输入/输出一眼可辨（人蓝·AI紫·系统灰）
 

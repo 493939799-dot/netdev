@@ -43,15 +43,21 @@ def _id(name: str, proto: str, host: str, port) -> str:
 
 
 def add(proto: str, host: str = "", port=None, username: str = "", name: str = "",
-        device: str = "", baud: int = 9600, note: str = "", platform: str = "huawei_vrp") -> dict:
+        device: str = "", baud="auto", note: str = "", platform: str = "huawei_vrp") -> dict:
     proto = proto.lower()
     if proto not in PROTOCOLS:
         raise ValueError(f"协议只能是 {'/'.join(PROTOCOLS)}")
     if proto == "serial":
         if not device:
-            raise ValueError("串口需要 --device /dev/cu.xxx")
-        entry = {"protocol": "serial", "device": device, "baud": int(baud)}
-        addr = f"{device}@{baud}"
+            from . import host as _host
+            _eg = "COM3" if _host.IS_WIN else "/dev/cu.usbserial-XXXX"
+            raise ValueError(f"串口需要 --device（如 {_eg}）")
+        # baud 支持 "auto"（与 devices.toml 模板一致）：写死 9600 会让设备实际
+        # 115200 时接入先自检再切档。数字照旧存 int。
+        _baud = str(baud or "auto").strip().lower()
+        _baud = "auto" if _baud in ("", "auto") else int(_baud)
+        entry = {"protocol": "serial", "device": device, "baud": _baud}
+        addr = f"{device}@{_baud}"
     else:
         if not host:
             raise ValueError(f"{proto} 需要主机地址")
@@ -90,6 +96,6 @@ def find(key: str):
 def uri(entry: dict) -> str:
     """转成 netdev 统一 URI（可直接喂给 netdev shell/run/screen-send…）"""
     if entry["protocol"] == "serial":
-        return f"serial:{entry['device']}@{entry.get('baud', 9600)}"
+        return f"serial:{entry['device']}@{entry.get('baud') or 'auto'}"
     u = entry.get("username")
     return f"{entry['protocol']}://{u + '@' if u else ''}{entry['host']}:{entry['port']}"

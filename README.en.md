@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [MIT License](LICENSE)
 
-A macOS terminal for debugging network gear, built around one idea:
+A **macOS / Windows** terminal for debugging network gear, built around one idea:
 **the AI and the human must look at the same screen, through the same door.**
 
 Serial console, SSH and Telnet all converge into a single CLI. That CLI is the
@@ -19,13 +19,39 @@ a prompt, and being able to scroll back. Doing that through an AI wrapper usuall
 means the AI is *blind* — it sends a command, gets text back, and the human sees
 nothing.
 
-netdev puts both of you in the same tmux pane. The AI can read what's on screen
-and type into it; you watch it happen and can take over at any moment.
+netdev puts both of you in the same pane (tmux on macOS, a built-in daemon on
+Windows). The AI can read what's on screen and type into it; you watch it happen
+and can take over at any moment.
+
+## Windows: installs and runs like a normal app
+
+The Windows build ships a **graphical installer** — unzip, double-click
+`netdev-install.exe`, pick a folder, click Install. No console window at any point;
+you get Start-menu and desktop shortcuts with a proper icon.
+
+![Windows installer: choose install dir, tick autostart / open UI, live log](docs/NETDEV-Windows-安装向导.png)
+
+**Your daily entry point is the "netdev toolbox"** — a console-free WinForms window
+that re-checks the service every 3 seconds (TCP *and* `/api/health`, not just the PID
+file) and shows whether it's up, the address, PID, version, and autostart state.
+
+![netdev toolbox: service status + Open UI / Start·Restart / One-click repair / Refresh / Logs / Open install dir](docs/NETDEV-Windows-工具台.png)
+
+- **The service starts itself at login** — written to the per-user Startup folder
+  (works without admin), launched hidden, no console flash.
+- **If it won't start, one click fixes it** — the toolbox's "One-click repair" button
+  (and a separate Start-menu shortcut of the same name) runs the bundled
+  `一键体检.ps1 -Fix`: fills in missing config, clears zombie processes holding the
+  port, restarts the service, repairs deps, re-creates autostart. It works even when
+  the toolbox itself won't open.
+
+> Full steps: [Windows install notes](dist/installer/README-Windows安装说明.txt)
+> (Chinese). Bundles are on [Releases](https://github.com/493939799-dot/netdev/releases).
 
 ## Features
 
 - **Three ways in** — Serial Console / SSH / Telnet
-- **Shared screen** — tmux-backed; human and AI read and write the same pane, with scrollback
+- **Shared screen** — human and AI read and write the same pane, with scrollback (tmux on macOS; a built-in pane daemon + serial bridge on Windows)
 - **Four gates on every write** — blacklist → human approval → forced backup → per-line push with verification
 - **Fail-closed** — if the approver can't be reached, the write is *refused*, not allowed
 - **Vendor auto-detection** — sends `display version`, recognizes Huawei / H3C / Ruijie / Cisco / Maipu from the banner. You don't fill in a platform code
@@ -39,14 +65,48 @@ and type into it; you watch it happen and can take over at any moment.
 
 ## Requirements
 
-- **macOS**. This uses `/dev/cu.*` device names, `osascript`, `security`, and tmux.
-- Python **3.13**
-- `tmux` — `brew install tmux`
+**macOS**
+
+- `/dev/cu.*` device names, `osascript`, `security`, and `tmux` (`brew install tmux`)
+- Python **3.10+**
 - A USB-Console adapter (FTDI / CH340 / CP210x) for serial, if you use serial
+
+**Windows 10/11 x64**
+
+- Python **3.10 ~ 3.12** (x64), with "Add python.exe to PATH" ticked
+- A USB-Console adapter (FTDI / CH340 / CP210x) for serial, if you use serial
+- No tmux needed — the shared-screen daemon is built in
 
 ## Install
 
-### Prebuilt installer (recommended)
+### Windows: graphical wizard (recommended)
+
+Download `netdev-windows-x64-installer.zip` from
+[Releases](https://github.com/493939799-dot/netdev/releases), unzip it, and
+double-click **`netdev-install.exe`**. Pick a folder, tick "start at login / open
+UI when done", click Install (about 2–5 min).
+
+Then: Start-menu / desktop **"netdev toolbox"** → open <http://127.0.0.1:8898>.
+Uninstall:
+`powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\netops\uninstall.ps1"`
+(config and backups are kept; add `-Purge` to remove everything).
+
+<details>
+<summary>Build the Windows bundle yourself</summary>
+
+```powershell
+powershell -ExecutionPolicy Bypass -File dist/build_bundle.ps1 -Out .
+# → netdev-windows-x64-installer.zip + .sha256
+```
+
+`build_bundle.ps1` first calls `dist/installer/build_exes.ps1`, which uses the
+.NET Framework compiler `csc.exe` (bundled with Windows) to compile
+`LauncherStub.cs` / `InstallerStub.cs` into `netdev-toolbox.exe` /
+`netdev-install.exe` (icon from `netdev.ico`), then packs them with `install.ps1`
+and `一键体检.ps1`. The `.exe` files are build artifacts and are gitignored.
+</details>
+
+### macOS: prebuilt installer (recommended)
 
 **[⬇ Download netdev-macos-arm64-installer.tar.gz](https://github.com/493939799-dot/netdev/releases/latest/download/netdev-macos-arm64-installer.tar.gz)** (~33 MB)
 
@@ -164,7 +224,7 @@ hardware won't get contributions.
 
 ```bash
 ./netdev selftest                                          # end-to-end, against the simulator
-./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 136 checks
+./.venv/bin/python tests/test_ai_toolchain_and_cache.py    # 135 checks
 ./.venv/bin/python tests/test_approval_gates.py            # 19 checks (security-critical)
 ./.venv/bin/python tests/test_ui_lifecycle.py              # 27 checks
 ./.venv/bin/python tests/test_mock_cmd.py                  # 21 checks
@@ -185,8 +245,9 @@ to `0.0.0.0`. See [SECURITY.md](SECURITY.md) for the full trust boundary.
 
 ## Platform support
 
-**macOS only** for now. The architecture is portable (the core is pure Python),
-but `/dev/cu.*`, `osascript`, and the serial bridge are not.
+**macOS and Windows 10/11 x64.** The core is pure Python; the platform-specific
+pieces are the serial bridge, the shared-screen layer (tmux on macOS / a built-in
+daemon on Windows), and the launchers.
 
 ## License
 

@@ -23,15 +23,20 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="netdev-mon-")
 os.environ["NETDEV_ROOT"] = TMP          # 基线文件全部落进临时目录
+# ★ 退出即清：不清理的话，在 TEMP/TMP 为空或相对路径的环境里，这个模块级
+#   临时目录会直接堆在 CWD（同类问题见 06-接管与完善记录 OPT-12）。
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "lib"))

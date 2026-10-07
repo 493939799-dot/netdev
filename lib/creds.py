@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 
+from . import host
+
 POPUP_TIMEOUT = 180
 
 # 凭据文件位置（可用 NETDEV_CRED_FILE 覆盖，测试时方便）
@@ -74,7 +76,7 @@ def _file_delete(service: str) -> bool:
         return False
 
 
-# ───────────────────────────────────────────────────────── 钥匙串（仅作迁移兼容）
+# ───────────────────────────────────────────────────────── 系统凭据库（仅作迁移兼容）
 def _run(cmd, timeout=20):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -82,18 +84,22 @@ def _run(cmd, timeout=20):
         return None
 
 
-def keychain_item(service: str):
-    """取凭据 → (account, password)。
+# Windows 侧 keyring 约定：service="netdev"，account=<业务 service 名>。
+_KR_SERVICE = "netdev"
 
-    顺序：**本地文件（主）→ 钥匙串（旧数据兼容）**。
-    名字保留 keychain_item 是因为三个桥和 CLI 都在调它；语义已升级为“取凭据”。
-    """
-    if not service:
+
+def _kr_item(service: str):
+    """Windows Credential Manager（经 keyring）取旧数据 → (account, password)。"""
+    try:
+        import keyring
+        pw = keyring.get_password(_KR_SERVICE, service)
+        return (service, pw) if pw else (None, None)
+    except Exception:
         return None, None
-    u, p = file_item(service)
-    if p or u:
-        return u, p
-    # —— 以下为旧数据兼容：文件里没有才去问钥匙串 ——
+
+
+def _mac_item(service: str):
+    """macOS 钥匙串取旧数据 → (account, password)。"""
     r = _run(["/usr/bin/security", "find-generic-password", "-s", service])
     if not r or r.returncode != 0:
         return None, None
@@ -106,14 +112,39 @@ def keychain_item(service: str):
     return acct, (pw or None)
 
 
+def keychain_item(service: str):
+    """取凭据 → (account, password)。
+
+    顺序：**本地文件（主）→ 系统凭据库（旧数据兼容）**。
+    名字保留 keychain_item 是因为三个桥和 CLI 都在调它；语义已升级为“取凭据”。
+    """
+    if not service:
+        return None, None
+    u, p = file_item(service)
+    if p or u:
+        return u, p
+    # —— 以下为旧数据兼容：文件里没有才去问系统凭据库 ——
+    if host.IS_WIN:
+        return _kr_item(service)
+    return _mac_item(service)
+
+
 def store_credential(service: str, username: str, password: str) -> bool:
-    """写入凭据 —— 只写本地文件（不再新增钥匙串条目）。"""
-    return _file_save(service, username or os.environ.get("USER", "mac"), password)
+    """写入凭据 —— 只写本地文件（不再新增系统凭据库条目）。"""
+    default_user = os.environ.get("USERNAME") if host.IS_WIN else os.environ.get("USER", "mac")
+    return _file_save(service, username or default_user, password)
 
 
 def delete_credential(service: str) -> bool:
-    """删除凭据 —— 文件与钥匙串都清，不留旧副本。"""
+    """删除凭据 —— 文件与系统凭据库都清，不留旧副本。"""
     ok = _file_delete(service)
+    if host.IS_WIN:
+        try:
+            import keyring
+            keyring.delete_password(_KR_SERVICE, service)
+            return True
+        except Exception:
+            return bool(ok)
     r = _run(["/usr/bin/security", "delete-generic-password", "-s", service])
     return bool(ok or (r and r.returncode == 0))
 
@@ -135,7 +166,66 @@ def list_credentials(show_password: bool = False) -> list[dict]:
     return out
 
 
+def _popup_win(title: str, msg: str, hidden: bool, default: str = "",
+               timeout: int = POPUP_TIMEOUT):
+    """Windows 原生输入弹窗（tkinter，随 Python 自带）。
+
+    语义对齐 macOS 版：超时/关窗/取消 → None；确定且空 → None。
+    弹窗置顶，密码用掩码。
+    """
+    import tkinter as tk
+    result: dict = {"value": None, "done": False}
+
+    def _run_dialog():
+        root = tk.Tk()
+        root.title(title)
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+        try:
+            root.option_add("*Font", "Microsoft YaHei UI 10")
+        except Exception:
+            pass
+
+        def _finish(val):
+            result["value"] = val
+            result["done"] = True
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+        def _on_timeout():
+            if not result["done"]:
+                _finish(None)
+
+        tk.Label(root, text=msg, justify="left", padx=12, pady=10, wraplength=380).pack(anchor="w")
+        var = tk.StringVar(value=default or "")
+        entry = tk.Entry(root, textvariable=var, width=44, show="*" if hidden else "")
+        entry.pack(padx=12, fill="x")
+        entry.focus_set()
+        bar = tk.Frame(root)
+        bar.pack(pady=10)
+        tk.Button(bar, text="确定", width=9, default="active",
+                  command=lambda: _finish(var.get().strip() or None)).pack(side="left", padx=6)
+        tk.Button(bar, text="取消", width=9,
+                  command=lambda: _finish(None)).pack(side="left", padx=6)
+        root.protocol("WM_DELETE_WINDOW", lambda: _finish(None))
+        root.bind("<Return>", lambda e: _finish(var.get().strip() or None))
+        root.bind("<Escape>", lambda e: _finish(None))
+        root.after(int(timeout * 1000), _on_timeout)
+        root.update_idletasks()
+        root.mainloop()
+
+    try:
+        _run_dialog()
+    except Exception:
+        return None
+    return result["value"] if result["done"] else None
+
+
 def _popup(title: str, msg: str, hidden: bool, default: str = ""):
+    if host.IS_WIN:
+        return _popup_win(title, msg, hidden, default)
     script = (f'display dialog "{msg}" default answer "{default}" '
               + ("with hidden answer " if hidden else "")
               + f'with title "{title}" buttons {{"取消","确定"}} default button "确定" '

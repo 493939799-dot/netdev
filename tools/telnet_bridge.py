@@ -12,12 +12,22 @@
 """
 import os
 import pathlib
+import queue
 import re
-import select
 import socket
 import sys
+import threading
+import time
 import pathlib as _pathlib
 import time as _time
+
+sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
+from lib import host  # noqa: E402
+
+if not host.IS_WIN:
+    import select
+    import termios
+    import tty
 
 # ── 自动登录（2026-09-26 补：原来 telnet 通道完全没有自动登录）──
 #   认出 Username:/Login:/Password: 提示就用凭据填上；不打印密码、不写日志。
@@ -30,21 +40,22 @@ except Exception:
 
 _DEV = None
 # ── 设备名从哪来（2026-09-27 修）────────────────────────────────────
-# ⚠ 原来只读 NETDEV_DEVICE_JSON，但 netdev_cli.py 实际传的是 NETDEV_DEVICE
-#   （见 netdev_cli.py 的 exec env NETDEV_DEVICE=<name>）。名字对不上 →
-#   _DEV 落到"从 argv[1] 猜"的兜底分支 → 猜出的是【IP】而不是【设备名】→
-#   按设备名存的凭据取不到 → 连接簿里明明存了用户名密码，却仍停在登录界面。
-#   现在优先用 NETDEV_DEVICE（和 ssh_bridge.py 保持一致），JSON 仅作后备。
-_nm = (os.environ.get("NETDEV_DEVICE") or "").strip()
-if _nm:
-    _DEV = {"name": _nm}
+# ⚠ 原来的优先级是：NETDEV_DEVICE → NETDEV_DEVICE_JSON → argv 猜
+#   但 NETDEV_DEVICE 只是单个名字，NETDEV_DEVICE_JSON 是完整 dict
+#   （含 username/password 等 ad-hoc 临时目标必需的字段）。
+#   把 NETDEV_DEVICE 先执行会覆盖完整 dict → 导致 ad-hoc 自动登录
+#   找不到 username。现在反过来：JSON 优先，NETDEV_DEVICE 只作 name 兜底。
+try:
+    import json as _json
+    _j = _json.loads(os.environ.get("NETDEV_DEVICE_JSON") or "{}")
+    if isinstance(_j, dict) and _j:
+        _DEV = _j
+except Exception:
+    pass
 if _DEV is None:
-    try:
-        import json as _json
-        _j = _json.loads(os.environ.get("NETDEV_DEVICE_JSON") or "{}")
-        _DEV = _j or None
-    except Exception:
-        _DEV = None
+    _nm = (os.environ.get("NETDEV_DEVICE") or "").strip()
+    if _nm:
+        _DEV = {"name": _nm}
 if _DEV is None:
     # 最后兜底：从命令行猜（argv[1] 是 host/uri，只能猜个 IP，取凭据多半取不到）
     try:
@@ -55,6 +66,9 @@ if _DEV is None:
 
 def maybe_autologin(data: bytes, sock=None) -> None:
     """看到登录提示就填凭据（只用一次，避免重复填）。
+
+    凭据查找顺序：credfile（按设备名）→ NETDEV_DEVICE_JSON 里的 username/password 字段
+    （ad-hoc 临时目标如 netdev telnet 1.2.3.4 -u admin 靠这个 fallback）。
 
     ⚠ 2026-09-27 修：原来这里写的是 os.write(sys.stdout.fileno(), ...) ——
       那是【把用户名/密码打到屏幕上】，根本没发给设备！
@@ -68,6 +82,9 @@ def maybe_autologin(data: bytes, sock=None) -> None:
     try:
         if (b"username" in low or b"login:" in low or b"user name" in low) and not _AUTOLOGIN["sent_user"]:
             u, _src = _creds.get_username(_DEV, allow_popup=False)
+            if not u and _DEV:
+                # fallback: NETDEV_DEVICE_JSON 里直接带的 username（ad-hoc: -u admin 进来的）
+                u = _DEV.get("username") if isinstance(_DEV, dict) else None
             if u:
                 sock.sendall((u + "\r\n").encode())
                 _AUTOLOGIN["sent_user"] = True
@@ -83,14 +100,10 @@ def maybe_autologin(data: bytes, sock=None) -> None:
     except Exception:
         pass
 
-import termios
-import time
-import tty
-
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 
-host = sys.argv[1]
-port = int(sys.argv[2]) if len(sys.argv) > 2 else 23
+thost = sys.argv[1]
+tport = int(sys.argv[2]) if len(sys.argv) > 2 else 23
 logfile = sys.argv[3] if len(sys.argv) > 3 else None
 
 # IP 橙色高亮 + 输入回显著色（人=蓝/AI=紫/系统=灰）
@@ -115,7 +128,7 @@ log = open(logfile, "ab", buffering=0) if logfile else None
 BACKSPACE = os.environ.get("NETDEV_BACKSPACE", "bs").lower()
 START = time.time()
 
-sock = socket.create_connection((host, port), timeout=8)
+sock = socket.create_connection((thost, tport), timeout=8)
 
 # ── TCP 保活（2026-09-26 加）────────────────────────────────────────────
 #   原则：**绝不改客户设备配置**，所有健壮性都做在桥侧。
@@ -137,7 +150,7 @@ sock.setblocking(False)
 
 fd = sys.stdin.fileno()
 old_attr = None
-if os.isatty(fd):
+if not host.IS_WIN and os.isatty(fd):
     old_attr = termios.tcgetattr(fd)
     tty.setraw(fd)
 
@@ -275,10 +288,137 @@ def fix_keys(data: bytes) -> bytes:
     return data
 
 
-screen(f"\r\n[telnet 已连接] {host}:{port}\r\n"
+screen(f"\r\n[telnet 已连接] {thost}:{tport}\r\n"
        f"[人机同屏会话；退出 Ctrl+]   IP高亮+输入着色={'开' if _paint_on else '关'}   日志: {logfile or '未开启'}]\r\n\r\n".encode())
 
 last_data = time.time()
+
+# ════════════════════════════════════════════════════════════════════
+# Windows 主循环：输入走守护喂送通道（select on fd 的替代），
+# 设备 socket 非阻塞 recv；保活/看门狗/自动登录与 POSIX 完全同语义。
+# POSIX 主循环在下面。
+# ════════════════════════════════════════════════════════════════════
+if host.IS_WIN:
+    from lib import pane as _pane_mod
+    _feed_port = int(os.environ.get("NETDEV_FEED_PORT", "0"))
+    if not _feed_port:
+        raise SystemExit("[telnet_bridge] 缺少 NETDEV_FEED_PORT")
+    q_in, _feed_sock = _pane_mod.feed_client(_feed_port)
+
+    try:
+        _ka_interval = int(os.environ.get("NETDEV_TELNET_KEEPALIVE", "240"))
+    except Exception:
+        _ka_interval = 240
+    _last_ka = time.time()
+    _pending_since = [0.0]
+    _wd_last = [0.0]
+    _dead = False
+
+    def _win_finish():
+        try:
+            sock.close()
+        except Exception:
+            pass
+        if log:
+            try:
+                log.write(f"\n[session end {time.time()-START:.0f}s]\n".encode())
+                log.close()
+            except Exception:
+                pass
+        screen("\r\n[telnet 已断开]\r\n".encode())
+
+    # ★ 2026-10-07 修（网页终端「输入很卡」，与 serial_bridge 同款全局优化）：
+    #   原节拍 0.2s —— 主循环每 200ms 才排空一次输入队列 / recv 设备 socket，
+    #   键击下发与回显最多各等 0.2s（平均 ~100ms）。POSIX 版用 select(timeout=0.2)，
+    #   有数据立刻醒；Windows 版换成队列轮询 + 无条件 sleep(0.2)，等于给每次交互
+    #   加固定延迟。降到 10ms 后与串口通道一致（串口实测 median 150ms → 8.7ms）。
+    _TICK = 0.01
+    try:
+        while not _dead:
+            _now = time.time()
+            # 保活
+            if _ka_interval > 0 and (_now - _last_ka) > _ka_interval:
+                _last_ka = _now
+                try:
+                    sock.sendall(bytes([255, 241, 255, 242]))   # IAC NOP + IAC DM
+                except Exception:
+                    pass
+                try:
+                    sock.sendall(b"\x08 \x08")                  # 退格 空格 退格（无痕）
+                except Exception:
+                    pass
+            # 看门狗（只提醒，不主动断）
+            if _now - _wd_last[0] > 2.0:
+                _wd_last[0] = _now
+                if _LOGGED_IN[0] and _pending_since[0] and (_now - _pending_since[0]) > 90.0:
+                    _pending_since[0] = 0.0
+                    if not _WD_WARNED[0]:
+                        _WD_WARNED[0] = True
+                        screen("\r\n[telnet_bridge] ⚠ 已 90 秒没有设备回显 —— 可能连接僵死，"
+                               "建议重连（netdev shell <设备> --restart 或界面上的「重连」）\r\n".encode())
+            # 输入队列
+            while True:
+                try:
+                    d = q_in.get_nowait()
+                except queue.Empty:
+                    break
+                if not d:
+                    screen("\r\n[telnet] 喂送通道关闭，桥退出。重连：--restart。\r\n".encode())
+                    _dead = True
+                    break
+                _pending_since[0] = time.time()
+                if b"\x1d" in d:                        # Ctrl+]
+                    _dead = True
+                    break
+                try:
+                    sd = fix_keys(d)
+                    if _tf is not None:
+                        _n = _tf.dropped_count(sd)
+                        sd = _tf.strip(sd)
+                        if _n:
+                            log_raw(("[丢弃终端应答 %d 字节]\n" % _n).encode())
+                    sock.sendall(sd)
+                    if _paint_on and _echo:
+                        _echo.expect(sd)
+                except OSError as e:
+                    screen(f"\r\n[telnet] 发送失败: {e}\r\n".encode())
+                    _dead = True
+                    break
+                log_raw(_input_for_log(d, "[input] ").encode())
+            # 设备输出：非阻塞排空
+            got = False
+            while True:
+                try:
+                    data = sock.recv(8192)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    screen("\r\n[telnet] 远端已关闭连接\r\n".encode())
+                    _dead = True
+                    break
+                got = True
+                if not data:
+                    screen("\r\n[telnet] 远端已关闭连接\r\n".encode())
+                    _dead = True
+                    break
+                clean = strip_iac(data)
+                if clean:
+                    last_data = time.time()
+                    _pending_since[0] = 0.0
+                    log_raw(bytes(clean))
+                    screen(_echo.feed(clean) if _paint_on and _echo else clean)
+                    maybe_autologin(bytes(clean), sock)
+            if not got and _paint_on and _echo and _echo.pending() and time.time() - last_data > 0.15:
+                screen(_echo.flush())
+            time.sleep(_TICK)
+    except Exception as e:
+        import traceback
+        screen(f"\r\n[telnet] 异常: {type(e).__name__}: {e}\r\n".encode())
+        screen(traceback.format_exc().encode())
+    finally:
+        _win_finish()
+    raise SystemExit(0)
+
 try:
     # ── 保活心跳（2026-09-26 加，纯桥侧、不动设备配置）──────────────────
     #   为什么需要：设备侧 vty 有 idle-timeout，按"多久没收到你的输入"算；

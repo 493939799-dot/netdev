@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import importlib
 import json
 import os
 import pathlib
@@ -35,7 +36,23 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from lib import approval, colorize, creds, engine, gates, mirror, paths as _P, vrp_commands  # noqa: E402
+from lib import approval, colorize, creds, engine, gates, host, mirror, paths as _P, vrp_commands  # noqa: E402
+
+# ★ 2026-10-07：输出编码兜底。
+#   stdout 若不是控制台（被重定向成管道，例如启动器直接拉 python.exe 收输出），
+#   Windows 上 Python 用本地编码（中文机是 GBK）。本 CLI 到处打印 ✔ / ✘ 这类
+#   非 GBK 字符 —— 一旦编码不上就 UnicodeEncodeError，整条命令以退出码 1 失败：
+#   一个装饰性符号把「启动服务」这种正事搞挂（用户实测，见日志里的 traceback）。
+#   这里只把 errors 改成 replace：编码得出的照常（中文不乱），编不出的降级为 ?，
+#   绝不因为一个符号让命令失败。正规入口（netdev.cmd / 启动器）仍会设
+#   PYTHONUTF8=1 走 UTF-8，这只是最后一道兜底。
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is None:          # pythonw.exe 下为 None
+        continue
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # ROOT：优先 NETDEV_ROOT 环境变量，其次从脚本自身位置推导（支持任意安装路径 / --prefix）。
 # 历史：曾硬编码为 ~/netops，导致 --prefix 换目录后配置/备份/日志全部错位。
@@ -45,6 +62,21 @@ ROOT = _P.ROOT
 BACKUPS = ROOT / "backups"
 BACKUPS.mkdir(parents=True, exist_ok=True)
 C = mirror.C
+
+# ★ 2026-10-06：抑制子进程弹出控制台窗口。
+#   本 CLI 常被「没有控制台」的父进程拉起（UI 服务是 DETACHED 的；AI 工具调用
+#   也是从那里转调过来的）。此时再拉起 powershell / python 这类控制台子进程，
+#   Windows 会**新建一个控制台窗口** → 界面上莫名弹黑框（用户实测：接入串口设备、
+#   启动模拟器时都弹）。统一加 CREATE_NO_WINDOW；POSIX 下为 0（等于默认，无影响）。
+_NO_WINDOW = 0x08000000 if host.IS_WIN else 0
+
+# ★ 2026-10-07：读 Windows 系统命令输出（netstat / taskkill / powershell）一律按本机
+#   ANSI 代码页（中文机 = GBK）解码。这些命令按控制台代码页吐字节，而本 CLI 入口设了
+#   PYTHONUTF8=1 —— text=True 于是按 UTF-8 解，中文机 netstat 输出里的 GBK 字节直接
+#   UnicodeDecodeError，把 `netdev ui restart` 这种正事整个搞挂（用户实测 traceback）。
+#   mbcs + replace 双保险：正常解出中文不乱，异常字节降级为 ?，绝不因解码抛异常。
+#   POSIX 下留空（系统命令走 UTF-8/locale，行为不变）。
+_SYS_TEXT = {"encoding": "mbcs", "errors": "replace"} if host.IS_WIN else {}
 
 # ── 网页服务（netdev-ui）─────────────────────────────────────────────
 # 约定：主机名/端口只在这里定义一次，doctor / ui / 启动器都从这里取。
@@ -57,6 +89,29 @@ UI_DAEMON = ROOT / "ui" / "daemonize.py"
 UI_PLIST = pathlib.Path.home() / "Library/LaunchAgents/com.netdev.ui.plist"
 UI_LABEL = "com.netdev.ui"
 
+
+def _win_startup_lnk() -> pathlib.Path:
+    """Windows 开机自启快捷方式：用户 Startup 目录下的 netdev-ui.lnk。
+
+    安装器（install.ps1）、一键体检、启动器三处都用这个路径 —— 必须一致，
+    否则会出现「启动器说已启用、netdev ui status 说未装」这种自相矛盾。
+    """
+    return pathlib.Path(os.environ.get("APPDATA", "")) / \
+        r"Microsoft\Windows\Start Menu\Programs\Startup\netdev-ui.lnk"
+
+
+def _win_autostart_state() -> tuple[bool, str]:
+    """Windows 开机自启是否已装，以及是哪种装法。返回 (已装, 说明)。"""
+    if _win_startup_lnk().exists():
+        return True, "Startup 快捷方式"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+            winreg.QueryValueEx(k, "netdev-ui")
+        return True, "注册表 Run 键"
+    except OSError:
+        return False, ""
 
 
 # ─────────────────────────────────────────────────────────────── 工具
@@ -76,6 +131,9 @@ def _tmux_holds(dev_name):
     实测踩到）。现在用 pane_dead 过滤，只有活窗格才算占用。
     死窗格的清理仍走 panes 管理接口（那里看的是全量窗口列表）。
     """
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        return _pane_mod.holds(dev_name)
     if not shutil.which("tmux"):
         return False
     r = subprocess.run([shutil.which("tmux"), "list-windows", "-t", "netops",
@@ -99,15 +157,25 @@ def _open_serial_soft(dev):
     except Exception as e:
         port = dev.get("port") or "auto"
         others = engine.other_port_holders(port)
-        who = ("当前占用者 pid " + "、".join(others) + "（多半是 screen / NyaTerm 等其它程序）") if others else "未发现其它占用者"
+        if host.IS_WIN:
+            who = ("当前占用者 pid " + "、".join(others)) if others else "未发现其它占用者（多为别的程序直接占着 COM 口）"
+            howto = (
+                f"         ① 先关掉别的串口程序（串口助手 / PuTTY / SecureCRT / 另一份 netdev）\n"
+                f"         ② 若是本机 netdev 的同屏会话占着：netdev screen-ls 查，"
+                f"再到网页界面 netdev ui 的会话管理里断开\n"
+                f"         ③ 仍释放不掉：设备管理器里把该 COM 口「禁用→启用」一次可强断占用")
+        else:
+            who = ("当前占用者 pid " + "、".join(others) + "（多半是 screen / NyaTerm 等其它程序）") if others else "未发现其它占用者"
+            howto = (
+                f"         ① 若在用 screen → 先退出它（screen 里按 Ctrl+A 再按 K）\n"
+                f"         ② 若在用 NyaTerm 的串口会话 → 关掉它\n"
+                f"         ③ 查看到底谁占着：lsof {port}")
         raise SystemExit(
             f"✘ 打开串口失败：{port}\n"
             f"   原因: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else 'busy'}\n"
             f"   {who}\n"
             f"   处理: 一个串口同一时刻只应有一个使用者：\n"
-            f"         ① 若在用 screen → 先退出它（screen 里按 Ctrl+A 再按 K）\n"
-            f"         ② 若在用 NyaTerm 的串口会话 → 关掉它\n"
-            f"         ③ 查看到底谁占着：lsof {port}")
+            f"{howto}")
     if getattr(s, "port_warning", ""):
         print(f"{C['yel']}{s.port_warning}{C['reset']}")
     return s
@@ -116,10 +184,12 @@ def _open_serial_soft(dev):
 def _serial_open(dev, allow_popup=True, store=False, retries=2):
     """串口：先问设备要什么（probe），再按需取凭据 —— 不猜账号。"""
     if _tmux_holds(dev["name"]):
+        _how = ("到网页界面 netdev ui 的会话管理里断开它" if host.IS_WIN
+                else "先退出桥：tmux attach -t netops 然后按 Ctrl+]")
         raise SystemExit(
             f"✘ {dev['name']} 正在人机同屏会话中（netops:{dev['name']}），串口被它占着。\n"
             f"   两种做法：① 走同屏会话：netdev screen-send {dev['name']} \"命令\"\n"
-            f"             ② 先退出桥：tmux attach -t netops 然后按 Ctrl+]")
+            f"             ② 确实要直连：{_how}")
     s = _open_serial_soft(dev)
     kind = s.probe_login()
     label = {"user_pass": "要用户名 + 密码", "pass_only": "只要密码",
@@ -179,24 +249,46 @@ def _sanitize(name):
     return re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "target"
 
 
+def _resolve_serial_auto(d: dict) -> dict:
+    """串口设备：把清单里 port/baud 的 "auto" 就地解析成实际端口 / 速率。
+
+    为什么需要（2026-10-06 修）
+        `port = "auto"` / `baud = "auto"` 是设计允许的写法（USB 转串口换口后免改清单），
+        但 "auto" 是**非空字符串** —— `d.get("port") or discover_serial_port()` 会把它
+        当成真端口名直接用，于是：
+          · `probe_serial_baud("auto")` 打不开 → 静默回落 9600；
+          · `SerialSession` 再 `int("auto")` 报错（或按 9600 起）。
+        真机 COM3 @115200 就表现为「串口无任何回显：波特率 9600 / 设备未上电」。
+        这里统一解析：端口先落成具体口（COM3），再用缓存/探测定速率。
+    """
+    if str(d.get("protocol") or "").lower() != "serial":
+        return d
+    p = str(d.get("port") or "").strip()
+    if p.lower() in ("", "auto"):
+        p = engine.discover_serial_port() or ""
+        if p:
+            d["port"] = p                      # 落成具体口：桥/SerialSession/portlock 都靠它
+    if str(d.get("baud") or "").strip().lower() in ("", "auto", "none"):
+        if p:
+            b, ev = engine.probe_serial_baud(p)
+            d["baud"] = b
+            d["_baud_auto"] = b
+            d["_baud_ev"] = ev
+    return d
+
+
 def resolve_target(spec):
     """解析目标：清单里的设备名，或临时 URI（不写清单，一条命令即用）。
 
       telnet://[user@]host[:port]     → 临时 Telnet（默认 23）
       ssh://[user@]host[:port]        → 临时 SSH（默认 22）
-      serial:/dev/cu.usbserial-XXXX[@9600]  → 临时串口
+      serial:<串口>[@9600]             → 临时串口（Windows 如 serial:COM3；macOS 如 serial:/dev/cu.usbserial-XXXX）
     """
     if "://" not in spec and not spec.startswith("serial:"):
         devs = engine.load_devices()
         if spec in devs:
             d = dict(devs[spec])                               # 清单里的正式设备
-            if d.get("protocol") == "serial" and str(d.get("baud", "")).strip().lower() in ("auto", ""):
-                port = d.get("port") or engine.discover_serial_port() or ""
-                if port:
-                    baud, ev = engine.probe_serial_baud(port)
-                    d["baud"] = baud
-                    d["_baud_auto"] = baud
-                    d["_baud_ev"] = ev
+            _resolve_serial_auto(d)
             return d
         # ★ 2026-09-26 加：查连接簿（随手接入的临时目标）。
         #   原来 resolve_target 只认 devices.toml 和 URI，于是连接簿里的临时目标
@@ -215,11 +307,9 @@ def resolve_target(spec):
                          "_conn_id": _c.get("id")}
                 if _proto == "serial":
                     _port = _c.get("device") or _c.get("port") or ""
-                    try:
-                        _baud = int(_c.get("baud") or 9600)
-                    except Exception:
-                        _baud = 9600
-                    _base.update({"port": _port, "baud": _baud})
+                    _base.update({"port": _port, "baud": _c.get("baud") or "auto"})
+                    # 连接簿里 baud 现可存 "auto"（见 lib/conn_store.add）→ 同样解析成实际值
+                    _resolve_serial_auto(_base)
                 else:
                     _base.update({"host": _c.get("host"), "port": _c.get("port")})
                 return _base
@@ -228,9 +318,26 @@ def resolve_target(spec):
         except Exception:
             pass
         if _tmux_holds(spec):                              # 临时目标：已有同名同屏会话
+            # ⚠ 2026-10-05 补：POSIX 版 tmux 会话自带 host/port（tmux window
+            #   名里编码了），旧简化 dict 只写 name/protocol 在 POSIX 无害；
+            #   但 Windows pane-daemon 路径会走 TCP 预检，dev 缺 host/port
+            #   → `None:23` 直接炸。现在从同屏会话的 registry 反推 host/port：
+            try:
+                from lib import pane as _pm4
+                for s in _pm4.list_screens():
+                    if s["window"] != spec or s.get("dead"):
+                        continue
+                    cmd = str(s.get("command", ""))
+                    # command 形如 "telnet_bridge 127.0.0.1:2323" / "ssh admin@127.0.0.1:20022"
+                    m2 = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", cmd)
+                    if m2:
+                        return {"name": spec, "protocol": "telnet", "host": m2.group(1),
+                                "port": int(m2.group(2)), "platform": "", "ad_hoc": True}
+            except Exception:
+                pass
             return {"name": spec, "protocol": "telnet", "ad_hoc": True}
         raise SystemExit(f"✘ 清单里没有 '{spec}'，也没有名为 '{spec}' 的同屏会话\n"
-                         f"   可用：{', '.join(devs)} ｜ 或 telnet://IP[:端口] ｜ ssh://[用户@]IP ｜ serial:/dev/xxx")
+                         f"   可用：{', '.join(devs)} ｜ 或 telnet://IP[:端口] ｜ ssh://[用户@]IP ｜ serial:<串口>")
     if spec.startswith("serial:"):
         rest = spec[len("serial:"):]
         dev_path, _, baud_s = rest.partition("@")
@@ -247,7 +354,7 @@ def resolve_target(spec):
     m = re.match(r"([A-Za-z]+)://(?:([^@/]+)@)?([^:/]+)(?::(\d+))?$", spec)
     if not m:
         raise SystemExit(f"✘ 认不出的目标写法: {spec}\n"
-                         f"   可用：设备名 ｜ telnet://[用户@]IP[:端口] ｜ ssh://[用户@]IP[:端口] ｜ serial:/dev/xxx[@波特率]")
+                         f"   可用：设备名 ｜ telnet://[用户@]IP[:端口] ｜ ssh://[用户@]IP[:端口] ｜ serial:<串口>[@波特率]")
     proto, user, host, port = m.group(1).lower(), m.group(2), m.group(3), m.group(4)
     if proto not in ("telnet", "ssh"):
         raise SystemExit(f"✘ 不支持的协议: {proto}（只支持 ssh / telnet / serial:）")
@@ -284,14 +391,21 @@ def cmd_list(a):
         out = []
         for d in devs.values():
             proto = d.get("protocol", "ssh")
+            if proto == "serial":
+                # port/baud 写 auto 时解析成实际值（否则界面/JSON 显示「auto@9600」，
+                # 真机明明在 COM3 @115200 —— 见 engine.serial_display）
+                _p, _b = engine.serial_display(d)
+                _baud, _addr = _b, f"{_p}@{_b}"
+            else:
+                _baud = d.get("baud")
+                _addr = f"{d.get('host')}:{d.get('port', 22 if proto == 'ssh' else 23)}"
             out.append({
                 "name": d["name"], "protocol": proto,
                 "host": d.get("host"), "port": d.get("port", 22 if proto == "ssh" else (23 if proto == "telnet" else None)),
-                "baud": d.get("baud"), "username": d.get("username", ""), "platform": engine.platform_for(d),
+                "baud": _baud, "username": d.get("username", ""), "platform": engine.platform_for(d),
                 "esn": d.get("expected_esn"), "tags": d.get("tags", []),
                 "sim": bool(d.get("sim")), "official": True,
-                "address": (f"{d.get('port')}@{d.get('baud', 9600)}" if proto == "serial"
-                            else f"{d.get('host')}:{d.get('port', 22 if proto == 'ssh' else 23)}"),
+                "address": _addr,
                 "window": d["name"],
             })
         print(_json.dumps(out, ensure_ascii=False))
@@ -303,7 +417,8 @@ def cmd_list(a):
     for d in devs.values():
         proto = d.get("protocol", "ssh")
         if proto == "serial":
-            chan = f"串口 {d.get('port') or 'auto'} @{d.get('baud', 9600)}"
+            _p, _b = engine.serial_display(d)
+            chan = f"串口 {_p} @{_b}"
         else:
             chan = f"{d.get('host')}:{d.get('port', 22 if proto == 'ssh' else 23)}（{proto.upper()}）"
         kind = "本机模拟" if d.get("sim") else ("真机·串口" if proto == "serial" else "真机·IP")
@@ -696,6 +811,8 @@ def _tmux_target(dev_name):
 def _shell_inner(dev):
     """各通道的交互命令。串口→raw 桥（无前缀键、全程留档）；SSH→系统 ssh。"""
     if dev.get("protocol") == "serial":
+        # port/baud 的 "auto" 先解析成实际值（否则把字面量 "auto" 交给桥 → 开不了口）
+        _resolve_serial_auto(dev)
         port = dev.get("port") or engine.discover_serial_port() or ""
         if not port:
             raise SystemExit("没找到串口设备")
@@ -704,7 +821,7 @@ def _shell_inner(dev):
         return (f'exec env SERIAL_BACKSPACE={bs or "auto"} SERIAL_DEVICE={dev["name"]} '
                 f'NETDEV_DEVICE={shlex.quote(dev["name"])} '
                 f'{sys.executable} {ROOT}/tools/serial_bridge.py '
-                f'{port} {dev.get("baud", 9600)} {logf}')
+                f'{port} {dev.get("baud") or "auto"} {logf}')
     host = dev["host"]
     user = dev.get("username", "admin")
     port = dev.get("port", 22 if dev.get("protocol", "ssh") == "ssh" else 23)
@@ -736,10 +853,21 @@ def _shell_inner(dev):
 
 def _connect_lock():
     """接入临界区锁：网页点一下 + AI 同时接入时，避免两个进程同时 new-window 产生重复窗口。
-    flock 随进程退出/文件关闭自动释放，不会有残留死锁。"""
-    import fcntl
+    flock/msvcrt 锁随进程退出/文件关闭自动释放，不会有残留死锁。"""
     lockdir = _P.state_dir()
     lockdir.mkdir(parents=True, exist_ok=True)
+    if host.IS_WIN:
+        import msvcrt
+        fh = open(lockdir / "connect.lock", "a+b")
+        fh.seek(0)
+        for _ in range(80):                    # 最多等 20s
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return fh
+            except OSError:
+                time.sleep(0.25)
+        raise SystemExit("✘ 接入锁被占用且等待超时（别的接入卡住了？）")
+    import fcntl
     fh = open(lockdir / "connect.lock", "w")
     fcntl.flock(fh, fcntl.LOCK_EX)
     return fh
@@ -747,8 +875,13 @@ def _connect_lock():
 
 def _connect_unlock(fh):
     try:
-        import fcntl
-        fcntl.flock(fh, fcntl.LOCK_UN)
+        if host.IS_WIN:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
     except Exception:
         pass
@@ -804,6 +937,59 @@ def _stale_serial_bridges(port):
     return stale
 
 
+def _cleanup_windows_stale_serial_bridges(port: str) -> None:
+    """Windows：清掉孤儿 serial_bridge 进程（CmdLine 含目标串口，但守护已死/不存在）。
+
+    实测：桥被重复拉起、或守护被杀后，旧桥进程仍握着该串口（如 COMx）→ 下一次
+    shell <设备> 会 PermissionError 13。POSIX 版有 _stale_serial_bridges，
+    Windows 一直缺这步。
+    """
+    import json as _j
+    # 先拿活守护 PID 集合（注册表 + 守护进程本身都活着才算"活守护"）
+    alive_daemon_pids = set()
+    try:
+        from lib import pane as _pm2
+        for s in _pm2.list_screens():
+            p = s.get("pid")
+            if p and not s.get("dead"):
+                alive_daemon_pids.add(int(p))
+    except Exception:
+        pass
+    # 用 PowerShell + WMI 找所有 serial_bridge 进程
+    ps_code = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='python3.exe'\" "
+        f"| Where-Object {{ $_.CommandLine -match 'serial_bridge' -and $_.CommandLine -match '{port}' }} "
+        "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps_code],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=_NO_WINDOW, **_SYS_TEXT)
+    except Exception:
+        return
+    if not (out.stdout or "").strip():
+        return
+    try:
+        items = _j.loads(out.stdout)
+        if isinstance(items, dict):
+            items = [items]
+    except Exception:
+        return
+    killed = []
+    for it in items or []:
+        pid = int(it.get("ProcessId", 0))
+        if pid in alive_daemon_pids:
+            continue   # 活守护的桥，不该杀
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except Exception:
+            pass
+    if killed:
+        print(f"{C['yel']}⚠ 清理孤儿串口桥（{port}）：杀掉 pid {killed}（否则新桥会 PermissionError）{C['reset']}")
+        time.sleep(0.6)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  配置快照：备份 / 对比 / 恢复（接客户设备的标准动作）
 #    netdev snap save <设备> [--tag 客户] [--note 备注]   存快照
@@ -833,6 +1019,9 @@ def _snap_window(dev):
 
 def _pane_alive(win):
     """同屏窗口是否还活着（桥进程还在）。死会话要快速失败，别挂在等提示符上。"""
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        return _pane_mod.bridge_alive(win)
     try:
         out = _tmux("list-panes", "-t", f"netops:{win}", "-F", "#{pane_dead} #{pane_current_command}").stdout.strip()
     except Exception:
@@ -842,6 +1031,9 @@ def _pane_alive(win):
 
 def _pane_tail(win, n=12):
     """同屏窗格最后 n 行（含回滚）。"""
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        return _pane_mod.tail(win, n)
     return _tmux("capture-pane", "-p", "-J", "-t", f"netops:{win}", "-S", f"-{n}").stdout
 
 
@@ -860,7 +1052,11 @@ def _pager_drain(win, max_pages=120, gap=0.15):
     tgt = f"netops:{win}"
     n = 0
     while n < max_pages and _pane_paging(win):
-        _tmux("send-keys", "-t", tgt, "Space")
+        if host.IS_WIN:
+            from lib import pane as _pane_mod
+            _pane_mod.send_key(win, "Space")
+        else:
+            _tmux("send-keys", "-t", tgt, "Space")
         n += 1
         time.sleep(gap)
     return n
@@ -872,6 +1068,41 @@ def _session_run(win, cmd, timeout=90, quiet=False):
     分页用 **空格**（一屏），不是 Enter（一行）——大配置下差 30 倍以上，
     以前用 Enter 翻页会把超时耗光，留下截断的配置和一个卡在 More 的窗格。
     """
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        if not _pane_mod.bridge_alive(win):
+            raise SystemExit(f"✘ 同屏会话「{win}」里的进程已退出（串口被拔 / 设备断开？）\n"
+                             f"   重新接入：netdev shell {win}（或网页里点接入命令）\n"
+                             f"   查可用串口：netdev serial-discover")
+        if _pager_drain(win):                    # 上一轮没翻完的分页先翻完
+            _pane_mod.send_key(win, "C-c")
+            time.sleep(0.2)
+        _pane_mod.send_key(win, "C-u")           # 清空当前行
+        time.sleep(0.15)
+        _pane_mod.send_literal(win, cmd)
+        _pane_mod.send_key(win, "Enter")
+        t0 = time.time()
+        pages = 0
+        while time.time() - t0 < timeout:
+            time.sleep(0.3)
+            tail_txt = _pane_mod.tail(win, 12)
+            if MORE_RE.search(tail_txt):
+                _pane_mod.send_key(win, "Space")
+                pages += 1
+                continue
+            lines = [x for x in tail_txt.splitlines() if x.strip()]
+            if lines and PROMPT_RE.match(lines[-1]) and time.time() - t0 > 1.0:
+                break
+        else:
+            left = _pager_drain(win)
+            raise PaneBusy(f"设备在 {timeout}s 内没回到提示符（已翻 {pages} 页"
+                           + (f"，收尾又翻了 {left} 页" if left else "") + "）")
+        full = _pane_mod.capture_text(win, 40000)
+        if not quiet:
+            extra = f"，翻页 {pages} 次" if pages else ""
+            print(f"  {C['dim']}· {cmd}  取自会话 {win}（{time.time()-t0:.1f}s{extra}）{C['reset']}")
+        return full
+
     tgt = f"netops:{win}"
     if not _pane_alive(win):
         raise SystemExit(f"✘ 同屏会话「{win}」里的进程已退出（串口被拔 / 设备断开？）\n"
@@ -962,8 +1193,13 @@ def _pane_screen_length(win, value):
     netmiko 每次连接也是这么做的。
     """
     tgt = f"netops:{win}"
-    _tmux("send-keys", "-t", tgt, "-l", f"screen-length {value} temporary")
-    _tmux("send-keys", "-t", tgt, "Enter")
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        _pane_mod.send_literal(win, f"screen-length {value} temporary")
+        _pane_mod.send_key(win, "Enter")
+    else:
+        _tmux("send-keys", "-t", tgt, "-l", f"screen-length {value} temporary")
+        _tmux("send-keys", "-t", tgt, "Enter")
     time.sleep(0.6)
 
 
@@ -1082,6 +1318,18 @@ def _capture_via_screen(dev, cmd, win, timeout=90):
     实测：切完得到 239 行，与直连抓取完全一致，且全程同屏可见。
     """
     tgt = f"netops:{win}"
+    if host.IS_WIN:
+        # 无 tmux 滚动历史：daemon Ring 不可清，但 _after_echo 只切 cmd 之后的段，
+        # 历史残渣天然被切掉，不需要 clear-history。
+        time.sleep(0.2)
+        raw = _session_run(win, cmd, timeout)
+        body = _after_echo(raw, cmd)
+        _ls = body.splitlines()
+        for _i, _l in enumerate(_ls):
+            if _l.strip() in ("return", "end"):
+                body = "\n".join(_ls[:_i + 1])
+                break
+        return _trim_tail(body), f"同屏会话 {win}"
     try:
         _tmux("clear-history", "-t", tgt)      # 清滚动历史
         # 再把【可见屏】推空：clear-history 只管滚动历史，当前屏幕上的内容还在，
@@ -1528,6 +1776,14 @@ def first_note(out):
 
 def _vrp_prompt(win):
     """读当前提示符（<...> 用户视图 / [...] 系统或子视图）。"""
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        tail = _pane_mod.tail(win, 8)
+        for ln in reversed([x for x in tail.splitlines() if x.strip()]):
+            m = re.search(r"([<\[])([^>\]]+)[>\]]\s*$", ln)
+            if m:
+                return ln.strip()[-40:]
+        return ""
     tail = _tmux("capture-pane", "-p", "-J", "-t", f"netops:{win}", "-S", "-8").stdout
     for ln in reversed([x for x in tail.splitlines() if x.strip()]):
         m = re.search(r"([<\[])([^>\]]+)[>\]]\s*$", ln)
@@ -1593,9 +1849,53 @@ def _pane_after(win, marker, lines=300):
     save 的 (y/n)/成功字样就看这段，而不是读窗格日志文件——日志靠 pipe-pane 的 cat 管道，
     respawn-pane 之后那个 cat 会死（曾因此漏看 (y/n)，没回 y，保存被当成取消）。
     """
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        txt = _pane_mod.tail(win, lines)
+        i = txt.rfind(marker)
+        return txt[i + len(marker):] if i >= 0 else ""
     txt = _tmux("capture-pane", "-p", "-J", "-t", f"netops:{win}", "-S", f"-{lines}").stdout
     i = txt.rfind(marker)
     return txt[i + len(marker):] if i >= 0 else ""
+
+
+def _pane_save_win(win, m=None, timeout=240):
+    """Windows 版 _pane_save：同样的语义，全部走 pane-daemon。"""
+    from lib import pane as _pane_mod
+    if _vrp_prompt(win).startswith("["):
+        _vrp_run(win, "return", timeout=15)
+    _pager_drain(win)
+    marker = "save vrpcfg.zip"
+    _pane_mod.send_literal(win, marker)
+    _pane_mod.send_key(win, "Enter")
+    t0, answered, seg = time.time(), 0, ""
+    while time.time() - t0 < timeout:
+        time.sleep(0.8)
+        seg = _pane_after(win, marker)
+        low = seg.lower()
+        if "saved successfully" in low:
+            break
+        if ("(y/n)" in low or "[y/n]" in low) and answered < 3:
+            tail_now = _pane_tail(win, 4)
+            if "(y/n)" not in tail_now and "[y/n]" not in tail_now:
+                time.sleep(0.4)
+                continue
+            _pane_mod.send_key(win, "y")
+            _pane_mod.send_key(win, "Enter")
+            answered += 1
+            time.sleep(0.6)
+            continue
+        lines = [x for x in _pane_tail(win, 6).splitlines() if x.strip()]
+        if answered and lines and PROMPT_RE.match(lines[-1]) and "(y/n)" not in low:
+            break
+    try:
+        verify = _vrp_run(win, "dir flash:/vrpcfg.zip", timeout=25)
+    except BaseException:
+        verify = ""
+    ok = ("saved successfully" in seg.lower()) and ("vrpcfg" in verify)
+    if m:
+        m.recv((seg or verify)[-800:], ok)
+    return ok, (seg + "\n" + verify)
 
 
 def _pane_save(win, m=None, timeout=240):
@@ -1607,6 +1907,8 @@ def _pane_save(win, m=None, timeout=240):
       * 不依赖窗格日志文件（respawn 后管道会死）；
       * 最后用 `dir flash:/vrpcfg.zip` 复核（和串口 / netmiko 引擎一致）。
     """
+    if host.IS_WIN:
+        return _pane_save_win(win, m, timeout)
     tgt = f"netops:{win}"
     if _vrp_prompt(win).startswith("["):
         _vrp_run(win, "return", timeout=15)
@@ -1939,6 +2241,13 @@ def cmd_attach(a):
         win = win.split(":", 1)[1]
     if not win:
         raise SystemExit("用法：netdev attach <设备名>")
+    if host.IS_WIN:
+        # Windows 无 tmux attach：终端式同屏走网页界面；命令行用 screen-*
+        print(f"{C['dim']}Windows 上没有 attach（无 tmux）。同屏操作：{C['reset']}")
+        print(f"  网页终端：{C['bold']}netdev ui{C['reset']}（{UI_BASE}）")
+        print(f"  命令行：{C['bold']}netdev screen-read {win}{C['reset']} / "
+              f"{C['bold']}netdev screen-send {win} \"…\"{C['reset']}")
+        return 0
     sess, target = _view_session(win)
     tmx = shutil.which("tmux")
     if not sys.stdin.isatty():
@@ -1949,9 +2258,63 @@ def cmd_attach(a):
     os.execv(tmx, [tmx, "attach-session", "-t", target])
 
 
+def _shell_win(a, dev):
+    """Windows：拉起 pane-daemon 同屏会话（无 tmux）。交互终端走网页界面。"""
+    from lib import pane as _pane_mod
+    name = dev["name"]
+    proto = dev.get("protocol", "ssh")
+    # 可达性预检：SSH/Telnet 先探 TCP
+    if proto in ("ssh", "telnet"):
+        import socket as _sock
+        _h, _pt = dev.get("host"), int(dev.get("port", 22 if proto == "ssh" else 23))
+        try:
+            with _sock.create_connection((_h, _pt), timeout=2.5):
+                pass
+        except Exception as e:
+            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h}:{_pt}）连不上：{type(e).__name__}\n"
+                             f"   先确认：① 地址/端口对不对 ② 设备是否在线 ③ 是否只是没插网线")
+    # 串口：同一串口不能有两个活桥；并且**先清孤儿桥**
+    #       （守护死了但 serial_bridge 仍握着串口 → 新桥 PermissionError 13）
+    if proto == "serial":
+        _sport = str(dev.get("port") or "")
+        if _sport.strip().lower() in ("", "auto"):
+            # 清单写 auto/没写 → 先解析成具体 COM 口，否则下面这层
+            # 「孤儿桥清理 + 双桥拦截」全被跳过（_sport 为空），
+            # 结果旧桥仍握着口、新桥 PermissionError 13。
+            _sport = engine.discover_serial_port() or ""
+            if _sport:
+                dev["port"] = _sport
+        if _sport:
+            _cleanup_windows_stale_serial_bridges(_sport)
+        for s in _pane_mod.list_screens():
+            if s.get("dead") or s["window"] == name:
+                continue
+            cmd = str(s.get("command", ""))
+            if _sport and _sport in cmd and cmd.startswith("serial_bridge"):
+                print(f"{C['yel']}⚠ 串口 {_sport} 已被同屏会话「{s['window']}」占用{C['reset']}")
+                print("  不再新开第二个桥（两个进程读同一个串口会互抢字节）")
+                print(f"  直接用：netdev screen-read {s['window']} ｜ "
+                      f"netdev screen-send {s['window']} \"…\"")
+                return 1
+    ok = _pane_mod.ensure(dev, restart=bool(getattr(a, "restart", False)), timeout=60)
+    if not ok:
+        raise SystemExit(f"✘ {name} 同屏会话拉起失败（看日志 logs/pane-{name}.daemon.log）")
+    _remember_target(dev, name, getattr(a, "device", None))
+    print(f"{C['grn']}✔ 同屏会话 {name} 已就绪（pane-daemon，140x40）{C['reset']}")
+    print(f"  读屏：{C['bold']}netdev screen-read {name}{C['reset']}"
+          f"{C['dim']}（最后 N 行：netdev screen-read {name} 30）{C['reset']}")
+    print(f"  发令：{C['bold']}netdev screen-send {name} \"display clock\"{C['reset']}")
+    print(f"  重连：{C['bold']}netdev shell {name} --restart{C['reset']}")
+    print(f"{C['dim']}  终端式同屏操作请用网页界面：netdev ui（{UI_BASE}）；"
+          f"退出 Ctrl+]{C['reset']}")
+    return 0
+
+
 def cmd_shell(a):
     """建/连一条可被 attach 的 tmux 会话（人机同屏：你看得见 AI 敲的，也能自己接管）。"""
     dev = resolve_target(a.device)
+    if host.IS_WIN:
+        return _shell_win(a, dev)
     if not shutil.which("tmux"):
         print(f"{C['yel']}⚠ 未安装 tmux，回退为直接连接（装法：brew install tmux）{C['reset']}")
         subprocess.run(_shell_inner(dev), shell=True)
@@ -1961,17 +2324,18 @@ def cmd_shell(a):
     proto = dev.get("protocol", "ssh")
     if proto in ("ssh", "telnet"):
         import socket
-        host, port = dev.get("host"), int(dev.get("port", 22 if proto == "ssh" else 23))
+        _h2, _p2 = dev.get("host"), int(dev.get("port", 22 if proto == "ssh" else 23))
         try:
-            with socket.create_connection((host, port), timeout=2.5):
+            with socket.create_connection((_h2, _p2), timeout=2.5):
                 pass
         except Exception as e:
-            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{host}:{port}）连不上：{type(e).__name__}\n"
+            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h2}:{_p2}）连不上：{type(e).__name__}\n"
                              f"   先确认：① 地址/端口对不对 ② 设备是否在线 ③ 是否只是没插网线\n"
                              f"   （想强制开窗也可以：把 TCP 通了再来；或先 netdev ping {name} <目标>）")
     # ☆ 串口防双桥：这个口已经在某个同屏窗口里用着 → 直接切过去，
     #   绝不新开第二个桥（两个进程抢同一个串口会让对方 read 抛异常而崩）。
     if dev.get("protocol") == "serial":
+        _resolve_serial_auto(dev)          # port/baud 的 "auto" 先落成实际值，防双桥比对失准
         _sport = dev.get("port") or engine.discover_serial_port() or ""
         # ☆ 先收拾"孤儿桥"：窗格已销毁但进程还在握着串口（会让后续接入打不开/互抢）
         _stale = _stale_serial_bridges(_sport)
@@ -2172,6 +2536,23 @@ def cmd_screen_ls(a):
     只列 netops 里的设备窗格：`view-*` 是“某个网页终端自己的视图会话”（里面是 link-window
     链接过去的同一块窗格），不重复计数。
     """
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        rows = _pane_mod.list_screens()
+        if getattr(a, "json", False):
+            print(json.dumps([{"session": "pane", "window": r["window"],
+                               "target": r["target"], "size": r["size"],
+                               "command": r["command"], "dead": r["dead"]}
+                              for r in rows], ensure_ascii=False))
+            return 0
+        if not rows:
+            print("当前没有同屏会话。用 `netdev shell <设备>` 创建。"); return 0
+        print(f"{C['bold']}同屏会话（pane-daemon）{C['reset']}：")
+        for r in rows:
+            print(f"  {r['window']:<20} {r['size']:<8} {r['command']:<30} "
+                  f"{'[已退出]' if r['dead'] else ''}")
+        print(f"\n{C['dim']}你接入：netdev screen-read <设备> / netdev ui 网页终端{C['reset']}")
+        return 0
     if not shutil.which("tmux"):
         print("未安装 tmux"); return 1
     if getattr(a, "json", False):
@@ -2206,6 +2587,11 @@ def cmd_screen_ls(a):
 
 
 def _require_pane(dev_name):
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        if _pane_mod.control(dev_name) is None:
+            raise SystemExit(f"没有 {dev_name} 的同屏会话。先跑：netdev shell {dev_name}")
+        return
     if not shutil.which("tmux"):
         raise SystemExit("未安装 tmux")
     if _tmux("has-session", "-t", "netops").returncode != 0 or \
@@ -2247,12 +2633,21 @@ def cmd_screen_send(a):
         colorize.write_mark(text, src=getattr(a, "src", "ai"), device=dev["name"])
     except Exception:
         pass
-    _tmux("send-keys", "-t", _tmux_target(dev["name"]), "-l", text)
-    m.send(f"[同屏] {text}", gates.classify(text))
-    if not a.no_enter:
-        _tmux("send-keys", "-t", _tmux_target(dev["name"]), "Enter")
-    time.sleep(a.wait)
-    out = _tmux("capture-pane", "-p", "-J", "-t", _tmux_target(dev["name"]), "-S", f"-{a.lines}").stdout
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        _pane_mod.send_literal(dev["name"], text)
+        m.send(f"[同屏] {text}", gates.classify(text))
+        if not a.no_enter:
+            _pane_mod.send_key(dev["name"], "Enter")
+        time.sleep(a.wait)
+        out = _pane_mod.capture_text(dev["name"], a.lines)
+    else:
+        _tmux("send-keys", "-t", _tmux_target(dev["name"]), "-l", text)
+        m.send(f"[同屏] {text}", gates.classify(text))
+        if not a.no_enter:
+            _tmux("send-keys", "-t", _tmux_target(dev["name"]), "Enter")
+        time.sleep(a.wait)
+        out = _tmux("capture-pane", "-p", "-J", "-t", _tmux_target(dev["name"]), "-S", f"-{a.lines}").stdout
     tail = "\n".join([l for l in out.splitlines() if l.strip()][-12:])   # 观察口只留尾部，避免刷屏
     m.recv(tail, True)
     m.close()
@@ -2265,8 +2660,20 @@ def cmd_screen_read(a):
     """读同屏会话的当前屏幕（AI 看人做了什么、人看 AI 做了什么，同一个屏）。"""
     dev = resolve_target(a.device)
     _require_pane(dev["name"])
-    out = _tmux("capture-pane", "-p", "-J", "-t", _tmux_target(dev["name"]), "-S", f"-{a.lines}").stdout
-    print(colorize.paint_str(out.rstrip()) if colorize.enabled() else out.rstrip())
+    if host.IS_WIN:
+        from lib import pane as _pane_mod
+        # ⚠ 2026-10-05 Windows 着色：改用 capture_raw 拿原始字节（含桥进程注入的
+        #    输入三色 + IP 橙 ANSI），再只截取末尾 --lines 行。
+        #    旧的 capture_text() 会 strip_ansi() 把所有着色剥光，只剩 IP 橙，
+        #    而 POSIX tmux capture-pane -p 本来就保留完整 ANSI —— 行为对齐。
+        raw = _pane_mod.capture_raw(dev["name"])
+        # 只保留最后 N 行（用 \r\n?\n 拆，保留原始换行与 ANSI 嵌入）
+        txt = raw.decode("utf-8", "replace")
+        lines = [ln for ln in txt.split("\n")]
+        out = "\n".join(lines[-a.lines:])
+    else:
+        out = _tmux("capture-pane", "-p", "-J", "-t", _tmux_target(dev["name"]), "-S", f"-{a.lines}").stdout
+    print(out.rstrip())
     return 0
 
 
@@ -2406,7 +2813,8 @@ def cmd_device_add(a):
         print(f"✘ protocol 只能是 ssh / telnet / serial，收到 {proto}"); return 1
     if proto == "serial":
         if not a.device_port and not a.auto:
-            print("✘ 串口设备需要 --device-port（如 /dev/cu.usbserial-XXXX），或 --auto 自动发现"); return 1
+            _eg = "COM3" if host.IS_WIN else "/dev/cu.usbserial-XXXX"
+            print(f"✘ 串口设备需要 --device-port（如 {_eg}），或 --auto 自动发现"); return 1
     else:
         if not a.host:
             print(f"✘ {proto} 设备需要 --host"); return 1
@@ -2417,7 +2825,17 @@ def cmd_device_add(a):
              f'protocol = "{proto}"']
     if proto == "serial":
         lines.append(f'port     = "{a.device_port or "auto"}"')
-        lines.append(f'baud     = {a.baud or 9600}')
+        # ★ 2026-10-06：baud 支持 "auto"（与配置模板/网页端下拉一致）。
+        #   原来 --baud 是 int（默认 9600）→ 生成的条目写死 9600，而设备实际可能
+        #   是 115200：接入时串口桥要先自检再切档，`netdev list` 也一直显示错的速率。
+        _baud = str(a.baud if a.baud is not None else "auto").strip().lower()
+        if _baud in ("", "auto"):
+            lines.append('baud     = "auto"')
+        else:
+            try:
+                lines.append(f'baud     = {int(_baud)}')
+            except ValueError:
+                print(f"✘ --baud 只能是数字或 auto，收到 {a.baud!r}"); return 1
         lines.append('backspace = "auto"')
     else:
         lines.append(f'host     = "{a.host}"')
@@ -2460,7 +2878,33 @@ def cmd_device_add(a):
     return 0
 
 
+def _serial_discover_win(a):
+    """Windows：枚举 COM 口（pyserial），试打开，标注 netdev 占用。"""
+    ports = host.serial_ports()
+    if not ports:
+        print("未发现串口设备。检查：USB 转 Console 线是否插好 / 驱动是否装（FTDI·CH340·CP210x）")
+        return 1
+    used = {}
+    for d in engine.load_devices().values():
+        if d.get("protocol") == "serial" and d.get("port"):
+            used[d["port"].upper()] = d["name"]
+    print(f"{C['bold']}发现 {len(ports)} 个串口端点：{C['reset']}")
+    for dev_name, desc in ports:
+        try:
+            import serial
+            s = serial.Serial(dev_name, 9600, timeout=0.2); s.close()
+            flag = f"{C['grn']}可打开（9600-8N1）{C['reset']}"
+        except Exception as e:
+            flag = f"{C['yel']}被占用/打不开: {type(e).__name__}{C['reset']}"
+        owner = f"   ← netdev 设备: {used[dev_name.upper()]}" if dev_name.upper() in used else ""
+        print(f"  {dev_name}  {flag}  {desc[:50]}{owner}")
+    print(f"\n{C['dim']}提示：拿不准对面是哪台设备？登录后跑 netdev identify <设备名> 读 ESN 对账{C['reset']}")
+    return 0
+
+
 def cmd_serial_discover(a):
+    if host.IS_WIN:
+        return _serial_discover_win(a)
     import glob
     # 所有 /dev/cu.*（排除蓝牙/调试假串口）——换任何 USB 转串口线都能认出来
     skip_suffix = ("-Incoming-Port", "-Modem")
@@ -2586,7 +3030,8 @@ def cmd_selftest(a):
         print(f"{C['dim']}   或者改 config/devices.toml 里 mock-hw 的 port 换一个空闲端口。{C['reset']}")
         return 2
     proc = subprocess.Popen([sys.executable, str(sim), str(port)],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            creationflags=_NO_WINDOW)
     # ★ 固定 sleep 是本项目反复踩的坑（GitHub ARM 冷启动实测 32s）。
     #   这里改成轮询到端口真的监听起来，上限 8 秒；超时就把子进程输出打出来。
     _deadline = time.time() + 8
@@ -2849,17 +3294,21 @@ def _mock_paths(port: int):
 
 
 def _mock_pid(port: int):
-    """返回 (pid, pidfile)；没在跑时 pid 为 None（残留文件也返回 None）。"""
+    """返回 (pid, pidfile)；没在跑时 pid 为 None（残留文件也返回 None）。
+
+    ★ 探活必须走 host.pid_alive（2026-10-04 Windows 实测修）：
+    Windows 上 os.kill(pid, 0) 不是探活 —— 实测抛 OSError WinError 87，
+    于是这里恒判"没在跑"，导致 status 永远报没跑、stop 停不掉、
+    start 每次都另起一个实例（PID 越积越多）。
+    """
     pidf, _ = _mock_paths(port)
     try:
         pid = int(pidf.read_text(encoding="utf-8").strip())
     except Exception:
         return None, pidf
-    try:
-        os.kill(pid, 0)          # 探活，不杀
+    if host.pid_alive(pid):
         return pid, pidf
-    except Exception:
-        return None, pidf        # 残留 pid 文件：进程已死
+    return None, pidf            # 残留 pid 文件：进程已死
 
 
 def cmd_ai_log(a):
@@ -2942,17 +3391,17 @@ def cmd_ai_log(a):
         t = r.get("at", "")[11:]
         k = r.get("type")
         if k == "user":
-            print(f"{t}  {C['cyn']}👤 你 {C['reset']}{r.get('text','')[:160]}")
+            print(f"{t}  {C['cyn']}● 你 {C['reset']}{r.get('text','')[:160]}")
         elif k == "tool_call":
             arg = _json.dumps(r.get("args") or {}, ensure_ascii=False)[:130]
-            print(f"{t}  {C['blu']}🔧 工具 {C['reset']}{r.get('name','')}({arg}) "
+            print(f"{t}  {C['blu']}▷ 工具 {C['reset']}{r.get('name','')}({arg}) "
                   f"{C['dim']}→ {r.get('result_chars',0)} 字符{C['reset']}")
         elif k == "turn_end":
             txt = (r.get("assistant") or "").replace("\n", " ")[:160]
             extra = f" {C['dim']}[{r.get('seconds','?')}s{' 已中止' if r.get('aborted') else ''}]{C['reset']}"
-            print(f"{t}  {C['grn']}🤖 AI {C['reset']}{txt}{extra}")
+            print(f"{t}  {C['grn']}◆ AI {C['reset']}{txt}{extra}")
         elif k == "compact":
-            print(f"{t}  {C['yel']}🗜 压缩 {C['reset']}丢弃 {r.get('dropped')} 条 → "
+            print(f"{t}  {C['yel']}■ 压缩 {C['reset']}丢弃 {r.get('dropped')} 条 → "
                   f"摘要 {r.get('summary_chars')} 字（原文仍在流水）")
         elif k == "error":
             print(f"{t}  {C['red']}✘ 错误 {C['reset']}{str(r.get('error',''))[:160]}")
@@ -2999,12 +3448,10 @@ def cmd_mock(a):
             print("本来就没在跑")
             return 0
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)     # Windows：走 TerminateProcess，实测有效
             for _ in range(20):
                 time.sleep(0.15)
-                try:
-                    os.kill(pid, 0)
-                except Exception:
+                if not host.pid_alive(pid):  # ★ 同上：不能用 os.kill(pid, 0) 探活
                     break
             else:
                 os.kill(pid, signal.SIGKILL)
@@ -3032,7 +3479,7 @@ def cmd_mock(a):
     with open(logf, "ab") as fh:
         proc = subprocess.Popen([py, str(sim), str(port)], stdout=fh, stderr=fh,
                                 stdin=subprocess.DEVNULL, start_new_session=True,
-                                cwd=str(ROOT))
+                                cwd=str(ROOT), creationflags=_NO_WINDOW)
     pidf.write_text(str(proc.pid), encoding="utf-8")
     for _ in range(40):                      # 等它真的在监听，别"起完就说好了"
         time.sleep(0.15)
@@ -3310,22 +3757,44 @@ def _doctor_rows():
     """体检项 → (名称, 是否通过, 说明/修法)"""
     import json as _json
     rows = []
-    dev = ROOT / "netdev"
-    rows.append(("netdev 入口", dev.exists() and os.access(dev, os.X_OK), str(dev)))
-    venv = ROOT / ".venv/bin/python"
+    if host.IS_WIN:
+        # Windows 安装形态：netdev.cmd（安装器建）；源码形态：netdev_cli.py 本体
+        dev = ROOT / "netdev.cmd"
+        if not dev.exists():
+            dev = ROOT / "netdev_cli.py"
+        rows.append(("netdev 入口", dev.exists(), str(dev)))
+    else:
+        dev = ROOT / "netdev"
+        rows.append(("netdev 入口", dev.exists() and os.access(dev, os.X_OK), str(dev)))
+    venv = host.venv_python(ROOT)
     rows.append(("venv python", venv.exists(), str(venv) if venv.exists() else "缺失（设备读写会不可用）"))
     if venv.exists():
         r = subprocess.run([str(venv), "-c", "import netmiko,serial;print(netmiko.__version__, serial.__version__)"],
                            capture_output=True, text=True)
         rows.append(("netmiko / pyserial", r.returncode == 0, (r.stdout or r.stderr).strip()[:60]))
-    _which_tmux = shutil.which("tmux")
-    tmux = pathlib.Path(_which_tmux) if _which_tmux else next(
-        (p for p in (ROOT.parent / "homebrew/bin/tmux", pathlib.Path("/opt/homebrew/bin/tmux"),
-                     pathlib.Path("/usr/local/bin/tmux"), pathlib.Path("/usr/bin/tmux")) if p.exists()), None)
-    rows.append(("tmux（同屏会话）", bool(tmux), str(tmux) if tmux else "缺失：同屏会话/AI 读屏不可用"))
+        if host.IS_WIN:
+            # pywinpty：串口桥的 PTY；keyring：系统凭据库（M1 起 Win 必需）
+            rw = subprocess.run([str(venv), "-c", "import winpty,keyring;print('pywinpty/keyring ok')"],
+                                capture_output=True, text=True)
+            rows.append(("pywinpty / keyring", rw.returncode == 0, (rw.stdout or rw.stderr).strip()[:60]))
+    if host.IS_WIN:
+        # Windows 同屏会话由自建 pane-daemon 承担（替代 tmux）。
+        # 控制口信息在 state/panes/<device>.json；M2 实现，此前只如实报未启用。
+        panes_dir = _P.state_dir() / "panes"
+        npanes = len(list(panes_dir.glob("*.json"))) if panes_dir.exists() else 0
+        rows.append(("pane-daemon（同屏会话）", True,
+                     f"{npanes} 个会话守护（{panes_dir}）" if npanes else "未启用（正常；接入设备后自动拉起）"))
+    else:
+        _which_tmux = shutil.which("tmux")
+        tmux = pathlib.Path(_which_tmux) if _which_tmux else next(
+            (p for p in (ROOT.parent / "homebrew/bin/tmux", pathlib.Path("/opt/homebrew/bin/tmux"),
+                         pathlib.Path("/usr/local/bin/tmux"), pathlib.Path("/usr/bin/tmux")) if p.exists()), None)
+        rows.append(("tmux（同屏会话）", bool(tmux), str(tmux) if tmux else "缺失：同屏会话/AI 读屏不可用"))
     script = ROOT / "tools/quick_conn.py"
-    rows.append(("接入脚本", script.exists() and os.access(script, os.X_OK),
-                 str(script) + ("" if script.exists() and os.access(script, os.X_OK) else "（缺失或不可执行）")))
+    # Windows 没有可执行位语义，只看文件在不在
+    script_ok = script.exists() and (host.IS_WIN or os.access(script, os.X_OK))
+    rows.append(("接入脚本", script_ok,
+                 str(script) + ("" if script_ok else "（缺失或不可执行）")))
     f = _web_path(None)
     data, warn = _web_load(f)
     have = {c.get("name") for c in data["commands"]}
@@ -3345,17 +3814,36 @@ def _doctor_rows():
         rows.append(("设备/连接清单", True,
                      f"devices.toml {ndev} 台" + ("（还没加设备是正常的：netdev device-add <名字>）" if not ndev else "")
                      + f"；connections.json {'有' if conns.exists() else '暂无（正常）'}"))
-    ports = sorted(pathlib.Path("/dev").glob("cu.usbserial*"))
-    rows.append(("串口设备", True, f"{len(ports)} 个：" + (", ".join(p.name for p in ports) if ports else "当前无（USB-Console 线未插是正常的）")))
-    try:
-        tmux_bin = shutil.which("tmux") or "tmux"
-        out = subprocess.run([tmux_bin, "list-panes", "-a", "-F", "#{window_name} dead=#{pane_dead}"],
-                             capture_output=True, text=True, timeout=6).stdout.strip()
-        dead = [x.split()[0] for x in out.splitlines() if "dead=1" in x]
-        rows.append(("同屏会话", True, (out.replace("\n", " ｜ ") if out else "无会话（正常；接上设备后才会有）") +
-                     (f"　⚠ 已死窗口：{', '.join(dead)}（桥已退出，设备可能被拔）→ 重新接入即可" if dead else "")))
-    except Exception as e:
-        rows.append(("同屏会话", False, f"查不到：{e}"))
+    if host.IS_WIN:
+        ports = host.serial_ports()
+        rows.append(("串口设备", True,
+                     f"{len(ports)} 个：" + (", ".join(f"{n}({d})" for n, d in ports) if ports else "当前无（USB-Console 线未插是正常的）")))
+    else:
+        ports = sorted(pathlib.Path("/dev").glob("cu.usbserial*"))
+        rows.append(("串口设备", True, f"{len(ports)} 个：" + (", ".join(p.name for p in ports) if ports else "当前无（USB-Console 线未插是正常的）")))
+    if host.IS_WIN:
+        # pane-daemon 会话清单：用 pane.list_screens()（它连控制口查桥 alive，
+        #  不会把"守护活着但桥死了"误诊为活着；也不会把"注册表残留但守护已死"算进去）
+        try:
+            _pm3 = importlib.import_module("lib.pane")
+            all_screens = _pm3.list_screens()
+        except Exception:
+            all_screens = []
+        alive_names = [s["window"] for s in all_screens if not s.get("dead")]
+        dead_names = [s["window"] for s in all_screens if s.get("dead")]
+        rows.append(("同屏会话", True,
+                     ("、".join(alive_names) if alive_names else "无会话（正常；接上设备后才会有）")
+                     + (f"　⚠ 已死守护：{', '.join(dead_names)}（桥已退出，设备可能被拔）→ 重新接入即可" if dead_names else "")))
+    else:
+        try:
+            tmux_bin = shutil.which("tmux") or "tmux"
+            out = subprocess.run([tmux_bin, "list-panes", "-a", "-F", "#{window_name} dead=#{pane_dead}"],
+                                 capture_output=True, text=True, timeout=6).stdout.strip()
+            dead = [x.split()[0] for x in out.splitlines() if "dead=1" in x]
+            rows.append(("同屏会话", True, (out.replace("\n", " ｜ ") if out else "无会话（正常；接上设备后才会有）") +
+                         (f"　⚠ 已死窗口：{', '.join(dead)}（桥已退出，设备可能被拔）→ 重新接入即可" if dead else "")))
+        except Exception as e:
+            rows.append(("同屏会话", False, f"查不到：{e}"))
     _uh = _ui_health()
     _stale, _why = _ui_code_stale() if _uh["up"] else (False, "")
     rows.append((f"netdev-ui :{UI_PORT}", _uh["up"] and not _stale,
@@ -3414,7 +3902,10 @@ def _doctor_rows():
         last = ""
         alog = ROOT / "logs/approvals.log"
         if alog.exists():
-            lines = [x for x in alog.read_text(errors="ignore").splitlines() if x.strip()]
+            # approvals.log 由 lib/approval.py 显式以 UTF-8 追加写入，
+            # 这里必须同样用 UTF-8 读；否则中文 Windows（cp936）上会读成乱码，
+            # 「最近一次审批」一栏显示不出正确内容。
+            lines = [x for x in alog.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip()]
             if lines:
                 f = lines[-1].split()
                 last = f" 最近: {f[1]} {f[0].split()[1] if len(f[0].split()) > 1 else ''}"
@@ -3426,29 +3917,42 @@ def _doctor_rows():
     except Exception as e:
         rows.append(("写操作人审", False, f"检查失败：{type(e).__name__}"))
 
-    lc = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
-    la_dir = pathlib.Path.home() / "Library/LaunchAgents"
-    la_ui = la_dir / "com.netdev.ui.plist"
-    loaded = UI_LABEL in lc
-    installed = la_ui.exists()
     up = _uh["up"]
     # 这一项问的是「重启后 :8898 会不会自己回来」，属部署选择，不是缺陷：
     # 服务正在跑就不判失败，只如实说明重启后的行为。
-    if loaded:
-        rows.append(("开机自启", True, "已装且已加载 —— 登录后会自动回来"))
-    elif installed:
-        rows.append(("开机自启", up,
-                     "已装未加载 —— 现在服务在跑，但重启后不会自动回来"
-                     " → 想自动：netdev ui install（本机 launchctl bootstrap 常被安全策略拦，拦了也不影响日常用 netdev ui）"
-                     if up else "已装未加载，且服务没在跑 → netdev ui start"))
+    if host.IS_WIN:
+        # Windows 自启：Startup 文件夹快捷方式（安装器建 netdev-ui.lnk）或注册表 Run 键
+        installed, how = _win_autostart_state()
+        if installed:
+            rows.append(("开机自启", up,
+                         f"已装（{how}）—— 登录后会自动回来" if up else
+                         f"已装（{how}），且服务没在跑 → netdev ui start"))
+        else:
+            rows.append(("开机自启", up,
+                         "未装 —— 重启后需手动 netdev ui start（想自动：netdev ui install）"
+                         if up else "未装，且服务没在跑 → netdev ui start"))
     else:
-        rows.append(("开机自启", up,
-                     "未装 —— 重启后需手动 netdev ui start（想自动：netdev ui install）"
-                     if up else "未装，且服务没在跑 → netdev ui start"))
+        lc = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+        la_dir = pathlib.Path.home() / "Library/LaunchAgents"
+        la_ui = la_dir / "com.netdev.ui.plist"
+        loaded = UI_LABEL in lc
+        installed = la_ui.exists()
+        if loaded:
+            rows.append(("开机自启", True, "已装且已加载 —— 登录后会自动回来"))
+        elif installed:
+            rows.append(("开机自启", up,
+                         "已装未加载 —— 现在服务在跑，但重启后不会自动回来"
+                         " → 想自动：netdev ui install（本机 launchctl bootstrap 常被安全策略拦，拦了也不影响日常用 netdev ui）"
+                         if up else "已装未加载，且服务没在跑 → netdev ui start"))
+        else:
+            rows.append(("开机自启", up,
+                         "未装 —— 重启后需手动 netdev ui start（想自动：netdev ui install）"
+                         if up else "未装，且服务没在跑 → netdev ui start"))
 
     # pi-web-ui 前端小补丁：左栏按钮“作用在当前选中的终端”（否则会按标题复用同一个终端）
+    # 该补丁只针对 macOS 上的 pi-web-ui，Windows 不适用，跳过。
     patcher = ROOT / "tools/piweb_patch.py"
-    if patcher.exists():
+    if patcher.exists() and not host.IS_WIN:
         pr = subprocess.run([sys.executable, str(patcher), "--check"], capture_output=True, text=True)
         note = (pr.stdout or pr.stderr).strip()
         rows.append(("左栏按钮补丁", pr.returncode == 0,
@@ -3465,13 +3969,7 @@ def _ui_pid() -> int:
 
 
 def _ui_alive(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return host.pid_alive(pid)
 
 
 def _ui_port_open() -> bool:
@@ -3508,12 +4006,35 @@ def _ui_daemon(*args: str) -> tuple[int, str]:
     p = subprocess.run([sys.executable, str(UI_DAEMON),
                         "--port", str(UI_PORT), "--host", UI_HOST,
                         "--pidfile", str(UI_PIDFILE), "--logfile", str(UI_LOGFILE), *args],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, creationflags=_NO_WINDOW,
+                       errors="replace")
     return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
 
 
 def _ui_kill_orphan() -> None:
     """端口被占但 PID 文件对不上（旧实例 / 手工起的前台进程）时，按端口找出来收掉。"""
+    if host.IS_WIN:
+        try:
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                 capture_output=True, text=True, timeout=6,
+                                 creationflags=_NO_WINDOW, **_SYS_TEXT).stdout
+        except Exception:
+            return
+        killed = set()
+        for ln in (out or "").splitlines():
+            if f":{UI_PORT}" in ln and "LISTENING" in ln.upper():
+                s = ln.split()[-1]
+                if s.isdigit() and int(s) != os.getpid() and s not in killed:
+                    killed.add(s)
+                    subprocess.run(["taskkill", "/PID", s, "/T", "/F"], capture_output=True,
+                                   creationflags=_NO_WINDOW)
+                    print(f"{C['dim']}   已停掉占用 {UI_PORT} 的旧进程 PID {s}{C['reset']}")
+        time.sleep(0.6)
+        try:
+            UI_PIDFILE.unlink()
+        except Exception:
+            pass
+        return
     lsof = shutil.which("lsof") or "/usr/sbin/lsof"
     try:
         out = subprocess.run([lsof, "-nP", f"-iTCP:{UI_PORT}", "-sTCP:LISTEN", "-t"],
@@ -3620,7 +4141,13 @@ def _ui_status_lines() -> list[tuple[bool, str]]:
     else:
         pid_note = f"{pid}（已死 —— PID 文件是残留）"
     rows.append((pid_ok or h["up"], f"{'进程':<8}{pid_note}"))
-    if UI_PLIST.exists():
+    if host.IS_WIN:
+        installed, how = _win_autostart_state()
+        if installed:
+            rows.append((True, f"{'开机自启':<7}已装（{how}）"))
+        else:
+            rows.append((True, f"{'开机自启':<7}未装（想装：netdev ui install）"))
+    elif UI_PLIST.exists():
         loaded = UI_LABEL in subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
         rows.append((loaded, f"{'开机自启':<7}{'已装已加载' if loaded else '已装未加载'}（{UI_PLIST.name}）"))
     else:
@@ -3630,6 +4157,72 @@ def _ui_status_lines() -> list[tuple[bool, str]]:
         if stale:
             rows.append((False, f"{'代码版本':<8}{why}"))
     return rows
+
+
+def _ui_install_win() -> int:
+    """Windows 开机自启：在用户 Startup 目录建 netdev-ui.lnk（pythonw 隐藏启动）。
+
+    与 install.ps1 / 一键体检.ps1 建的是同一个文件、同样的目标，保证三处口径一致。
+    """
+    lnk = _win_startup_lnk()
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+    pyw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    if not pyw.exists():
+        pyw = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not pyw.exists():
+        pyw = pathlib.Path(sys.executable)
+    env = dict(os.environ)
+    env["NETDEV_LNK"] = str(lnk)
+    env["NETDEV_TARGET"] = str(pyw)
+    env["NETDEV_ARGS"] = f'"{ROOT / "netdev_cli.py"}" ui'
+    env["NETDEV_WORKDIR"] = str(ROOT)
+    ps = ("$ws = New-Object -ComObject WScript.Shell; "
+          "$sc = $ws.CreateShortcut($env:NETDEV_LNK); "
+          "$sc.TargetPath = $env:NETDEV_TARGET; "
+          "$sc.Arguments = $env:NETDEV_ARGS; "
+          "$sc.WorkingDirectory = $env:NETDEV_WORKDIR; "
+          "$sc.WindowStyle = 7; "
+          "$sc.Description = 'netdev 网络设备工具台 · 登录后隐藏启动'; "
+          "$sc.Save()")
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       capture_output=True, text=True, creationflags=_NO_WINDOW, env=env, **_SYS_TEXT)
+    if r.returncode == 0 and lnk.exists():
+        print(f"{C['grn']}✔{C['reset']} 已装开机自启：{lnk}")
+        print(f"{C['dim']}  pythonw 隐藏启动（不弹控制台）；登录后自动回来。卸载：netdev ui uninstall{C['reset']}")
+        return 0
+    print(f"{C['red']}✘ 开机自启创建失败{C['reset']}")
+    err = (r.stderr or r.stdout).strip()
+    if err:
+        print(f"{C['dim']}  {err}{C['reset']}")
+    return 1
+
+
+def _ui_uninstall_win() -> int:
+    """Windows：移除 Startup 快捷方式（以及可能存在的注册表 Run 键）。"""
+    removed = []
+    lnk = _win_startup_lnk()
+    if lnk.exists():
+        try:
+            lnk.unlink()
+            removed.append(str(lnk))
+        except OSError as e:
+            print(f"{C['red']}✘ 删不掉 {lnk}：{e}{C['reset']}")
+            return 1
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run",
+                            0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, "netdev-ui")
+            removed.append("注册表 Run 键 netdev-ui")
+    except OSError:
+        pass
+    if removed:
+        for x in removed:
+            print(f"{C['grn']}✔{C['reset']} 已移除 {x}")
+    else:
+        print(f"{C['dim']}本来就没装{C['reset']}")
+    return 0
 
 
 def cmd_ui(a):
@@ -3704,6 +4297,8 @@ def cmd_ui(a):
         return rc
 
     if act == "install":
+        if host.IS_WIN:
+            return _ui_install_win()
         python = ROOT / ".venv/bin/python"
         if not python.exists():
             python = pathlib.Path(sys.executable)
@@ -3724,6 +4319,8 @@ def cmd_ui(a):
         return 0
 
     if act == "uninstall":
+        if host.IS_WIN:
+            return _ui_uninstall_win()
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{UI_LABEL}"], capture_output=True, text=True)
         if UI_PLIST.exists():
             UI_PLIST.unlink()
@@ -3871,9 +4468,10 @@ def main(argv=None):
             _first = argv[0]
             _known = _first in ("list", "run", "apply", "snap", "shell", "attach", "screen-ls", "screen-read",
                                 "screen-send", "backup", "save", "snap", "login", "serial-discover", "identify",
-                                "conn", "web", "doctor", "policy", "serve", "logs", "ping", "mcp")
+                                "conn", "web", "ui", "doctor", "policy", "serve", "logs", "ping", "mcp")
             if not _known:
-                if _tmux("has-session", "-t", "netops").returncode == 0 and \
+                # Windows 无 tmux（同屏会话由 pane-daemon 承载），只查设备表。
+                if not host.IS_WIN and _tmux("has-session", "-t", "netops").returncode == 0 and \
                         _first in _tmux("list-windows", "-t", "netops", "-F", "#{window_name}").stdout.split():
                     argv = ["attach", _first] + argv[1:]
                 elif _first in engine.load_devices():
@@ -3921,7 +4519,8 @@ def main(argv=None):
     cn.add_argument("-u", "--username", default="")
     cn.add_argument("--name", default="")
     cn.add_argument("--device", help="串口设备路径")
-    cn.add_argument("--baud", type=int, default=9600)
+    cn.add_argument("--baud", default="auto",
+                    help="串口波特率：数字，或 auto 自动探测（默认 auto）")
     cn.add_argument("--note", default="")
     cn.add_argument("--platform", default="huawei_vrp")
     cn.add_argument("--json", action="store_true", help="机器可读输出（给网页/AI 用）")
@@ -3978,7 +4577,8 @@ def main(argv=None):
     da.add_argument("--port", type=int, help="端口（默认 ssh=22 / telnet=23）")
     da.add_argument("--device-port", dest="device_port", help="串口路径，如 /dev/cu.usbserial-XXXX")
     da.add_argument("--auto", action="store_true", help="串口：自动发现设备")
-    da.add_argument("--baud", type=int, default=9600)
+    da.add_argument("--baud", default="auto",
+                    help="串口波特率：数字，或 auto 自动探测（默认 auto）")
     da.add_argument("--username", help="登录用户名（可留空，串口登录时会问）")
     da.add_argument("--platform", default="huawei_vrp",
                     help="netmiko 平台：huawei_vrp / h3c_comware / ruijie_os / cisco_ios …")
@@ -4096,6 +4696,7 @@ def main(argv=None):
 
     a = p.parse_args(argv)
     return a.fn(a)
+
 
 if __name__ == "__main__":
     try:

@@ -40,8 +40,19 @@ def _first_existing(*cands: pathlib.Path) -> pathlib.Path:
 
 
 def cfg(name: str) -> pathlib.Path:
-    """配置文件定位：安装根（软链）优先，回落 `config/`（源码安装）。"""
-    return _first_existing(ROOT / name, CONFIG / name)
+    """配置文件定位：**`config/` 是唯一真身**，安装根那份只是镜像。
+
+    为什么改成 config 优先（2026-10-06 修）
+        macOS 的安装包把 `安装根/devices.toml` 建成**指向 config/devices.toml 的软链**，
+        于是"读哪份"其实是同一份。Windows 建不了软链，安装器改成「config → 安装根」
+        复制一份 —— 根目录那份就成了**独立副本**。原来这里写「安装根优先」，后果实测：
+          · 用户按报错提示去改 `config/devices.toml`，程序读的却是安装根那份 → 改了没用；
+          · `netdev device-add` 写进安装根那份，而重装时安装器又用 `config → 安装根`
+            覆盖它 → **重装一次，用户加的设备全没了**。
+        与 macOS 语义对齐的做法：`config/` 是真身，读写都走它；安装根那份由安装器
+        每次同步，只作兼容镜像（老文档/脚本偶尔直接读安装根）。
+    """
+    return _first_existing(CONFIG / name, ROOT / name)
 
 
 def state_dir() -> pathlib.Path:
@@ -101,6 +112,9 @@ def bootstrap(verbose: bool = False) -> list[str]:
     """
     made: list[str] = []
     CONFIG.mkdir(parents=True, exist_ok=True)
+    # doctor「配置真身」要求 config/state 存在（Windows 不用软链，两个实体目录并存）。
+    # 安装包会显式建它；源码安装（git clone）没有这一步 → 全新克隆 doctor 恒红。
+    (CONFIG / "state").mkdir(parents=True, exist_ok=True)
     for name, tpl in _DERIVED.items():
         dst = CONFIG / name
         if dst.exists():

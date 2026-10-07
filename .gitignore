@@ -97,6 +97,20 @@ bin/netdev
 dist/stage/
 dist/stage.stale-*/
 dist/last_bundle.txt
+# ★ Windows 图形程序编译产物（源在 dist/installer/*.cs，由 build_exes.ps1 用 csc.exe 生成）
+#   图标 netdev.ico 是资产（exe 图标 + 网页 favicon 的来源），要进仓；.exe 不进仓（2026-10-07 补）
+dist/installer/*.exe
+
+# ★ 垃圾临时目录（TEMP/TMP 为空或相对路径时，gettempdir() 会落在 CWD）——
+#   测试与 pip 的中间产物，绝不能进仓，更不能进安装包（2026-10-05 补，见 OPT-12）
+netdev-colorize-*/
+netdev-mon-*/
+netdev-cache-*/
+netdev-rmtree-*/
+netdev-ui-test-*/
+pip-install-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
 # ★ 打包时从 config/*.example 生成的模板副本（真源在 config/，2026-10-03 补）
 dist/installer/config-template/
 # ★ 离线二进制依赖（35MB 编译产物）—— 走 GitHub Release 附件，不进 git 仓（2026-10-03 补）

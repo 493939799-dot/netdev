@@ -103,15 +103,12 @@ function initDotMatrix(cv){
   const onResize = () => resize();
   addEventListener('resize', onResize);
 
-  if(matchMedia('(prefers-reduced-motion: reduce)').matches){
-    /* 无障碍：减动效环境渲染静态一帧 */
-    resize();
-    ctx.fillStyle = '#070707'; ctx.fillRect(0, 0, W, H); drawGlow(0);
-    for(const d of dots){ ctx.fillStyle = `rgba(${d.r},${d.g},${d.b},${d.a0})`; ctx.fillRect(d.x, d.y, d.s, d.s); }
-  }else{
-    resize();
-    rafId = requestAnimationFrame(frame);
-  }
+  /* 2026-10-06：不再看 prefers-reduced-motion —— 工程师机器常开「最佳性能」
+     （Windows 视觉效果 = 最佳性能，SPI 动画全关，Edge 即上报 reduce），
+     背景会被无声冻结成静态一帧，用户以为坏了。动效开关收归设置面板的
+     「背景点阵眼形」复选框（S.rain），语义显式、所见即所得。 */
+  resize();
+  rafId = requestAnimationFrame(frame);
 
   return { destroy(){ destroyed = true; cancelAnimationFrame(rafId); removeEventListener('resize', onResize); } };
 }
