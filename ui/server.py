@@ -1977,8 +1977,10 @@ def _parse_nat(text: str) -> dict | None:
     t = text
     used = cap = None
     for pat in (r"(?:current\s+)?total\s+(?:number\s+of\s+)?sessions?\s*[:：]?\s*(\d+)",
-                r"Total active translations:\s*(\d+)"):
-        m = re.search(pat, t, re.I)
+                r"Total active translations:\s*(\d+)",
+                # 华为 `display nat session all` 的收尾行：`Total : 0`（2026-10-09 真机）
+                r"^\s*Total\s*[:：]\s*(\d+)\s*$"):
+        m = re.search(pat, t, re.I | re.M)
         if m:
             used = int(m.group(1))
             break
@@ -2658,14 +2660,23 @@ def collect_metrics(dev: str) -> dict:
                     _wait_prompt(window, (cand.split() or [""])[0])
                     _rc, t2, _e = raw_netdev(["screen-read", window, "--lines", "200"], timeout=25)
                     t2 = strip_ansi(t2)
+                    # ★ 2026-10-09 修：原来拿【整屏 200 行】做坏命令判定 —— 里面混着
+                    #   前面候选的报错文本，导致「当前候选明明成功了」也判为坏，
+                    #   cache_put 永远不触发 → 每轮采集重演一遍全部候选报错（真机实测）。
+                    #   现在只取【本候选回显之后】的切段做判定，命中即缓存。
+                    _ls2 = t2.splitlines()
+                    _st2 = 0
+                    for _i2, _l2 in enumerate(_ls2):
+                        if cand in _l2:
+                            _st2 = _i2 + 1
+                    t2 = "\n".join(_ls2[_st2:])
                 else:
                     _rc, t2, err2 = raw_netdev(["run", dev, cand], timeout=30)
                     t2 = strip_ansi(t2) if not err2 else f"<err> {err2[:120]}"
                 if not _plat.looks_like_bad_command(t2) and t2.strip():
                     _plat.cache_put(dev, key, cand)
                     cmds.append(cand); used[key] = cand
-                    raws.setdefault("probe", "")
-                    raws["probe"] = (raws["probe"] + "\n" + t2)[-12000:]
+                    raws[key] = t2                          # 直接回填本候选的干净切段
                     print(f"  · {key} → 采用 {cand}（已记住，下次直接用）")
                     break
 
