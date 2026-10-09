@@ -72,6 +72,8 @@ def pid_alive(pid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+    except OverflowError:
+        return False                # pid 超出进程号上限（2**32 之类）→ 必然不存在
     except PermissionError:
         return True
     except OSError:
