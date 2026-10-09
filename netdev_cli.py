@@ -2271,7 +2271,7 @@ def _shell_win(a, dev):
             with _sock.create_connection((_h, _pt), timeout=2.5):
                 pass
         except Exception as e:
-            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h}:{_pt}）连不上：{type(e).__name__}\n"
+            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h}:{_pt}）连不上：{type(e).__name__}: {e}\n"
                              f"   先确认：① 地址/端口对不对 ② 设备是否在线 ③ 是否只是没插网线")
     # 串口：同一串口不能有两个活桥；并且**先清孤儿桥**
     #       （守护死了但 serial_bridge 仍握着串口 → 新桥 PermissionError 13）
@@ -2329,7 +2329,7 @@ def cmd_shell(a):
             with socket.create_connection((_h2, _p2), timeout=2.5):
                 pass
         except Exception as e:
-            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h2}:{_p2}）连不上：{type(e).__name__}\n"
+            raise SystemExit(f"✘ {name} 的 {proto.upper()}（{_h2}:{_p2}）连不上：{type(e).__name__}: {e}\n"
                              f"   先确认：① 地址/端口对不对 ② 设备是否在线 ③ 是否只是没插网线\n"
                              f"   （想强制开窗也可以：把 TCP 通了再来；或先 netdev ping {name} <目标>）")
     # ☆ 串口防双桥：这个口已经在某个同屏窗口里用着 → 直接切过去，
