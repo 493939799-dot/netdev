@@ -384,6 +384,7 @@ CANDIDATES: dict[str, list[str]] = {
 # 认错命令时的典型回显（命中就说明这条不能用）
 BAD_CMD_RE = re.compile(
     r"(Unrecognized command|Invalid command|Unknown command|"
+    r"Ambiguous command|Incomplete command|"
     r"% ?Invalid input|Error:\s*Wrong parameter|Too many parameters found)",
     re.I,
 )
