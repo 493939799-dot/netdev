@@ -418,19 +418,34 @@ def cache_all(dev: str, keys: list[str] | None = None) -> dict:
     return out
 
 
+_SHOW_PLATFORMS = {"cisco_ios", "ruijie_os"}
+
+
 def candidates_for(key: str, prefer_platform: str | None = None) -> list[str]:
-    """候选命令：先放该平台的首选命令，再补上其它家的。"""
+    """候选命令：先放该平台的首选命令，再补上其它家的。
+
+    ★ 2026-10-09：候选按 CLI 方言过滤 —— 平台已知是 display 系厂商
+    （华为/华三/迈普）就不再试 show 系候选（思科/锐捷），反之亦然。
+    真机实测：AR111-S 的 cpu 候选 5 条里 4 条是 show 系报错，全是纯噪音
+    （用户在屏幕上看到的全是这些无意义的 Unrecognized）。
+    平台未知时仍全部候选都试 —— 探测是唯一的发现手段。
+    """
     first = ""
     try:
         first = (profile_of(prefer_platform).get("cmds") or {}).get(key) or ""
     except Exception:
         first = ""
+    fam = "show" if prefer_platform in _SHOW_PLATFORMS else (
+        "display" if prefer_platform else "")
     out: list[str] = []
     if first:
         out.append(first)
     for c in CANDIDATES.get(key, []):
-        if c not in out:
-            out.append(c)
+        if c in out:
+            continue
+        if fam and c.split(" ", 1)[0].lower() != fam:
+            continue
+        out.append(c)
     return out
 
 

@@ -1617,6 +1617,17 @@ def _platform_of(dev_name: str) -> str:
         # 临时目标（连接簿）没有 platform，按名字/协议兜个默认
     except Exception:
         pass
+    # ★ 2026-10-09 修：连接簿里其实存了 platform（接入时识别/手选的），原来没人读
+    #   —— 后果：cfg 键给临时目标发 show running-config（思科味）打在华为设备上
+    #   报 Unrecognized（真机实测）。连接簿记录 platform 是 display 系就按档案走。
+    try:
+        _conn_file = ROOT / "config" / "connections.json"
+        if _conn_file.exists():
+            for _c in json.loads(_conn_file.read_text(encoding="utf-8")):
+                if _c.get("id") == dev_name or _c.get("name") == dev_name:
+                    return (_c.get("platform") or "").strip()
+    except Exception:
+        pass
     return ""
 
 
@@ -2621,6 +2632,26 @@ def collect_metrics(dev: str) -> dict:
             for _k, _kc in used.items():
                 if _kc in segs and not raws.get(_k):
                     raws[_k] = segs[_kc]
+            # ★ 2026-10-09 丢字重发：串口偶发吞首字符（实测 display→isplay）。
+            #   tmux send-keys 整串灌入 → 桥 → 串口，设备 UART 忙时可能丢字。
+            #   命令回显在屏上找不到 = 这条没发完整 → 只把丢字的逐条重发一次。
+            _missing = sorted({c for k, c in used.items() if c not in raws["screen"]})
+            if _missing:
+                for c in _missing:
+                    try:
+                        subprocess.run([*cli, "screen-send", window, c, "--yes", "--src", "sys"],
+                                       capture_output=True, timeout=20, creationflags=_NO_WINDOW)
+                    except Exception:
+                        pass
+                    _wait_prompt(window, (c.split() or [""])[0])
+                time.sleep(0.6)
+                _rc, _t2, _e = raw_netdev(["screen-read", window, "--lines", "900"], timeout=30)
+                _t2 = strip_ansi(_t2)
+                raws["screen"] += "\n" + _t2
+                _segs2 = _split_screen_by_cmds(_t2, _missing)
+                for k, c in used.items():
+                    if c in _segs2 and not raws.get(k):
+                        raws[k] = _segs2[c]
             return raws["screen"]
         acc = []
         for key, cmd in work.items():
@@ -3077,11 +3108,26 @@ def metric_one(dev_name: str, key: str, cmd_override: str = "") -> dict:
     except Exception:
         pass
     # 2) 发命令（走同屏，屏幕可见）
-    try:
-        subprocess.run([*cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
-                       capture_output=True, timeout=30, creationflags=_NO_WINDOW)
-    except Exception as e:
-        return {"error": f"下发失败：{e}"}
+    #    ★ 2026-10-09 丢字防护：串口偶发吞首字符（实测 display→isplay）。
+    #    tmux send-keys 整串灌入 → 桥 → 串口，设备 UART 忙时可能丢字。
+    #    命令回显就是"回执"——发完验证回显里有完整命令；没有且设备已空闲
+    #    （末行是裸提示符）→ 判定丢字，立即重发一次（至多一次，不死循环）。
+    for _attempt in (1, 2):
+        try:
+            subprocess.run([*cli, "screen-send", win, cmd, "--yes", "--src", "sys"],
+                           capture_output=True, timeout=30, creationflags=_NO_WINDOW)
+        except Exception as e:
+            return {"error": f"下发失败：{e}"}
+        time.sleep(0.8)
+        _rc, _peek, _e2 = raw_netdev(["screen-read", win, "--lines", "12"], timeout=15)
+        _peek_t = strip_ansi(_peek)
+        if any(cmd in ln for ln in _peek_t.splitlines()):
+            break                                    # 回显完整 → 正常继续
+        _last2 = [l.strip() for l in _peek_t.splitlines() if l.strip()]
+        _idle = bool(_last2) and re.match(
+            r"^\s*[<\[][\w.\-]{1,30}[>\]]\s*$|^\s*[\w.\-]{1,30}[>#]\s*$", _last2[-1])
+        if not _idle or _attempt == 2:
+            break                                    # 设备还在吐输出 / 已重发过 → 交给轮询逻辑
     # 3) 等输出稳定再读 —— 固定 sleep 会读到半截。
     #    实测：display interface brief 有 26 行接口，2 秒时只吐到"表头+第 1 行"，
     #    结果交给 AI 的样例残缺，AI 只能回答"未给出"（它是对的，是我们给少了）。
