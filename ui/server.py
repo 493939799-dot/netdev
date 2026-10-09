@@ -1795,6 +1795,33 @@ def _mon_baseline_path(dev: str):
     return ROOT / "live" / "monitor" / f"{safe}.jsonl"
 
 
+# ── 指标忽略清单（2026-10-09）────────────────────────────────────────
+#   设备根本没有的指标（如无光模块的 AR111-S 查光衰）不该每轮都报「没采到」。
+#   用户可对失败指标点「忽略」→ 采集跳过、诊断不再报；点「恢复」随时找回。
+_IGN_PATH = ROOT / "live" / "monitor" / "ignored.json"
+
+
+def _metric_ignored_get(dev: str) -> set:
+    try:
+        d = json.loads(_IGN_PATH.read_text(encoding="utf-8"))
+        return set(d.get(dev) or [])
+    except Exception:
+        return set()
+
+
+def _metric_ignored_set(dev: str, key: str, ignore: bool) -> bool:
+    try:
+        d = json.loads(_IGN_PATH.read_text(encoding="utf-8")) if _IGN_PATH.exists() else {}
+    except Exception:
+        d = {}
+    cur = set(d.get(dev) or [])
+    (cur.add(key) if ignore else cur.discard(key))
+    d[dev] = sorted(cur)
+    _IGN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _IGN_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    return True
+
+
 def _mon_baseline_load(dev: str) -> dict | None:
     """读上一次采集快照（JSONL 最后一行完整 JSON）。坏了/没有 → None，绝不抛。"""
     try:
@@ -2533,6 +2560,10 @@ def collect_metrics(dev: str) -> dict:
             pass
     base_cmds = mon_cmds(platform, dev, keys=["cpu", "mem", "brief",
                                               "nat", "dhcp", "arp", "optical"])
+    # 用户明确忽略的指标（设备根本没有的能力）→ 不发命令、不参与解析
+    _ignored_keys = _metric_ignored_get(dev)
+    if _ignored_keys:
+        base_cmds = {k: v for k, v in base_cmds.items() if k not in _ignored_keys}
     base_cmds.setdefault("log", _log_cmd_for(platform))   # 设备日志（排障线索卡；不支持会被探测逻辑丢弃）
     # 体验层固定探针（平台无关，2026-10-04 三层指标观）：出口连通 / DNS / 配置漂移源
     base_cmds.setdefault("wan", "ping 223.5.5.5")
@@ -2674,6 +2705,7 @@ def collect_metrics(dev: str) -> dict:
             "delta": delta, "rows": rows, "log": log_info,
             "hist_cpu": _mon_baseline_all(dev, "cpu"),
             "cmds": cmds, "used": used, "learned": learned,
+            "ignored": sorted(_ignored_keys),
             "raw": {k: v[-4000:] for k, v in raws.items()}}
 
 
@@ -2893,6 +2925,12 @@ _METRIC_CMDS = {
     "log":  "display logbuffer",          # 监控表格「设备日志」行的下钻
     "ver":  "display version",
     "clock": "display clock",
+    # 快诊四项（2026-10-09）：采集命令经常不适配具体设备型号（报 Error/参数多），
+    # 学习入口要让用户能对它们逐个「让 AI 换命令 + 学解析」。
+    "nat":    "display nat session statistics",
+    "dhcp":   "display ip pool",
+    "arp":    "display arp all",
+    "optical": "display transceiver diagnosis",
 }
 
 
@@ -2902,6 +2940,10 @@ _METRIC_LABEL = {
     "ram": "内存使用率（百分比）",
     "crc": "接口的错误包总数（inErrors 列求和）",
     "if":  "处于 up 状态的物理接口【个数】（需要数行，不是取某个字段）",
+    "nat": "NAT 会话条目数（个数）",
+    "dhcp": "DHCP 地址池信息里的关键数值（如池内可用地址数，看回显有什么就取什么，说清楚取的是哪个）",
+    "arp": "ARP 表项总数（个数）",
+    "optical": "光模块收光功率 Rx power（dBm，带负号的小数）",
 }
 
 
@@ -2958,13 +3000,64 @@ def ai_suggest_pattern(dev_name: str, key: str, raw: str, cmd: str,
     return {"value": obj.get("value"), "pattern": (obj.get("pattern") or "").strip()}
 
 
-def metric_one(dev_name: str, key: str) -> dict:
-    """取单项指标的原始回显 —— 走同屏会话（不直连、不抢串口、用户看得见）。"""
+def ai_suggest_command(dev_name: str, key: str, bad_raw: str, old_cmd: str,
+                       timeout: int = 90) -> dict:
+    """当前查询命令被设备拒绝时，让 AI 提议一条替代的只读命令。
+
+    只提议不执行 —— 执行与自检由调用方完成。AI 只允许给 display/show 开头的
+    命令（返回前再校验一遍，双保险）。
+    """
+    cfg = _direct_cfg()
+    if not cfg["ok"]:
+        return {"error": "直连 AI 未配置：" + cfg["note"]}
+    label = _METRIC_LABEL.get(key, key)
+    prompt = (
+        "你是网络设备排障助手。对设备执行查询命令 `" + old_cmd + "` 时，"
+        "设备返回了如下回显（很可能这条命令不被该型号/软件版本支持）：\n"
+        + (bad_raw or "")[:1200] + "\n\n"
+        f"请给出一条【替代的只读查询命令】，用于在同样风格的 CLI 上查询「{label}」。\n"
+        "要求：必须是 display 或 show 开头的只读命令；贴合该设备的 CLI 方言；"
+        "只给一条你最确信的；不确定就输出空 JSON。\n"
+        '只输出一行 JSON，不要解释、不要代码块围栏：{"command": "<命令>"}\n'
+        "若没有把握，输出：{}\n"
+    )
+    try:
+        s = DirectSession("__learn__", model="", tools="read")
+        resp = s._chat([{"role": "user", "content": prompt}], stream=False)
+        body_raw = resp.read().decode("utf-8", "replace")
+        if resp.status != 200:
+            return {"error": f"直连 API 返回 {resp.status}: {body_raw[:200]}"}
+        body = json.loads(body_raw)
+        out_text = (((body.get("choices") or [{}])[0]).get("message") or {}) \
+            .get("content") or ""
+    except Exception as e:
+        return {"error": f"直连请求失败：{type(e).__name__}: {e}"}
+    m = re.search(r'\{[^{}]*"command"\s*:', out_text or "", re.S)
+    if not m:
+        return {"command": ""}                      # AI 没把握 → 空提议（不是错误）
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return {"command": ""}
+    cmd = (obj.get("command") or "").strip().rstrip(";")
+    if cmd and not re.match(r"^(display|show)\b", cmd, re.I):
+        return {"command": ""}                      # 越界提议 → 丢弃
+    return {"command": cmd}
+
+
+def metric_one(dev_name: str, key: str, cmd_override: str = "") -> dict:
+    """取单项指标的原始回显 —— 走同屏会话（不直连、不抢串口、用户看得见）。
+
+    cmd_override（2026-10-09）：学习流程里 AI 提议的替换命令。只放行
+    display/show 开头的只读命令 —— 这是学习通道，不是执行通道。
+    """
     info = resolve_device(dev_name)
     win = info.get("window") or dev_name
-    cmd = _METRIC_CMDS.get(key)
+    cmd = (cmd_override or "").strip() or _METRIC_CMDS.get(key)
     if not cmd:
         return {"error": f"未知指标 {key}"}
+    if (cmd_override or "").strip() and not re.match(r"^(display|show)\b", cmd, re.I):
+        return {"error": "替换命令只允许 display/show 开头（只读闸门）"}
     cli = netdev_argv()
     # 1) 清历史（否则屏上的旧内容会混进来）
     try:
@@ -3034,6 +3127,14 @@ def metric_one(dev_name: str, key: str) -> dict:
             _ifs = _parse_if_brief(raw)
             if _ifs:
                 val = sum(int(x.get("in_err") or 0) for x in _ifs)
+        elif key == "nat":
+            val = _parse_nat(raw)
+        elif key == "dhcp":
+            val = _parse_dhcp(raw)
+        elif key == "arp":
+            val = _parse_arp_count(raw)
+        elif key == "optical":
+            val = _parse_optical(raw)
     except Exception:
         pass
     return {"device": dev_name, "key": key, "cmd": cmd,
@@ -3311,6 +3412,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._api_metric_learn_remove(b)
         if u.path == "/api/metric/learn/clear":
             return self._api_metric_learn_clear()
+        if u.path == "/api/metric/ignore":
+            return self._api_metric_ignore(b)
         if u.path == "/api/netdev/run":
             return self._api_netdev_run(b)
         if u.path == "/api/ai/open":
@@ -4243,7 +4346,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if one.get("error"):
             return self._json(one, 500)
         raw = one.get("output") or ""
-        sug = ai_suggest_pattern(dev, key, raw, one.get("cmd") or "")
+        # ── 两段式（2026-10-09）：命令被设备拒绝时，先让 AI 提议替换命令，
+        #    用新命令重取回显，再在【新回显】上学解析。采纳时命令+正则一起存，
+        #    下次采集直接用新命令，不再重复犯错。
+        cmd_used = one.get("cmd") or ""
+        cmd_candidate = ""
+        bad_cmd = _plat.looks_like_bad_command(raw) if _plat else False
+        if bad_cmd:
+            sc = ai_suggest_command(dev, key, raw, cmd_used)
+            cmd_candidate = (sc.get("command") or "").strip()
+            if cmd_candidate:
+                with screen_lock(dev):
+                    try:
+                        one2 = metric_one(dev, key, cmd_override=cmd_candidate)
+                    except Exception as e:
+                        one2 = {"error": str(e)}
+                if not one2.get("error") and not _plat.looks_like_bad_command(one2.get("output") or ""):
+                    raw = one2.get("output") or ""
+                    cmd_used = cmd_candidate
+                else:
+                    cmd_candidate = ""          # 新命令也不行 → 不提议，按坏回显走
+        sug = ai_suggest_pattern(dev, key, raw, cmd_used)
         if sug.get("error"):
             return self._json({**sug, "raw": raw[-1500:]})
         # 自检（三道护栏之一）——用 AI 看到的那份原文
@@ -4256,7 +4379,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             scopes.append({"scope": "plat", "label": f"给该平台所有设备（{plat}）"})
         return self._json({"ok": True, "device": dev, "key": key,
                            "platform": plat or "(未标注)",
-                           "scopes": scopes, "cmd": one.get("cmd"),
+                           "scopes": scopes, "cmd": cmd_used,
+                           "orig_cmd": one.get("cmd"),
+                           "bad_command": bool(bad_cmd),
+                           "cmd_candidate": cmd_candidate,
                            "sample": raw[:2500],
                            "ai_value": sug.get("value"),
                            "ai_pattern": sug.get("pattern"),
@@ -4281,6 +4407,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ok, why = _learned.put_scoped(scope, name, key, pat, sample, val, source="ai")
         if ok:
             self._LEARN_CACHE.pop(f"{dev}:{key}", None)
+            # 采纳了 AI 提议的替换命令 → 记进设备命令缓存，下次采集直接用
+            cand = (b.get("cmd_candidate") or "").strip()
+            if cand and _plat is not None and re.match(r"^(display|show)\b", cand, re.I):
+                try:
+                    _plat.cache_put(dev, key, cand)
+                except Exception:
+                    pass
         return self._json({"ok": ok, "msg": why, "scope": scope, "name": name, "key": key})
 
     def _api_metric_learn_list(self):
@@ -4299,6 +4432,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if _learned is None:
             return self._json({"ok": False})
         return self._json({"ok": True, "cleared": _learned.clear()})
+
+    def _api_metric_ignore(self, b: dict):
+        """采纳/放弃：把某设备的某指标标记为忽略（或恢复采集）。"""
+        dev = (b.get("device") or "").strip()
+        key = (b.get("key") or "").strip()
+        ignore = bool(b.get("ignore", True))
+        if not dev or not key:
+            return self._json({"error": "缺少 device/key"}, 400)
+        _metric_ignored_set(dev, key, ignore)
+        return self._json({"ok": True, "device": dev, "key": key,
+                           "ignored": sorted(_metric_ignored_get(dev))})
 
     def _api_metric_one(self, qs):
         """单项指标：走同屏取，不在终端里插命令。"""

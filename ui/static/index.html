@@ -611,6 +611,10 @@ td.ops{white-space:nowrap}
   border:1px solid currentColor;margin:2px 0 6px;letter-spacing:2px}
 .diag-sum{font-size:11px;line-height:1.55;padding-bottom:7px}
 .diag-item{border-top:1px dashed var(--g4);padding:7px 0;font-size:10.5px;line-height:1.55}
+/* 采集失败项的「学习」小按钮（2026-10-09）：ghost 样式跟主题走，悬停提亮 */
+.lk-btn{background:transparent;border:1px solid var(--g4,var(--g3));color:var(--fg);
+  border-radius:6px;padding:1px 8px;margin-left:4px;font-size:10.5px;cursor:pointer;line-height:1.6}
+.lk-btn:hover{border-color:var(--g2);background:var(--sel,rgba(128,128,128,.12))}
 .diag-item .dt{font-weight:700}
 .diag-item .dd{color:var(--dim);margin-top:1px}
 .diag-item .da{color:var(--g1);margin-top:1px}
@@ -2582,7 +2586,7 @@ let monBusy = false;
    AI 不可用/解析失败 → 降级：亮黄横幅说明原因（采集本身已完成）。 */
 const DIAG_SEV = {ok:'var(--st-on)', warn:'var(--warn)', bad:'var(--bad)'};
 const DIAG_TXT = {ok:'正 常', warn:'留 意', bad:'异 常'};
-function renderDiag(diag, plan){
+function renderDiag(diag, plan, failed, ignored){
   const box = $('diagBox'); if(!box) return;
   if(!diag || diag.error){
     box.innerHTML = '<div class="w" style="font-size:10.5px;line-height:1.5">⚠ AI 诊断不可用：'
@@ -2595,6 +2599,25 @@ function renderDiag(diag, plan){
   const txt = DIAG_TXT[diag.overall] || '留 意';
   let h = `<span class="diag-badge" style="color:${sev}">${txt}</span>`
     + `<div class="diag-sum">${esc(diag.summary || '')}</div>`;
+  // ★ 采集失败项 → 学习入口（2026-10-09）：命令不适配设备时，用户可逐个
+  //   「让 AI 看回显 → 提议命令与解析 → 采纳/放弃」。入口此前在 UI 清理中被删，
+  //   整套学习功能成了不可达的孤儿 —— 本次接回。
+  if(Array.isArray(failed) && failed.length){
+    h += `<div style="margin:6px 0 2px;font-size:10.5px;line-height:1.8;color:var(--warn,#c77700)">`
+      + `⚠ ${failed.length} 项没采到（命令可能不适配这台设备）：`
+      + failed.map(f =>
+          `<button class="lk-btn" data-lk="${esc(f[0])}" title="让 AI 看这台设备的回显，必要时换一条命令，学一条能用的解析规则">🔧${esc(f[1])}</button>`
+          +`<button class="lk-btn" data-ig="${esc(f[0])}" title="这台设备没有这个能力？忽略它，以后不再报失败">忽略</button>`
+        ).join(' ')
+      + `</div>`;
+  }
+  if(Array.isArray(ignored) && ignored.length){
+    h += `<div style="margin:2px 0;font-size:10px;color:var(--dim)">已忽略：`
+      + ignored.map(f =>
+          `<button class="lk-btn" data-igres="${esc(f[0])}" title="恢复采集该指标">${esc(f[1])} ↩</button>`
+        ).join(' ')
+      + `</div>`;
+  }
   if(Array.isArray(plan) && plan.length){
     const rej = (diag.rejected && diag.rejected.length)
       ? `（另有 ${diag.rejected.length} 条被只读闸门拦下）` : '';
@@ -2610,6 +2633,19 @@ function renderDiag(diag, plan){
       + `</div>`;
   }
   box.innerHTML = h;
+  box.querySelectorAll('.lk-btn').forEach(b=>{
+    if(b.dataset.lk) b.onclick=()=>openLearn(b.dataset.lk);
+    if(b.dataset.ig) b.onclick=async()=>{
+      await api('/api/metric/ignore',{device:CURDEV||'',key:b.dataset.ig,ignore:true});
+      audit('WRITE',CURDEV||'',`忽略指标 ${b.dataset.ig}（设备无此能力，不再报失败）`);
+      loadMonitor(true);
+    };
+    if(b.dataset.igres) b.onclick=async()=>{
+      await api('/api/metric/ignore',{device:CURDEV||'',key:b.dataset.igres,ignore:false});
+      audit('WRITE',CURDEV||'',`恢复采集指标 ${b.dataset.igres}`);
+      loadMonitor(false);
+    };
+  });
 }
 async function loadMonitor(quiet){
   if(monBusy) return; monBusy=true; monIcon(true);
@@ -2634,7 +2670,14 @@ async function loadMonitor(quiet){
       return;      // 按钮与 monBusy 由 finally 复位
     }
     const mon = d.monitor || {};
-    renderDiag(d.diag);
+    // 采集失败项 → 学习/忽略入口（键名 ↔ 学习键/显示名对照）
+    const _FK = [['cpu','CPU','cpu_10s'],['ram','内存','mem_pct'],['crc','错包','crc'],
+                 ['nat','NAT','nat'],['dhcp','DHCP','dhcp'],['arp','ARP','arp'],['optical','光模块','optical']];
+    const _igList = mon.ignored || [];
+    const _failed = mon.metrics
+      ? _FK.filter(f=>mon.metrics[f[2]]==null && !_igList.includes(f[0])).map(f=>[f[0],f[1]]) : [];
+    const _ignored = _FK.filter(f=>_igList.includes(f[0])).map(f=>[f[0],f[1]]);
+    renderDiag(d.diag, null, _failed, _ignored);
     $('monSub').textContent = `${mon.via} · ${String(mon.at).slice(11)}`;
     // 平台提示：自动识别 or 档案匹配 or 未标注（配 title 悬停看全）
     const _platEl = document.getElementById('monSub');
@@ -2695,7 +2738,7 @@ async function openLearn(key){
   const dev = CURDEV || '';
   const modal=$('modalLearn'), box=$('lnBody');
   pushModalZ(modal);
-  const label={cpu:'CPU',ram:'RAM',crc:'CRC/错包',if:'INT'}[key]||key;
+  const label={cpu:'CPU',ram:'RAM',crc:'CRC/错包',if:'接口',nat:'NAT',dhcp:'DHCP',arp:'ARP',optical:'光模块'}[key]||key;
   $('lnSub').textContent=`设备 ${dev} · 指标 ${label}`;
   box.innerHTML='<div class="m" style="padding:14px">正在取回显并请 AI 分析…（约 10~40 秒）</div>';
   $('lnAccept').disabled = true;
@@ -2716,11 +2759,26 @@ async function openLearn(key){
   h+=`<div class="sg">原始回显（AI 看到的）</div>`;
   h+=`<pre style="font-size:10.5px;max-height:170px;overflow:auto">${esc((d.sample||'').slice(0,1600))}</pre>`;
   h+=`<div class="sg">AI 提议</div>`;
+  if(d.bad_command && d.cmd_candidate){
+    h+=`<div class="w" style="padding:6px 10px;font-size:10.5px;line-height:1.6">原命令 <code>${esc(d.orig_cmd||'')}</code> 这台设备不认。`
+      +`AI 提议换用：<b><code>${esc(d.cmd_candidate)}</code></b>（下面自检用的就是它；采纳后采集会记住这条命令）</div>`;
+  }else if(d.bad_command){
+    h+=`<div class="w" style="padding:6px 10px;font-size:10.5px">原命令这台设备不认，AI 也没给出有把握的替代命令。</div>`;
+  }
   h+=`<table><tr><th>项目</th><th>值</th></tr>`
     +`<tr><td>命令</td><td><code>${esc(d.cmd||'')}</code></td></tr>`
     +`<tr><td>AI 读出的值</td><td><b>${d.ai_value!=null?esc(String(d.ai_value)):'<span class="bad">未给出</span>'}</b></td></tr>`
     +`<tr><td>提议的正则</td><td><code style="word-break:break-all">${esc(d.ai_pattern||'')}</code></td></tr>`
     +`<tr><td>平台</td><td>${esc(d.platform||'')}</td></tr></table>`;
+  // 生效范围（后端返回 scopes；未标平台的设备只能存设备级）
+  if(Array.isArray(d.scopes) && d.scopes.length>1){
+    h+=`<div class="sg">生效范围</div><div id="lnScope" style="display:flex;gap:16px;padding:2px 2px 6px;flex-wrap:wrap">`;
+    d.scopes.forEach((s,i)=>{
+      h+=`<label style="font-size:11.5px;display:flex;align-items:center;gap:5px;cursor:pointer">`
+        +`<input type="radio" name="lnscope" value="${esc(s.scope)}" ${i===0?'checked':''}>${esc(s.label)}</label>`;
+    });
+    h+=`</div>`;
+  }
   h+=`<div class="sg">自检（用同一条正则回放到同一段回显）</div>`;
   h+= ok
     ? `<div class="k">✓ 通过 —— 取出 ${esc(String(d.selfcheck_value))}，与 AI 声称的 ${esc(String(d.ai_value))} 一致。可以采纳。</div>`
@@ -2733,7 +2791,9 @@ $('lnAccept').onclick=async()=>{
   if(!LEARN_CTX) return;
   const r = await api('/api/metric/learn/save',{
     device:LEARN_CTX.device, platform:LEARN_CTX.platform, key:LEARN_CTX.key,
-    pattern:LEARN_CTX.ai_pattern, sample:LEARN_CTX.sample, value:LEARN_CTX.ai_value});
+    pattern:LEARN_CTX.ai_pattern, sample:LEARN_CTX.sample, value:LEARN_CTX.ai_value,
+    scope:(document.querySelector('input[name="lnscope"]:checked')||{}).value || 'dev',
+    cmd_candidate:LEARN_CTX.cmd_candidate || ''});
   audit(r.ok?'WRITE':'FAIL','-',`学习规则 ${LEARN_CTX.platform}/${LEARN_CTX.key}${r.ok?'':'（'+r.msg+'）'}`);
   say('系统', r.ok
     ? `📚 已采纳并保存：<b>${esc(LEARN_CTX.platform)}</b> / ${esc(LEARN_CTX.key)} —— 以后该平台采集会优先用这条规则。`
