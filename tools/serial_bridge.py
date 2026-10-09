@@ -147,13 +147,37 @@ DEV_USER, DEV_PW, PW_SRC = "", "", ""
 if AUTOLOGIN and DEVICE_NAME:
     try:
         from lib import creds as _creds, engine as _engine
-        _dev = _engine.get_device(DEVICE_NAME)
-        if _dev:
-            _u, _ = _creds.get_username(_dev, allow_popup=False)
-            _pw, PW_SRC = _creds.get_password(_dev, allow_popup=False)
-            DEV_USER, DEV_PW = (_u or "").strip(), (_pw or "")
+        _dev = None
+        try:
+            _dev = _engine.get_device(DEVICE_NAME)
+        except KeyError:
+            _dev = None
+        if _dev is None:
+            # ★ 2026-10-09 修（临时接入的设备填了密码仍要手工登录）：
+            #   连接簿临时目标不在 devices.toml，get_device 抛 KeyError 后
+            #   _dev=None → DEV_USER/DEV_PW 空 → maybe_autologin 静默失效。
+            #   回退成裸 {"name": ...}，creds 按 service "netdev-<名字>"
+            #   查凭据文件 —— 连接簿 conn_add 存的正是这个服务名。
+            _dev = {"name": DEVICE_NAME}
+        _u, _ = _creds.get_username(_dev, allow_popup=False)
+        _pw, PW_SRC = _creds.get_password(_dev, allow_popup=False)
+        DEV_USER, DEV_PW = (_u or "").strip(), (_pw or "")
     except Exception as _e:
         PW_SRC = f"凭据查询异常({type(_e).__name__})"
+
+
+def _autologin_banner(lg):
+    """桥启动后往 screen.log 记一行凭据加载结果（诊断用，不记密码）。"""
+    if not AUTOLOGIN:
+        return
+    try:
+        lg.write(("[自动登录] 凭据加载: 设备=%s 用户名=%s 密码来源=%s\n" % (
+            DEVICE_NAME, "有" if DEV_USER else "无", PW_SRC or "无")).encode())
+    except Exception:
+        pass
+
+
+_autologin_banner(log)
 
 _USER_PROMPT = re.compile(rb"[Uu]sername:\s*$")
 _PW_PROMPT = re.compile(rb"[Pp]assword:\s*$")
