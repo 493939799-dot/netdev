@@ -3412,7 +3412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/ai/list":
             return self._api_ai_list()
         if p == "/api/metric/learn/list":
-            return self._api_metric_learn_list()
+            return self._api_metric_learn_list(qs)
         if p == "/api/metric/one":
             return self._api_metric_one(qs)
         if p == "/api/interface/detail":
@@ -4473,10 +4473,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
         return self._json({"ok": ok, "msg": why, "scope": scope, "name": name, "key": key})
 
-    def _api_metric_learn_list(self):
+    def _api_metric_learn_list(self, qs=None):
         if _learned is None:
             return self._json({"rules": []})
-        return self._json({"rules": _learned.all_rules_scoped(), "file": str(_learned.FILE)})
+        out = {"rules": _learned.all_rules_scoped(), "file": str(_learned.FILE)}
+        # ★ 2026-10-09：带上指定设备的命令缓存（采集学到的"这台设备用哪条命令"），
+        #   规则视图能看到全貌：解析规则（scope 级）+ 命令缓存（设备级）。
+        try:
+            dev = ((qs or {}).get("device", [""])[0] or "").strip()
+            if dev and _plat is not None:
+                cmds = _plat.cache_all(dev)
+                if cmds:
+                    out["cmds"] = cmds
+                    out["cmds_dev"] = dev
+        except Exception:
+            pass
+        return self._json(out)
 
     def _api_metric_learn_remove(self, b: dict):
         """删除一条学到的规则。"""

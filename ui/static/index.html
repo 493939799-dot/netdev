@@ -2605,6 +2605,8 @@ function renderDiag(diag, plan, failed, ignored){
   if(Array.isArray(failed) && failed.length){
     h += `<div style="margin:6px 0 2px;font-size:10.5px;line-height:1.8;color:var(--warn,#c77700)">`
       + `⚠ ${failed.length} 项没采到（命令可能不适配这台设备）：`
+      + `<button class="lk-btn" data-lkall="${esc(failed.map(f=>f[0]).join(','))}"`
+      + ` title="让 AI 把每一项都看一遍：换命令、提规则、自检 —— 全部列出来，由你勾选采纳（仍然只提议，不自动落库）">⚡一键学全部</button> `
       + failed.map(f =>
           `<button class="lk-btn" data-lk="${esc(f[0])}" title="让 AI 看这台设备的回显，必要时换一条命令，学一条能用的解析规则">🔧${esc(f[1])}</button>`
           +`<button class="lk-btn" data-ig="${esc(f[0])}" title="这台设备没有这个能力？忽略它，以后不再报失败">忽略</button>`
@@ -2635,6 +2637,7 @@ function renderDiag(diag, plan, failed, ignored){
   box.innerHTML = h;
   box.querySelectorAll('.lk-btn').forEach(b=>{
     if(b.dataset.lk) b.onclick=()=>openLearn(b.dataset.lk);
+    if(b.dataset.lkall) b.onclick=()=>openLearnBatch(b.dataset.lkall.split(',').filter(Boolean));
     if(b.dataset.ig) b.onclick=async()=>{
       await api('/api/metric/ignore',{device:CURDEV||'',key:b.dataset.ig,ignore:true});
       audit('WRITE',CURDEV||'',`忽略指标 ${b.dataset.ig}（设备无此能力，不再报失败）`);
@@ -2734,12 +2737,15 @@ $('btnDeep').onclick = async ()=>{
 
 /* ── ⚡ AI 学习：采不到值时点这里 ── */
 let LEARN_CTX = null;
+const LEARN_LABEL={cpu:'CPU',ram:'RAM',crc:'CRC/错包',if:'接口',nat:'NAT',dhcp:'DHCP',arp:'ARP',optical:'光模块'};
+function learnFootRestore(){ $('lnAccept').style.display=''; $('lnRe').style.display=''; }
 async function openLearn(key){
   const dev = CURDEV || '';
   const modal=$('modalLearn'), box=$('lnBody');
   pushModalZ(modal);
-  const label={cpu:'CPU',ram:'RAM',crc:'CRC/错包',if:'接口',nat:'NAT',dhcp:'DHCP',arp:'ARP',optical:'光模块'}[key]||key;
-  $('lnSub').textContent=`设备 ${dev} · 指标 ${label}`;
+  learnFootRestore();
+  const label=k=>LEARN_LABEL[k]||k;
+  $('lnSub').textContent=`设备 ${dev} · 指标 ${label(key)}`;
   box.innerHTML='<div class="m" style="padding:14px">正在取回显并请 AI 分析…（约 10~40 秒）</div>';
   $('lnAccept').disabled = true;
   modal.classList.add('show');
@@ -2785,7 +2791,7 @@ async function openLearn(key){
     : `<div class="bad">✗ 未通过 —— ${esc(d.selfcheck_msg||'')}<br>这条提议不会被保存。</div>`;
   box.innerHTML=h;
 }
-$('lnReject').onclick=()=>$('modalLearn').classList.remove('show');
+$('lnReject').onclick=()=>{ $('modalLearn').classList.remove('show'); learnFootRestore(); LEARN_BATCH=null; };
 $('lnRe').onclick=()=>{ if(LEARN_CTX) openLearn(LEARN_CTX.key); };
 $('lnAccept').onclick=async()=>{
   if(!LEARN_CTX) return;
@@ -2805,24 +2811,128 @@ $('lnAccept').onclick=async()=>{
   loadMonitor(true);
 };
 
+/* ── ⚡⚡ 批量学习（2026-10-09）：一键让 AI 把所有失败项都看一遍 ──
+   仍是「AI 只提议」：逐个调提议接口（含坏命令换命令 + 重跑 + 自检），
+   汇总成清单由用户勾选，点「采纳选中项」才逐条落库 —— 闸门一个不少。 */
+let LEARN_BATCH = null;
+function learnItemLabel(k){ return LEARN_LABEL[k]||k; }
+function learnItemOk(it){ return !!(it.r && it.r.ok && it.r.selfcheck_ok && it.r.ai_value!=null); }
+function renderLearnBatch(busyMsg){
+  const box=$('lnBody');
+  let h='<div class="m" style="font-size:10.5px;margin-bottom:6px">'
+    +'AI <b>只提议</b>：勾选后点「采纳选中项」才会落库；每条采纳前都过了自检'
+    +'（正则必须能在同一段回显上取出 AI 声称的值）。</div>';
+  if(busyMsg) h+=`<div class="k" style="padding:6px 10px;font-size:10.5px">${esc(busyMsg)}</div>`;
+  for(const it of (LEARN_BATCH||[])){
+    const ok = learnItemOk(it);
+    h+=`<div style="border:1px solid var(--line,#d8d4cc);border-radius:6px;padding:6px 9px;margin:6px 0;font-size:10.5px;line-height:1.7">`
+      +`<div><input type="checkbox" class="bk-item" data-k="${esc(it.key)}" ${ok?'checked':'disabled'}> `
+      +`<b>${esc(learnItemLabel(it.key))}</b> `
+      +(ok?'<span class="k">✓ 自检通过，可采纳</span>'
+          :'<span class="bad">✗ 不可采纳'+(it.r&&it.r.error?'（'+esc(String(it.r.error).slice(0,70))+'）':'（AI 没给出有把握的提议）')+'</span>')
+      +`</div>`;
+    if(it.r && it.r.ok){
+      h+=`<div class="m">命令 <code>${esc(it.r.cmd||'')}</code>`
+        +(it.r.bad_command&&it.r.cmd_candidate?` —— 这台设备不认，AI 提议换 <b><code>${esc(it.r.cmd_candidate)}</code></b>`:'')
+        +` ｜ AI 读值 <b>${it.r.ai_value!=null?esc(String(it.r.ai_value)):'—'}</b>`
+        +(Array.isArray(it.r.scopes)&&it.r.scopes.length>1
+          ?` ｜ 范围 <select class="bk-scope" data-k="${esc(it.key)}" style="font-size:10.5px">`
+            +it.r.scopes.map((s,i)=>`<option value="${esc(s.scope)}" ${i===0?'selected':''}>${esc(s.label)}</option>`).join('')
+            +'</select>':'')
+        +`</div>`;
+    }
+    h+='</div>';
+  }
+  if(!busyMsg && LEARN_BATCH && LEARN_BATCH.length){
+    h+=`<div style="margin-top:10px;text-align:right">`
+      +`<button class="b-allow" id="bkAccept">采纳选中项</button></div>`;
+  }
+  box.innerHTML=h;
+  const ba=$('bkAccept');
+  if(ba) ba.onclick=acceptLearnBatch;
+}
+async function acceptLearnBatch(){
+  if(!LEARN_BATCH) return;
+  const sel=[...document.querySelectorAll('.bk-item:checked')].map(x=>x.dataset.k);
+  if(!sel.length){ return; }
+  let okn=0; const fails=[];
+  for(const k of sel){
+    const it=LEARN_BATCH.find(x=>x.key===k); if(!it) continue;
+    const scEl=document.querySelector('.bk-scope[data-k="'+CSS.escape(k)+'"]');
+    const r = await api('/api/metric/learn/save',{
+      device:it.r.device, platform:it.r.platform, key:it.r.key,
+      pattern:it.r.ai_pattern, sample:it.r.sample, value:it.r.ai_value,
+      scope:(scEl&&scEl.value)||'dev', cmd_candidate:it.r.cmd_candidate||''});
+    if(r.ok) okn++; else fails.push(learnItemLabel(k)+':'+(r.msg||''));
+  }
+  audit('WRITE','-',`批量学习采纳 ${okn} 条`+(fails.length?`，失败 ${fails.length} 条`:''));
+  say('系统', `📚 批量学习完成：已采纳 <b>${okn}</b> 条`
+    +(fails.length?`，<span class="bad">失败 ${fails.length} 条</span>（${esc(fails.join('；'))}）`:'')
+    + '，正在重取状态卡…', 'ai');
+  $('modalLearn').classList.remove('show'); learnFootRestore();
+  LEARN_BATCH=null;
+  loadMonitor(true);
+}
+async function openLearnBatch(keys){
+  const dev = CURDEV || '';
+  if(!dev || !keys || !keys.length) return;
+  const modal=$('modalLearn');
+  pushModalZ(modal);
+  // 批量模式收起单条流的底部按钮（避免和批量「采纳选中项」打架）
+  $('lnAccept').style.display='none'; $('lnRe').style.display='none';
+  $('lnSub').textContent=`设备 ${dev} · 批量学习 ${keys.length} 项`;
+  LEARN_CTX=null; LEARN_BATCH=[];
+  renderLearnBatch('准备中…');
+  modal.classList.add('show');
+  for(let i=0;i<keys.length;i++){
+    renderLearnBatch(`正在学 ${i+1}/${keys.length}：${esc(learnItemLabel(keys[i]))}…`
+      +'（AI 看回显，必要时换命令重跑，每项约 10~40 秒）');
+    let r;
+    try{ r = await api('/api/metric/learn',{device:dev, key:keys[i]}); }
+    catch(e){ r = {ok:false, error:String(e.message||e)}; }
+    LEARN_BATCH.push({key:keys[i], r});
+  }
+  renderLearnBatch(null);
+}
+
 /* ── 📚 已学规则管理 ── */
 async function showRules(){
   const modal=$('modalRules'), box=$('rulesBody');
   pushModalZ(modal);
   box.innerHTML='载入中…';
   modal.classList.add('show');
-  const d = await api('/api/metric/learn/list');
+  // 带上当前设备 → 后端顺带返回该设备的命令缓存（2026-10-09）
+  const d = await api('/api/metric/learn/list'+(CURDEV?('?device='+encodeURIComponent(CURDEV)):''));
   if(d.file) $('rulesFile').textContent = '文件：'+d.file+'（可手改、可删）';
   const rs = d.rules||[];
-  if(!rs.length){ box.innerHTML='<div class="m" style="padding:12px">还没有学到任何规则。</div>'; return; }
-  let h='<table><tr><th>平台</th><th>指标</th><th>值</th><th>正则</th><th>时间</th><th></th></tr>';
-  rs.forEach(r=>{
-    h+=`<tr><td>${esc(r.platform)}</td><td>${esc(r.key)}</td><td>${esc(String(r.value))}</td>`
-      +`<td><code style="font-size:10px;word-break:break-all">${esc(r.pattern)}</code></td>`
-      +`<td style="font-size:10px">${esc(String(r.at).slice(5,16))}</td>`
-      +`<td><span class="bk-del" data-p="${esc(r.platform)}" data-k="${esc(r.key)}" title="删除">✕</span></td></tr>`;
-  });
-  h+='</table>';
+  let h='';
+  if(!rs.length){
+    h='<div class="m" style="padding:12px">还没有学到任何解析规则。</div>';
+  }else{
+    h='<table><tr><th>范围</th><th>平台/设备</th><th>指标</th><th>值</th><th>正则</th><th>时间</th><th></th></tr>';
+    rs.forEach(r=>{
+      h+=`<tr><td style="font-size:10px;white-space:nowrap"><b>${esc(r.scope||'')}</b>`
+        +(r.scope_name?`<br><span class="m">${esc(r.scope_name)}</span>`:'')+`</td>`
+        +`<td>${esc(r.platform)}</td><td>${esc(r.key)}</td><td>${esc(String(r.value))}</td>`
+        +`<td><code style="font-size:10px;word-break:break-all">${esc(r.pattern)}</code></td>`
+        +`<td style="font-size:10px">${esc(String(r.at).slice(5,16))}</td>`
+        +`<td><span class="bk-del" data-p="${esc(r.platform)}" data-k="${esc(r.key)}" title="删除">✕</span></td></tr>`;
+    });
+    h+='</table>';
+  }
+  // 命令缓存：设备级的"这台设备用哪条命令"（采集学到的，不涉及解析正则）
+  const cmds = d.cmds || {};
+  const ck = Object.keys(cmds);
+  if(ck.length){
+    h+=`<div class="sg" style="margin-top:12px">命令缓存 · 设备 ${esc(d.cmds_dev||CURDEV||'')}`
+      +`<span class="m">（采集时直接用这条命令，不再逐个探测候选）</span></div>`
+      +`<table><tr><th>指标</th><th>命令</th></tr>`
+      +ck.map(k=>`<tr><td>${esc(learnItemLabel(k))}</td>`
+        +`<td><code style="font-size:10px">${esc(cmds[k])}</code></td></tr>`).join('')
+      +`</table>`;
+  }else if(CURDEV){
+    h+=`<div class="m" style="margin-top:10px;padding:4px 2px;font-size:10.5px">设备 ${esc(CURDEV)} 暂无命令缓存（首次采集成功或学习采纳后会记下）。</div>`;
+  }
   box.innerHTML=h;
   box.querySelectorAll('.bk-del').forEach(x=>x.onclick=async()=>{
     await api('/api/metric/learn/remove',{platform:x.dataset.p, key:x.dataset.k});
