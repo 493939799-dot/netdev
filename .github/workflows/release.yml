@@ -108,6 +108,7 @@ jobs:
             ## netdev 设备工具台 ${{ github.ref_name }}
 
             macOS 离线安装包。**下载 `.tar.gz` 即可**，`.sha256` 是校验文件（可选）。
+            Windows 用户：下载 `netdev-windows-x64-installer.zip`（需自备 Python 3.12+，安装时联网拉依赖）。
 
             ### 怎么装
             ```bash
@@ -134,4 +135,55 @@ jobs:
           path: |
             ${{ env.BUNDLE_DIR }}/*.tar.gz
             ${{ env.BUNDLE_DIR }}/*.sha256
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────
+  # Windows 包（2026-10-09 加）：源码安装器，不带 Python 运行时，
+  # 装机时联网拉 requirements.txt（含 pywinpty/keyring 等 Windows 专属依赖）。
+  # 素材在 dist/windows/installer-src/（install.ps1 等，源自 2026-10-07 手工首版）；
+  # payload 由 git archive HEAD 现取——本机 config/logs/backups 天然进不了包。
+  # 版本号直接取 tag 名（--version），不再依赖 dist/installer/VERSION 是否同步。
+  # ─────────────────────────────────────────────────────────────────
+  build-windows:
+    name: 构建 Windows 安装包并挂到 Release
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 组装 + 打包 + 内置泄密断言
+        shell: pwsh
+        run: |
+          $pyargs = @('dist/windows/build_windows.py', '--out', 'bundle-out-win')
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $pyargs += @('--version', $env:GITHUB_REF_NAME)
+          }
+          python @pyargs
+
+      - name: Dry-run 自测（安装脚本只预览不落盘）
+        shell: pwsh
+        run: >
+          powershell -ExecutionPolicy Bypass -File
+          "bundle-out-win/netdev-windows-x64-installer/install.ps1" -DryRun
+
+      - name: 上传到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bundle-out-win/*.zip
+            bundle-out-win/*.sha256
+
+      - name: 产物留档（无 tag 时也上传，方便测试）
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: netdev-windows-bundle-manual
+          path: |
+            bundle-out-win/*.zip
+            bundle-out-win/*.sha256
           retention-days: 7

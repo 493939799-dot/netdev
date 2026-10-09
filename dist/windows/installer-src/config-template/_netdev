@@ -1,0 +1,102 @@
+#compdef netdev
+# netdev zsh 补全 —— 子命令 / 设备名 / 配置备份 / 变更清单 / 常用命令
+# 由 pi 于 2026-09-17 生成；改完执行 `exec zsh` 或重开终端生效
+
+_netdev_devices() {
+  local conf="$HOME/netops/devices.toml"
+  [[ -f $conf ]] || return
+  local -a devs
+  devs=(${(f)"$(grep -E '^[[:space:]]*name[[:space:]]*=' $conf | sed -E 's/.*"([^"]+)".*/\1/')"})
+  (( $#devs )) && compadd -X '设备' -a devs
+}
+
+_netdev_backups() {
+  local dir="$HOME/netops/backups"
+  [[ -d $dir ]] || return
+  local -a files
+  files=(${dir}/*.cfg(N))
+  (( $#files )) && compadd -X '配置备份' -f -- $files
+}
+
+_netdev_changes() {
+  local dir="$HOME/netops/changes"
+  [[ -d $dir ]] || return
+  local -a files
+  files=(${dir}/*.txt(N))
+  (( $#files )) && compadd -X '变更清单' -f -- $files
+}
+
+_netdev_common_cmds() {
+  local -a cmds
+  cmds=(
+    'display version' 'display clock' 'display device' 'display esn'
+    'display current-configuration' 'display saved-configuration'
+    'display interface brief' 'display ip interface brief'
+    'display ip routing-table' 'display vlan' 'display port vlan'
+    'display acl 2000' 'display nat outbound' 'display nat session all'
+    'display arp all' 'display users' 'display ssh server status'
+    'display cpu-usage' 'display memory-usage' 'display logbuffer'
+    'display reboot-info' 'dir' 'ping -c 5 8.8.8.8'
+  )
+  compadd -X '常用命令' -- $cmds
+}
+
+_netdev() {
+  local -a subcmds
+  subcmds=(
+    'list' 'run' 'apply' 'save' 'backup' 'diff' 'ping' 'shell' 'watch'
+    'cmds' 'hint' 'serial-discover' 'onboard' 'selftest' 'mcp'
+  )
+
+  if (( CURRENT == 2 )); then
+    compadd -X 'netdev 子命令' -- $subcmds
+    return
+  fi
+
+  case ${words[2]} in
+    run|hint)
+      if (( CURRENT == 3 )); then
+        _netdev_devices
+      elif (( CURRENT >= 4 )); then
+        _netdev_common_cmds
+      fi
+      ;;
+    apply)
+      if (( CURRENT == 3 )); then
+        _netdev_devices
+      else
+        _arguments \
+          '--cmd[单条命令，可重复]:命令:' \
+          '--file[变更清单文件]:文件:_netdev_changes' \
+          '--verify[下发后校验命令，可重复]:命令:' \
+          '--yes[跳过交互确认]' \
+          '--no-save[下发后不落盘]' \
+          '--rollback[失败时尝试回滚]'
+      fi
+      ;;
+    save|backup|shell|onboard)
+      (( CURRENT == 3 )) && _netdev_devices
+      ;;
+    watch)
+      (( CURRENT == 3 )) && _netdev_devices
+      _arguments '--lines[显示行数]:行数:' '--no-follow[只打印快照不跟随]'
+      ;;
+    diff)
+      _netdev_backups
+      ;;
+    ping)
+      if (( CURRENT == 3 )); then
+        _netdev_devices
+      elif (( CURRENT == 4 )); then
+        compadd -X '常用目标' -- 8.8.8.8 114.114.114.114 223.5.5.5 192.168.1.1
+      else
+        _arguments '--source[源 IP]:源IP:' '--count[次数]:次数:'
+      fi
+      ;;
+    cmds)
+      (( CURRENT == 3 )) && compadd -X '厂商' -- huawei h3c ruijie cisco 华为 华三 锐捷 思科
+      ;;
+  esac
+}
+
+_netdev "$@"
