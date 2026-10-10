@@ -148,6 +148,10 @@ jobs:
     name: 构建 Windows 安装包并挂到 Release
     runs-on: windows-latest
     timeout-minutes: 20
+    env:
+      # ★ runner 控制台是 cp1252，构建脚本的中文 print 会 UnicodeEncodeError
+      #   （v1.0.19 首跑实测）；build_windows.py 里也做了 reconfigure，双保险。
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 

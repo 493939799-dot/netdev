@@ -29,6 +29,15 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+# ★ Windows 控制台默认 cp1252/gbk，中文 print 直接 UnicodeEncodeError
+#   （GitHub runner 实测：print("版本：…") 炸在 cp1252 上、构建中断）。
+#   统一重配成 UTF-8；个别不可编码字符用占位替代，绝不让打印日志炸掉构建。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[2]          # 仓库根
 SRC = Path(__file__).resolve().parent / "installer-src"
 NAME = "netdev-windows-x64-installer"
