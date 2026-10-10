@@ -170,9 +170,10 @@ jobs:
 
       - name: Dry-run 自测（安装脚本只预览不落盘）
         shell: pwsh
-        run: >
-          powershell -ExecutionPolicy Bypass -File
-          "bundle-out-win/netdev-windows-x64-installer/install.ps1" -DryRun
+        run: |
+          # 构建脚本只产出 zip（不含解压树），先解压再自测
+          Expand-Archive -Path "bundle-out-win/netdev-windows-x64-installer.zip" -DestinationPath "bundle-out-win"
+          powershell -ExecutionPolicy Bypass -File "bundle-out-win/netdev-windows-x64-installer/install.ps1" -DryRun
 
       - name: 上传到 GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
