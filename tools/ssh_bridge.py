@@ -96,14 +96,26 @@ DEV_PW, PW_SRC = "", ""
 if AUTOLOGIN and DEVICE_NAME:
     try:
         from lib import creds as _creds, engine as _engine
-        _dev = _engine.get_device(DEVICE_NAME)
-        if _dev:
-            _pw, PW_SRC = _creds.get_password(_dev, allow_popup=False)
-            DEV_PW = _pw or ""
+        _dev = None
+        try:
+            _dev = _engine.get_device(DEVICE_NAME)
+        except KeyError:
+            _dev = None
+        if _dev is None:
+            # ★ 2026-10-10 修（连接簿临时目标 SSH 也要手输密码）：
+            #   临时目标不在 devices.toml，get_device 抛 KeyError → DEV_PW 空
+            #   → 自动登录静默失效（与 serial_bridge 同款病、同款修法）：
+            #   回退裸 {"name": ...}，creds 按 service "netdev-<名字>" 查凭据文件。
+            _dev = {"name": DEVICE_NAME}
+        _pw, PW_SRC = _creds.get_password(_dev, allow_popup=False)
+        DEV_PW = _pw or ""
     except Exception as _e:
         PW_SRC = f"凭据查询异常({type(_e).__name__})"
 PW_PROMPT = re.compile(rb"[Pp]assword:\s*$")
-YN_PROMPT = re.compile(rb"\(yes/no(\[[^\]]*\])?\)\?\s*$")
+# ★ 2026-10-10 修：OpenSSH 8.5+ 的首见提示是 "(yes/no/[fingerprint])?" ——
+#   旧正则 \(yes/no(\[[^\]]*\])?\) 吃不掉 yes/no 后面的 "/" → 匹配失败
+#   → 桥不回 yes → 停在指纹确认上，后面的密码自动填根本没机会跑。
+YN_PROMPT = re.compile(rb"\(yes/no(?:/\[[^\]]*\])?\)\?\s*$")
 
 # ── 退格模式解析：auto → 先看探测缓存（state/keys.json），没有就按 bs
 #    （与 telnet 桥一致：SSH 通道不自己探测。想逐字节问设备就用串口通道的自动探测，
