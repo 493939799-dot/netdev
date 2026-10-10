@@ -1047,7 +1047,7 @@ td.ops{white-space:nowrap}
     </div>
     <div class="dlg-foot">
       <button class="b-deny" id="addCancel">取消</button>
-      <button class="b-allow" id="addGo">接入</button>
+      <button class="b-allow" id="addGo" title="把这台设备写进连接簿/设备清单（不立即连屏）">登记</button>
     </div>
   </div>
 </div>
@@ -1593,15 +1593,15 @@ async function submitAdd(){
   }
   if(addKind!=='serial' && !body.host) return say('系统','<span class="bad">请填主机地址</span>','ai');
   if(addKind==='serial' && !body.device) return say('系统','<span class="bad">请选择串口设备</span>','ai');
-  if(mode==='device' && !body.name) return say('系统','<span class="bad">登记为正式设备时必须填名称</span>','ai');  const btn=$('addGo'); const doneAdd = busyOn(btn, '接入中…'); btn.disabled=true;
+  if(mode==='device' && !body.name) return say('系统','<span class="bad">登记为正式设备时必须填名称</span>','ai');  const btn=$('addGo'); const doneAdd = busyOn(btn, '登记中…'); btn.disabled=true;
   let r=null;
   try{ r = await api(mode==='device'?'/api/device/add':'/api/conn/add', body); }
   finally{ doneAdd(); btn.disabled=false; }
   if(r && r.ok){
     modalAdd.classList.remove('show');
     const key=r.key||r.name||body.name||'(自动)';
-    audit('WRITE','-',`已接入 ${addKind} ${key}（${mode==='device'?'正式':'临时'}）`);
-    say('系统', `✅ 已接入 <b>${esc(key)}</b>（${addKind} · ${mode==='device'?'已写入 devices.toml':'连接簿'}）`
+    audit('WRITE','-',`已登记 ${addKind} ${key}（${mode==='device'?'正式':'临时'}）`);
+    say('系统', `✅ 已登记 <b>${esc(key)}</b>（${addKind} · ${mode==='device'?'已写入 devices.toml':'连接簿'}）`
       + (r.password_saved? '<br><span class="m">密码已存入本地凭据文件</span>'
          : (body.password? '<br><span class="w">⚠ 密码未存（不影响本次接入）</span>':''))
       + '<br><span class="m">'+esc(String(r.stdout||'').replace(/\n/g,' ').slice(0,220))+'</span>','ai');
@@ -1617,7 +1617,7 @@ async function submitAdd(){
     if(/已存在同名连接|已存在/.test(msg)){
       const key = body.name || g('afName');
       say('系统','<span class="m">'+esc(key)+' 已在连接簿里，直接接入。</span>','ai');
-      const done2 = busyOn($('addGo'), '接入中…');
+      const done2 = busyOn($('addGo'), '连接中…');
       // ★ 2026-10-07：改走 openTerm —— 原来这里直接调 /api/term/open，既不关旧 SID
       //   也不更新 SID/EventSource：后端确实开了新会话，前端终端面板却还挂在旧会话上
       //   （看着像"点了没反应/卡住"），旧会话也永不关闭 → 会话越积越多。

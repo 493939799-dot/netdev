@@ -8,6 +8,54 @@
 
 ---
 
+## [未发布]
+
+## [1.0.19] - 2026-10-10
+
+### 新增：采集失败「⚡一键学全部」+ 学习脚手架补全（`ui/static/index.html`、`ui/server.py`）
+
+- 状态卡采集失败栏新增 **⚡一键学全部**：AI 逐项提议（坏命令自动换命令 → 重跑 → 提解析规则），
+  汇总成清单由你**勾选采纳**——仍然只提议不落库，每条采纳前都过自检闸门。
+- 📚 已学规则视图：新增「范围」列（设备级 / 平台级 + 归属名），并展示当前设备的**命令缓存**
+  （采集学到的"这台设备用哪条命令"）。
+- 单项学习的两段式（换命令 + 学正则）、指标忽略 / 恢复入口接回（此前 UI 清理中被删成了孤儿）。
+
+### 修复：三桥自动登录对「连接簿临时目标」全部失效（`tools/serial_bridge.py`、`tools/ssh_bridge.py`）
+
+- **真因（同款病两处）**：桥的凭据查找只查正式设备表（`engine.get_device`），
+  临时接入的目标不在清单 → KeyError 后密码变量为空 → 自动登录**静默失效**，
+  表现为"填了密码进同屏还要再输一遍用户名密码"。
+  串口桥、SSH 桥都改成：查不到正式设备就按连接簿登记名查本地凭据文件。
+- **SSH 桥第二个坑**：OpenSSH 8.5+ 的首见指纹提示是 `(yes/no/[fingerprint])?`，
+  旧正则吃不掉 `yes/no` 后面的 `/` → 桥不回 yes → 停在指纹确认，密码自动填根本没机会跑。
+- 真机闭环验证：删指纹模拟首见 → 自动回 yes → 自动填密码（日志仅掩码）→ 直达提示符，零人工。
+
+### 修复：真机采集三轮实测暴露的 five 处（`lib/platforms.py`、`ui/server.py`）
+
+- 同屏探测整屏误判 → 改为**按候选命令分段**判定成败；
+- NAT 解析认不出 `Total : 0` 尾行（华为 `display nat session all`）；
+- 坏命令判定补 `Ambiguous command` / `Incomplete command` 两种报错形态；
+- 方言过滤：Cisco/锐捷系只试 `show` 家族，华为/华三/迈普系只试 `display` 家族，不再互相污染候选；
+- 串口打字丢首字（`display`→`isplay`）→ 回显校验 + 自动重发一次；
+- 临时目标 platform 兜底：从连接簿登记读取，不再给华为设备发 `show running-config`。
+
+### 变更：接入向导按钮「接入」→「登记」（`ui/static/index.html`）
+
+- 按钮语义与实际行为对齐：这一步是把设备**写进连接簿/设备清单**，不立即连屏；
+  同屏连接走设备行的"接入"。成功提示、忙碌态文案同步更新。
+
+### 变更：SSH / Telnet 预检失败信息带上具体 errno（`netdev_cli.py`）
+
+- 之前只报异常类型名（`OSError`），分不清是路由不通、权限拦截还是超时；
+  现在附异常原文（如 `[Errno 65] No route to host`），一眼定位是哪一层。
+
+### 新增：Windows 安装包进入 CI 自动出包（`.github/workflows/release.yml`）
+
+- Release workflow 新增 `build-windows` job：打 tag 即云端自动产出 Windows 安装包
+  （zip + sha256）并挂到 Release，含 DryRun 安装自测；本机无需再手动打包。
+
+---
+
 ## [1.0.18] - 2026-10-07
 
 ### 修复：SSH / Telnet 通道「输入很卡」——节拍未与串口对齐（`tools/ssh_bridge.py`、`tools/telnet_bridge.py`）
